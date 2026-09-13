@@ -1,0 +1,9 @@
+# 行尾策略显式化：仓库内存 LF，检出时由 git 按平台决定。
+# 不写这行的话 git 会用隐式默认值并每次操作都打警告。
+* text=auto
+
+# 二进制文件不参与行尾转换
+*.png  binary
+*.jpg  binary
+*.db   binary
+*.zip  binary

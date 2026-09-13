@@ -1,0 +1,9 @@
+[project]
+name = "vigil"
+version = "0.1.0"
+description = "VIGIL 守夜人 —— QQ 群信息聚合器（路线 C：本地数据库旁路）"
+requires-python = ">=3.11"
+dependencies = ["sqlcipher3>=0.6.2"]
+
+[tool.setuptools.packages.find]
+include = ["vigil*"]

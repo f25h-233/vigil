@@ -1,0 +1,20 @@
+# 密钥——绝不提交
+.env
+
+# 数据产物（导出的明文库、缓存的解密副本）
+data/
+
+# Python
+__pycache__/
+*.py[oc]
+.venv/
+
+# 下载的第三方工具（qqcli 60 MB，可从 release 重新获取——
+# 写进 git 历史后很难撤，所以不入库）
+.cache/
+
+# 测试产物
+.pytest_cache/
+
+# 前端依赖（M3 引入 React 时用；不挡的话 git add -A 会吞掉几百 MB）
+node_modules/
