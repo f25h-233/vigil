@@ -1,0 +1,113 @@
+# VIGIL 监听群配置
+#
+# ── 怎么加群 ───────────────────────────────────────────────
+#   1. 跑 `vigil groups`，它会列出 QQ 本地库里所有群
+#      （含群号、群名、消息数，以及「是否已纳入」）
+#   2. 把新群的 id 按下面格式加一段 [[groups]]
+#   3. 重跑 `vigil export`。已纳群只补新消息，新群拉全量历史
+#
+# ── 怎么退群 ───────────────────────────────────────────────
+#   把 enabled 改成 false（保留配置便于回看），或整段删掉。
+#   已导出的历史数据留在库里不动——那是你的记录。
+#
+# 注意：刚加入的新群，QQ 需要先把它同步到本地库
+#      （group_info.db 出现群名、nt_msg.db 开始落消息），
+#      之后 `vigil groups` 才看得见。刚加完立刻查可能是空的。
+
+[settings]
+# QQ NT 数据库目录（含 nt_msg.db / group_info.db）
+qq_db_dir = "C:/Users/qwe13/Documents/Tencent Files/1307553675/nt_qq/nt_db"
+# 导出产物的明文库路径（相对仓库根目录）
+output_db = "data/vigil.db"
+
+# ── 常州大学相关（首批 15 个）──────────────────────────────
+
+[[groups]]
+id = 643375490
+name = "2026级常州大学新生群"
+enabled = true
+
+[[groups]]
+id = 704650053
+name = "求索校组织26级招新群西太湖校区"
+enabled = true
+
+[[groups]]
+id = 1035750419
+name = "26级准大一资料分享群"
+enabled = true
+
+[[groups]]
+id = 1074335063
+name = "储运263班级群"
+enabled = true
+
+[[groups]]
+id = 932222509
+name = "西太湖新媒体部门招新群"
+enabled = true
+
+[[groups]]
+id = 740631117
+name = "2026级石工本科生群"
+enabled = true
+
+[[groups]]
+id = 1124073041
+name = "26级高数（一）储运"
+enabled = true
+
+[[groups]]
+id = 1109467949
+name = "26届求索总群"
+enabled = true
+
+[[groups]]
+id = 1109468222
+name = "求索技术部的小窝"
+enabled = true
+
+[[groups]]
+id = 949603689
+name = "常大二手咸鱼⑤群"
+enabled = true
+
+[[groups]]
+id = 540815623
+name = "常大跑团群"
+enabled = true
+
+[[groups]]
+id = 1046517740
+name = "2026级储运工程制图"
+enabled = true
+
+[[groups]]
+id = 1101855355
+name = "26级宿舍长"
+enabled = true
+
+[[groups]]
+id = 1091630376
+name = "Python-储运26级"
+enabled = true
+
+[[groups]]
+id = 1055988015
+name = "263团员小群"
+enabled = true
+
+# ── 待定（看着像校园社团，你确认后可打开）──────────────────
+#
+# [[groups]]
+# id = 770791550
+# name = "游戏部"
+# enabled = false
+#
+# [[groups]]
+# id = 759877412
+# name = "26-27-1周二34花绳"
+# enabled = false
+#
+# ── 已排除 ─────────────────────────────────────────────────
+#   1108894155  26级萌新·AI漫剧制作社 —— 用户判定为诈骗群，将退群
