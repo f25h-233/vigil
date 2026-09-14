@@ -313,11 +313,7 @@ desc = "重复了"
 
 
 @pytest.mark.parametrize(
-    "bad",
-    [
-        "Notice", "NOTICE", "通知", "2notice", "no-tice", "no.tice", "", "notice ",
-        "notice\n",  # ⚠️ Python 的 $ 允许结尾一个换行；正则必须用 \Z 才能挡住
-    ],
+    "bad", ["Notice", "NOTICE", "通知", "2notice", "no-tice", "no.tice", "", "notice "]
 )
 def test_rejects_non_lowercase_ascii_slug(tmp_path, bad):
     """slug 会进 items.kind 列、提示词、前端筛选键——必须是小写英文标识符。
@@ -376,6 +372,35 @@ label = "通知"
 """,
     )
     with pytest.raises(CategoryError, match="desc"):
+        categories.load_categories(p)
+
+
+def test_rejects_slug_with_trailing_newline(tmp_path):
+    """`^[a-z][a-z0-9_]*$` 的 `$` 允许结尾一个换行，所以 `"notice\\n"` 会被旧正则放行。
+
+    ⚠️ 这里**必须用 TOML 多行字符串**把真换行喂进去：写成单行基本串里的
+    `\\n` 转义会被 tomllib 判为非法字符（单行串不允许裸换行），
+    测试就会绕过正则、在 TOML 解析层失败——**假绿**。
+    所以本用例与下面的 `test_rejects_malformed_toml` 必须分开，
+    各自只测一件事。
+    """
+    p = _write(
+        tmp_path,
+        '[[categories]]\nslug = """notice\n"""\nlabel = "x"\ndesc = "y"\n',
+    )
+    with pytest.raises(CategoryError, match="slug 必须匹配"):
+        categories.load_categories(p)
+
+
+def test_rejects_malformed_toml(tmp_path):
+    """TOML 语法错也必须走 CategoryError，而不是甩原始 traceback。
+
+    `tomllib.TOMLDecodeError` 继承自 ValueError 而非 RuntimeError——
+    不包的话会绕过 cli 的错误处理契约（cli 只捕 CategoryError）。
+    这条是 fix 审查实测抓出来的。
+    """
+    p = _write(tmp_path, '[[categories]]\nslug = "unclosed\n')
+    with pytest.raises(CategoryError, match="TOML"):
         categories.load_categories(p)
 
 
@@ -517,8 +542,14 @@ def load_categories(path: pathlib.Path | None = None) -> tuple[Category, ...]:
     if not path.is_file():
         raise CategoryError(f"找不到类目配置: {path}")
 
-    with open(path, "rb") as f:
-        raw = tomllib.load(f)
+    try:
+        with open(path, "rb") as f:
+            raw = tomllib.load(f)
+    except tomllib.TOMLDecodeError as exc:
+        # 必须包成 CategoryError：TOMLDecodeError 继承自 ValueError 而不是
+        # RuntimeError，不包的话会绕过 cli 的错误处理契约，用户看到的是
+        # 原始 traceback 而不是一行可读的配置错误。
+        raise CategoryError(f"{path}: TOML 语法错误——{exc}") from exc
 
     entries = raw.get("categories")
     if not entries:
