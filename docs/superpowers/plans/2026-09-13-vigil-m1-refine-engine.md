@@ -392,6 +392,26 @@ def test_rejects_slug_with_trailing_newline(tmp_path):
         categories.load_categories(p)
 
 
+@pytest.mark.parametrize(
+    "body",
+    [
+        "[categories]\nslug = 'notice'\nlabel = 'x'\ndesc = 'y'\n",  # 单层方括号（常见笔误）
+        "categories = 'oops'\n",  # 字符串
+        "categories = [1, 2]\n",  # 是数组，但元素不是表
+    ],
+)
+def test_rejects_wrong_shape_with_category_error(tmp_path, body):
+    """配置形状写错也要走 CategoryError，不能甩 AttributeError。
+
+    `[categories]` 与 `[[categories]]` 在 TOML 里只差一层方括号——最常见的笔误。
+    不挡的话会去迭代 dict 的键（字符串），下一行 `.get()` 抛 AttributeError，
+    同样绕过 cli 只捕 CategoryError 的契约。
+    """
+    p = _write(tmp_path, body)
+    with pytest.raises(CategoryError, match="categories"):
+        categories.load_categories(p)
+
+
 def test_rejects_malformed_toml(tmp_path):
     """TOML 语法错也必须走 CategoryError，而不是甩原始 traceback。
 
@@ -552,13 +572,32 @@ def load_categories(path: pathlib.Path | None = None) -> tuple[Category, ...]:
         raise CategoryError(f"{path}: TOML 语法错误——{exc}") from exc
 
     entries = raw.get("categories")
+    # ⚠️ 三个分支不能合并。`[categories]`（单层方括号）与 `[[categories]]` 在 TOML 里
+    # 只差一层括号，是极常见的笔误，但解析结果一个是 dict、一个是 list。
+    # 不挡的话 `for entry in entries` 会去迭代 dict 的键（字符串），
+    # 下一行 `entry.get(...)` 抛 AttributeError——**同样绕过 cli 只捕
+    # CategoryError 的契约**，用户看到的是原始 traceback。
+    # ⚠️ 顺序也不能反：先判 None 再判类型。反过来的话「根本没写」会被
+    # 归到「类型不对」，把「段为空」的专用报错变成不可达代码。
+    if entries is None:
+        raise CategoryError(f"{path}: [[categories]] 段为空（根本没写）")
+    if not isinstance(entries, list):
+        raise CategoryError(
+            f"{path}: 需要 [[categories]] 数组段（注意是双层方括号），"
+            f"实际是 {type(entries).__name__}"
+        )
     if not entries:
-        raise CategoryError(f"{path}: [[categories]] 段为空")
+        raise CategoryError(f"{path}: [[categories]] 段为空（写了个空数组）")
 
     out: list[Category] = []
     seen: set[str] = set()
 
     for entry in entries:
+        if not isinstance(entry, dict):
+            raise CategoryError(
+                f"{path}: 每个 [[categories]] 段都必须是键值表，"
+                f"实际是 {type(entry).__name__}"
+            )
         slug = str(entry.get("slug", ""))
         if not _SLUG_RE.match(slug):
             raise CategoryError(
