@@ -111,9 +111,11 @@ def main() -> int:
     if failed:
         print(f"\n✗ {len(failed)} 项未通过，M1 不能判过。")
         return 1
-    print("\n✓ 机械项全过。剩下「分类准确率 ≥80%」需人工判定：")
-    print("    PYTHONIOENCODING=utf-8 .venv/Scripts/python.exe "
-          "vigil_acceptance.py --n 100 --m 20 > M1-验收抽样.md")
+    print("\n✓ 机械项全过。")
+    print("  ⚠️ 本脚本**判不了**「分类准确率 ≥80%」——那要人工读抽样材料，")
+    print("     且只在改了 categories.toml / 提示词后才需要重判（重跑会换一批抽样）：")
+    print("       PYTHONIOENCODING=utf-8 .venv/Scripts/python.exe "
+          "vigil_acceptance.py --n 100 --m 20 > 新抽样.md")
     return 0
 
 
