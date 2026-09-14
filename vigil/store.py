@@ -130,7 +130,14 @@ def pending_messages(
     params: list[object] = []
 
     if not redo:
-        where.append("m.msg_id NOT IN (SELECT msg_id FROM refine_runs)")
+        # ⚠️ 必须排除 error 行重试，不能把它们当成「已处理」。
+        # 写成 `NOT IN (SELECT msg_id FROM refine_runs)` 的话，一次网络抖动
+        # （429/超时）就会把那批消息**永久跳过**，且没有任何自动重试机制——
+        # 静默的永久数据丢失。error 行是「试过但没成功」，不是「已处理」。
+        where.append(
+            "m.msg_id NOT IN (SELECT msg_id FROM refine_runs WHERE status != ?)"
+        )
+        params.append(STATUS_ERROR)
     if since is not None:
         where.append("m.ts >= ?")
         params.append(since)

@@ -228,33 +228,47 @@ def cmd_refine(args) -> int:
     except ValueError as exc:
         sys.exit(f"[参数错误] {exc}")
 
-    stats = refine_mod.refine(
-        config,
-        api_key=api_key,
-        db_path=db,
-        since=since_ts,
-        until=until_ts,
-        limit=args.limit,
-        redo=args.redo,
-        batch_size=args.batch,
-        context=args.context,
-        budget_tokens=args.budget,
-        # --model 不给时是 None，而 None 会绕过 refine() 的默认值，所以这里兜底
-        model=args.model or refine_mod.DEFAULT_MODEL,
-        prompt_ver=args.prompt_ver,
-        dry_run=args.dry_run,
-    )
+    # refine() 会对 --redo/--limit 的非法组合抛 ValueError。不接的话用户看到的是
+    # 裸 traceback，而不是一行可读的参数错误——与 other 子命令的既有风格不一致。
+    try:
+        stats = refine_mod.refine(
+            config,
+            api_key=api_key,
+            db_path=db,
+            since=since_ts,
+            until=until_ts,
+            limit=args.limit,
+            redo=args.redo,
+            batch_size=args.batch,
+            context=args.context,
+            budget_tokens=args.budget,
+            # --model 不给时是 None，而 None 会绕过 refine() 的默认值，所以这里兜底
+            model=args.model or refine_mod.DEFAULT_MODEL,
+            prompt_ver=args.prompt_ver,
+            dry_run=args.dry_run,
+        )
+    except ValueError as exc:
+        sys.exit(f"[参数错误] {exc}")
 
     print("-" * 60)
+    # ⚠️ 账目必须自洽：只报「硬丢弃」的话，用户会拿 scanned − discarded_local
+    # 去对 sent_messages，然后发现差了三万多条不知道去哪了（Task 7 审查实测）。
+    # 所以主数字用「本地筛掉」（= scanned − sent），硬丢弃作为其中一项列出。
     print(
-        f"完成：扫描 {stats.scanned:,} 条，本地丢弃 {stats.discarded_local:,} 条，"
-        f"送模型 {stats.sent_messages:,} 条（{stats.batches:,} 批）"
+        f"完成：扫描 {stats.scanned:,} 条 → 本地筛掉 "
+        f"{stats.scanned - stats.sent_messages:,} 条"
+        f"（其中硬丢弃 {stats.discarded_local:,} 条）"
+        f" → 送模型 {stats.sent_messages:,} 条（{stats.batches:,} 批）"
     )
     print(f"产出条目：{stats.items_saved:,} 条")
     if not args.dry_run:
         print(f"token 用量：输入 {stats.input_tokens:,} / 输出 {stats.output_tokens:,}")
     if stats.budget_hit:
-        print("[注意] 达到预算上限提前停止，剩余消息留待下次（或调大 --budget）")
+        # 报「实际跑了多少」而不是计划数——预算 break 后两者会差很多
+        print(
+            f"[注意] 达到预算上限提前停止：实际跑了 {stats.batches} 批，"
+            f"计划 {stats.batches_planned} 批。剩余消息留待下次（或调大 --budget）"
+        )
     if stats.errors:
         print(f"\n[失败] {len(stats.errors)} 批出错：")
         for e in stats.errors[:5]:
