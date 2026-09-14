@@ -26,7 +26,7 @@ from .llm import DEFAULT_MODEL, LLMConfig, LLMError, chat_json
 from .redact import Redactor
 from .store import PendingMessage
 
-PROMPT_VERSION = "v1"
+PROMPT_VERSION = "v2"
 
 # 输出 token 的上限估计，用于把「输出」也算进预算
 _BATCH_TITLE_MAX = 40
@@ -53,13 +53,30 @@ class RefineStats:
 
 
 def build_system_prompt(cats: tuple[Category, ...]) -> str:
-    """系统提示词。类目表从配置渲染，改 categories.toml 即改提示词。"""
+    """系统提示词。类目表从配置渲染，改 categories.toml 即改提示词。
+
+    ⚠️ 「以下一律直接不出现在结果里」那三条是用户反馈逼出来的（纯询问价值低、
+    多为噪声）。**它一度只写进了计划文档而没进代码**——commit 481dfb9 的
+    范围是 `feat(plan)`，改的是 docs/superpowers/plans/…md 里的代码块，
+    `vigil/refine.py` 一行没动。后果在 2026-09-14 的模型对照实验里现形：
+    模型照样把「怎么向一卡通里充钱啊」「我们不体检吗」抽成条目。
+
+    改这里务必同步 `PROMPT_VERSION`，否则 refine_runs 里新老提示词的产出
+    混在一起，谁也说不清哪条是哪个提示词抽的。
+    """
     return f"""你是校园 QQ 群的信息提炼助手。从群聊消息里挑出对大学生真正有价值的信息。
 
 类目（只能选这些）：
 {prompt_block(cats)}
 
-闲聊、纯表情、无信息量的发言**直接不出现在结果里**——不要为它们输出任何占位元素。
+**以下一律直接不出现在结果里**——不要为它们输出任何占位元素：
+
+* 闲聊、纯表情、无信息量的发言
+* **纯询问 / 提问类消息**——「XX 在哪个校区」「能不能带电脑」「什么时候开学」
+  这类**提问本身不含信息**，价值低且多为噪声。
+  只有当消息**给出了答案或明确信息**时才产出
+  （例：「30 号就得到学校」是信息，「30 号开学吗」不是）
+* 同学间的感慨、吐槽、附和
 
 输出必须是 JSON 对象，形如 {{"items": [...]}}，其中 items 是数组。
 每个元素的结构：
