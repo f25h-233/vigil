@@ -85,6 +85,23 @@ def test_pending_messages_skips_already_run(memdb):
     assert [m.msg_id for m in store.pending_messages(memdb)] == [2, 3]
 
 
+def test_pending_messages_retries_error_rows(memdb):
+    """⚠️ error 行必须被重试，不能当成「已处理」（Task 7 审查实测抓出）。
+
+    写成 `NOT IN (SELECT msg_id FROM refine_runs)` 的话，一次网络抖动
+    （429/超时）就会把那批消息**永久跳过**，且没有任何自动重试机制——
+    静默的永久数据丢失。error 的语义是「试过但没成功」，不是「已处理」。
+    """
+    _seed_messages(memdb)
+    store.ensure_schema(memdb)
+    store.record_run(memdb, [1], status=store.STATUS_OK, prompt_ver="v1")
+    store.record_run(memdb, [2], status=store.STATUS_ERROR, prompt_ver="v1", err="429")
+    store.record_run(memdb, [3], status=store.STATUS_DISCARDED, prompt_ver="v1")
+
+    # 只有 error 那条会被重新取出——ok 与 discarded 都算真处理过了
+    assert [m.msg_id for m in store.pending_messages(memdb)] == [2]
+
+
 def test_redo_returns_everything(memdb):
     _seed_messages(memdb)
     store.ensure_schema(memdb)

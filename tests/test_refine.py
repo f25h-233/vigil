@@ -108,6 +108,95 @@ def test_build_user_prompt_redacts_numbers():
     assert "张韩" in text, "姓名要保留——它是判断发送者身份的信号"
 
 
+def test_build_user_prompt_distinguishes_anonymous_senders():
+    """⚠️ 匿名发送者必须**逐条区分**。
+
+    本条的存在本身就是审查的产物：Task 7 审查实测「**删掉这个特判，128 条
+    测试全绿**」——实现是对的，但零守护。这是「空守卫」在同一里程碑里的
+    第四次重现，所以补上。
+
+    为什么重要：W1 波级审查实测全库 1,218 条匿名消息里 **1,196 条是实质正文**，
+    含班主任助理张皓宇、卞雨琦各 11 条。若全归一个代号，模型会把互不相识的
+    人当成同一个人，并把这个错误认知写进 title/detail。
+    """
+    from vigil.redact import Redactor
+    from vigil.store import PendingMessage
+
+    msgs = [
+        PendingMessage(
+            msg_id=1, group_id=100, ts=1000, sender_uid="",
+            sender="", content="转发通知：明天停课",
+        ),
+        PendingMessage(
+            msg_id=2, group_id=200, ts=1001, sender_uid="",
+            sender="", content="转发通知：明天停课",
+        ),
+    ]
+    text = refine.build_user_prompt(msgs, Redactor(), today="2026-09-13")
+    assert "匿名1" in text, "第一条匿名消息要有自己的标记"
+    assert "匿名2" in text, "第二条必须是**不同**的标记"
+    assert text.count("匿名") == 2
+
+
+def test_build_user_prompt_keeps_named_senders_stable():
+    """有 uid 的仍走稳定代号——同一人两次发言必须看得出是同一人。
+
+    与上一条互补：匿名者**逐条区分**，有身份者**稳定复用**。两条一起才
+    完整描述 `build_user_prompt` 的发信人标记规则。
+    """
+    from vigil.redact import Redactor
+    from vigil.store import PendingMessage
+
+    msgs = [
+        PendingMessage(msg_id=1, group_id=100, ts=1000, sender_uid="u_a",
+                       sender="班长小王", content="第一句"),
+        PendingMessage(msg_id=2, group_id=100, ts=1001, sender_uid="u_a",
+                       sender="班长小王", content="第二句"),
+    ]
+    text = refine.build_user_prompt(msgs, Redactor(), today="2026-09-13")
+    assert text.count("U1") == 2, "同一人的两条消息应共用一个代号"
+
+
+def test_cli_refine_model_falls_back_to_default(monkeypatch, tmp_path):
+    """⚠️ argparse 不给 `--model` 时传的是 `None`，而 `None` 会**绕过**
+    `refine()` 的默认参数值（默认值只在「未传参」时生效）。
+
+    CLI 不自己兜底的话，会把 `None` 当模型名发给 SiliconFlow。
+    """
+    from vigil import cli, refine as refine_mod
+
+    captured = {}
+
+    def fake_refine(config, **kwargs):
+        captured.update(kwargs)
+        return refine_mod.RefineStats()
+
+    monkeypatch.setattr(refine_mod, "refine", fake_refine)
+    monkeypatch.setattr(cli, "_load_config_only", lambda: object())
+    monkeypatch.setattr(cli, "_require_export_db", lambda c: tmp_path / "x.db")
+
+    assert cli.main(["refine", "--dry-run"]) == 0
+    assert captured["model"] == refine_mod.DEFAULT_MODEL
+    assert captured["dry_run"] is True
+
+
+def test_load_llm_key_prefers_env_over_file(monkeypatch, tmp_path):
+    """密钥读取：环境变量优先于 `.env`；都没有时返回空串而不是抛错。"""
+    from vigil.config import load_llm_key
+
+    env = tmp_path / ".env"
+    env.write_text("SILICONFLOW_API_KEY=sk-from-file\n", encoding="utf-8")
+
+    monkeypatch.delenv("SILICONFLOW_API_KEY", raising=False)
+    assert load_llm_key(env) == "sk-from-file"
+
+    monkeypatch.setenv("SILICONFLOW_API_KEY", "sk-from-env")
+    assert load_llm_key(env) == "sk-from-env", "环境变量应优先于 .env"
+
+    monkeypatch.delenv("SILICONFLOW_API_KEY", raising=False)
+    assert load_llm_key(tmp_path / "nonexistent.env") == "", "文件不存在不该崩"
+
+
 def test_refine_saves_items(seeded, monkeypatch):
     """一条消息产出条目 → 落库 → 记账。"""
     fake = FakeLLM(
@@ -221,7 +310,13 @@ def test_refine_respects_budget(seeded, monkeypatch):
         on_progress=lambda *a, **k: None,
     )
     assert stats.budget_hit is True
-    assert stats.batches == 3, "应该只跑了一部分就停"
+    # ⚠️ 计划批数与**实际**批数必须分开断言（I-3 修复的连带改动）：
+    # batch_size=1 → 计划 3 批，但第 2 批开始前的预算闸就 break 了，
+    # 所以实际只跑了 1 批。原先断言 `stats.batches == 3` 是在断言**旧口径**
+    # （把计划数当成已跑数），那正是 CLI 在预算截断时误报「317 批」的根因。
+    assert stats.batches_planned == 3, "计划 3 批"
+    assert stats.batches == 1, "预算闸在第 2 批前触发，实际只跑了 1 批"
+    assert stats.batches < stats.batches_planned
     assert len(seeded.execute(
         "SELECT 1 FROM refine_runs WHERE status = 'ok'"
     ).fetchall()) < 3

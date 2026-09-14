@@ -38,7 +38,8 @@ class RefineStats:
     scanned: int = 0
     discarded_local: int = 0
     sent_messages: int = 0
-    batches: int = 0
+    batches_planned: int = 0  # 计划要跑多少批
+    batches: int = 0  # **实际**跑了几批——预算 break 之后会小于 planned
     items_saved: int = 0
     input_tokens: int = 0
     output_tokens: int = 0
@@ -239,7 +240,7 @@ def refine(
         in_scope = prefilter.expand_context(messages, candidates, context=context)
         batches = prefilter.make_batches(in_scope, max_batch=batch_size)
         stats.sent_messages = len(in_scope)
-        stats.batches = len(batches)
+        stats.batches_planned = len(batches)
 
         if dry_run:
             on_progress(
@@ -262,6 +263,7 @@ def refine(
                 )
                 break
 
+            stats.batches += 1  # 实际跑了——放在预算闸之后，break 的那批不算跑过
             redactor = Redactor()
             user = build_user_prompt(batch, redactor, today=today)
             batch_ids = [m.msg_id for m in batch]
