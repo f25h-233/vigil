@@ -128,6 +128,26 @@ def test_rejects_slug_with_trailing_newline(tmp_path):
         categories.load_categories(p)
 
 
+@pytest.mark.parametrize(
+    "body",
+    [
+        "[categories]\nslug = 'notice'\nlabel = 'x'\ndesc = 'y'\n",  # 单层方括号（常见笔误）
+        "categories = 'oops'\n",  # 字符串
+        "categories = [1, 2]\n",  # 是数组，但元素不是表
+    ],
+)
+def test_rejects_wrong_shape_with_category_error(tmp_path, body):
+    """配置形状写错也要走 CategoryError，不能甩 AttributeError。
+
+    `[categories]` 与 `[[categories]]` 在 TOML 里只差一层方括号——最常见的笔误。
+    不挡的话会去迭代 dict 的键（字符串），下一行 `.get()` 抛 AttributeError，
+    同样绕过 cli 只捕 CategoryError 的契约。
+    """
+    p = _write(tmp_path, body)
+    with pytest.raises(CategoryError, match="categories"):
+        categories.load_categories(p)
+
+
 def test_rejects_malformed_toml(tmp_path):
     """TOML 语法错也必须走 CategoryError，而不是甩原始 traceback。
 
