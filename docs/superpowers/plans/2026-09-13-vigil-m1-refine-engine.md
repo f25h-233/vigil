@@ -313,7 +313,11 @@ desc = "重复了"
 
 
 @pytest.mark.parametrize(
-    "bad", ["Notice", "NOTICE", "通知", "2notice", "no-tice", "no.tice", "", "notice "]
+    "bad",
+    [
+        "Notice", "NOTICE", "通知", "2notice", "no-tice", "no.tice", "", "notice ",
+        "notice\n",  # ⚠️ Python 的 $ 允许结尾一个换行；正则必须用 \Z 才能挡住
+    ],
 )
 def test_rejects_non_lowercase_ascii_slug(tmp_path, bad):
     """slug 会进 items.kind 列、提示词、前端筛选键——必须是小写英文标识符。
@@ -491,7 +495,9 @@ DISCARD = "discard"
 # 所以必须是小写英文标识符。
 # ⚠️ 只查 str.isidentifier() 不够——它放行 'Notice' 和 '通知'，
 # 而两者都会在下游造成麻烦（W1 审查实测）。用正则收紧。
-_SLUG_RE = re.compile(r"^[a-z][a-z0-9_]*$")
+# ⚠️ 用 \Z 而不是 $：Python 里 $ 允许结尾有一个换行，
+# 于是 "notice\n" 会被放行（fix 审查实测）。
+_SLUG_RE = re.compile(r"^[a-z][a-z0-9_]*\Z")
 
 
 class CategoryError(RuntimeError):
@@ -695,16 +701,39 @@ def test_url_exemption_is_scoped():
         ("QQ：81464214", f"QQ：{PLACEHOLDER}"),
         ("加我qq 81464214", f"加我qq {PLACEHOLDER}"),
         ("群号 421632774", f"群号 {PLACEHOLDER}"),
+        # ↓ 下面四条来自真实语料（fix 审查捞出来的）——第一版规则**全部漏掉**，
+        #   因为第一版只枚举了 `QQ|群号|微信` 这类字面标签，而中文写法太散。
+        ("加qq群 831560802", f"加qq群 {PLACEHOLDER}"),
+        ("QQ通知群：421632774", f"QQ通知群：{PLACEHOLDER}"),
+        ("交流群548412164", f"交流群{PLACEHOLDER}"),
+        ("q群967911480", f"q群{PLACEHOLDER}"),
         ("微信号：abc123456", "微信号：abc123456"),  # 非纯数字，不该动
     ],
 )
 def test_redacts_identity_numbers_after_label(raw, expected):
+    """**「群」字本身就是标签**——这是第二版修法的核心。"""
     assert redact_text(raw) == expected
+
+
+def test_identity_rule_leaves_no_residue():
+    """12 位数字不该被 `\\d{5,12}` 咬掉一段、留下尾巴。"""
+    out = redact_text("群号 123456789012")
+    assert "123456789012" not in out
+    assert out == f"群号 {PLACEHOLDER}"
 
 
 @pytest.mark.parametrize("raw", ["第 3 教学楼", "下午 4 点 30 分", "2026 级", "共 12345 人"])
 def test_identity_rule_does_not_eat_ordinary_numbers(raw):
     """没有身份标签的普通数字不能被误伤——否则日期地点全毁。"""
+    assert redact_text(raw) == raw
+
+
+@pytest.mark.parametrize("raw", ["第3群有20人", "群里有300多人", "群里一共 120 人"])
+def test_group_label_rule_needs_enough_digits(raw):
+    """把「群」当标签后，后面的位数必须够长才抹——否则人数、楼号全毁。
+
+    这也是为什么下限是 5 位：队里 3 个人、第 2 群、300 多人，都远短于 5 位。
+    """
     assert redact_text(raw) == raw
 
 
@@ -811,12 +840,22 @@ PHONE = re.compile(r"(?<!\d)1[3-9]\d{9}(?!\d)")
 # 学号/订单号一类。10 位是下限：日期与金额远短于此，不会误伤。
 LONGNUM = re.compile(r"\d{10,}")
 
-# 身份标签后的短数字。QQ 号/群号常见 5-9 位，位数阈值挡不住，
-# 只能靠上下文——所以只在明确标签后面抹，避免打死普通数字。
+# 身份标签后的短数字。QQ 号/群号常见 5-9 位，位数阈值挡不住，只能靠上下文。
+#
+# ⚠️ 第一版只枚举了 `QQ|群号|微信` 一类字面标签——**实测几乎没起作用**：
+# 真实语料里 5-11 位泄漏只从 107 降到 100。中文写法太散，枚举是打地鼠。
+# 关键修法是把 **「群」字本身** 当标签（`交流群548412164`、`QQ通知群：421632774`、
+# `加qq群 831560802` 全都以它收口），并加 IGNORECASE 覆盖 qq/Qq/QQ 大小写。
+# `(?!\d)` 是防残渣：12 位数字若被 `\d{5,12}` 咬掉前 12 位会留下一位尾巴。
 IDENTITY_NUM = re.compile(
-    r"((?:QQ|qq|Q群|Q号|企鹅|群号|学号|工号|微信号|微信|WX|wx|VX|vx)\s*[:：]?\s*)"
-    r"(\d{5,11})"
+    r"((?:qq|Q号|企鹅|群号|学号|工号|微信号|微信|wx|vx|群)\s*[:：]?\s*)"
+    r"(\d{5,12})(?!\d)",
+    re.IGNORECASE,
 )
+
+# ⚠️ `群号` 与 `群` 两个备选**都必须留**，不能只留 `群`：
+# 「群号 421632774」里 群 后面跟的是「号」不是数字，光靠 `群` 匹配不上。
+# （这条是 controller 誊写计划时删错备选、被自测抓回来的。）
 
 
 def _redact_segment(text: str) -> str:
