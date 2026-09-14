@@ -25,6 +25,7 @@
 7. **测试绝不联网、绝不碰真实 QQ 加密库、绝不碰 `data/vigil.db`**。用 `sqlite3.connect(":memory:")` 与构造样本。
 8. **任务 4 修改 `tests/conftest.py` 时必须追加而非覆盖**——它已由任务 1 建立。
 9. **每个任务一个独立 commit**，消息格式 `feat: ...` / `test: ...` / `chore: ...`。
+10. **测试要逐条详情时用 `-vv` 而不是 `-v`**。`pyproject.toml` 里设了 `addopts = "-q"`，而 `-q` 与 `-v` 是互斥的计数器，命令行给一个 `-v` 只够抵消它、看不到逐条结果。`-vv` 才能压过 `-q`。（这是 Task 2 实测踩到的：brief 写 `-v`，实际无逐条输出。）
 
 ### 逃逸舱（wave 模式：收紧版）
 
@@ -311,6 +312,40 @@ desc = "重复了"
         categories.load_categories(p)
 
 
+@pytest.mark.parametrize(
+    "bad", ["Notice", "NOTICE", "通知", "2notice", "no-tice", "no.tice", "", "notice "]
+)
+def test_rejects_non_lowercase_ascii_slug(tmp_path, bad):
+    """slug 会进 items.kind 列、提示词、前端筛选键——必须是小写英文标识符。
+
+    `str.isidentifier()` 不够：它放行 `Notice` 与 `通知`（W1 审查实测）。
+    """
+    p = _write(
+        tmp_path,
+        f"""
+[[categories]]
+slug = "{bad}"
+label = "x"
+desc = "y"
+""",
+    )
+    with pytest.raises(CategoryError):
+        categories.load_categories(p)
+
+
+def test_accepts_underscore_and_digits_after_first_letter(tmp_path):
+    p = _write(
+        tmp_path,
+        """
+[[categories]]
+slug = "part_time_job2"
+label = "x"
+desc = "y"
+""",
+    )
+    assert categories.load_categories(p)[0].slug == "part_time_job2"
+
+
 def test_rejects_discard_as_slug(tmp_path):
     """discard 是保留字（表示「丢弃」），不能当类目名。"""
     p = _write(
@@ -441,6 +476,7 @@ desc = "兼职、实习、校招、家教、勤工助学、课题组招人，含
 from __future__ import annotations
 
 import pathlib
+import re
 import tomllib
 from dataclasses import dataclass
 
@@ -450,6 +486,12 @@ DEFAULT_CATEGORIES = REPO_ROOT / "config" / "categories.toml"
 
 # 保留字：被丢弃的消息在 refine_runs 里记这个值，所以不能用作类目名
 DISCARD = "discard"
+
+# slug 会被写进 items.kind 列、渲染进提示词、当作 CLI 与前端的筛选键，
+# 所以必须是小写英文标识符。
+# ⚠️ 只查 str.isidentifier() 不够——它放行 'Notice' 和 '通知'，
+# 而两者都会在下游造成麻烦（W1 审查实测）。用正则收紧。
+_SLUG_RE = re.compile(r"^[a-z][a-z0-9_]*$")
 
 
 class CategoryError(RuntimeError):
@@ -481,8 +523,10 @@ def load_categories(path: pathlib.Path | None = None) -> tuple[Category, ...]:
 
     for entry in entries:
         slug = str(entry.get("slug", ""))
-        if not slug or not slug.isidentifier():
-            raise CategoryError(f"{path}: slug 必须是小写英文标识符，实际是 {slug!r}")
+        if not _SLUG_RE.match(slug):
+            raise CategoryError(
+                f"{path}: slug 必须匹配 {_SLUG_RE.pattern}，实际是 {slug!r}"
+            )
         if slug in seen:
             raise CategoryError(f"{path}: slug 重复: {slug}")
         if slug == DISCARD:
@@ -552,7 +596,10 @@ git commit -m "feat: 加类目配置与校验（七个类目，配置驱动）"
 ```python
 """脱敏的测试。
 
-样本全部取自本机真实群昵称与真实消息——用真数据测才有意义。
+**样本来源要说清楚**（早期版本的本文件曾声称"全部取自真实数据"，那是错的）：
+群昵称样本确实取自本机真实数据（`2600090309张韩18368500707` 一类），
+但**正文样本多是构造的**——真实语料里没有恰好可用的例子。
+比如 `13812345678` 这个手机号在全库 0 命中，它只是形态正确。
 """
 
 from __future__ import annotations
@@ -604,6 +651,88 @@ def test_does_not_touch_dates_or_amounts(raw):
     assert redact_text(raw) == raw
 
 
+# ── URL 豁免 ──────────────────────────────────────────────────────
+# W1 审查实测：不豁免时全库 34 条链接有 2 条被打烂，
+# 都是 B 站分享链的 32 位 hex vd_source。
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "https://www.bilibili.com/video/BV1GH4y1H75S/?vd_source=1a2b3c4d5e6f7a8b",
+        "报名 https://www.wjx.cn/vm/1788234567890.aspx",
+        "https://docs.qq.com/sheet/DR0p1b2M3d4567890123",
+        "https://qr.qq.com/q/1234567890123",
+        "https://example.com/activity?id=1788234567890&t=1",
+    ],
+)
+def test_urls_are_left_intact(raw):
+    """链接必须原样保留——`links` 是 item schema 的一等字段。
+
+    链接里的文档 ID / 分享 token 是结构化标识符，不是手机号或学号；
+    抹掉会产出**残废 URL 且是静默的**——没有报错，只是数据错了。
+    """
+    assert redact_text(raw) == raw
+
+
+def test_url_exemption_is_scoped():
+    """豁免只针对 URL 段——同一行里 URL 之外的号码仍要抹掉。"""
+    text = "联系13812345678 报名 https://www.wjx.cn/vm/1788234567890.aspx"
+    out = redact_text(text)
+    assert "13812345678" not in out
+    assert "https://www.wjx.cn/vm/1788234567890.aspx" in out
+
+
+# ── 身份短号 ──────────────────────────────────────────────────────
+# W1 审查实测：QQ 号常见 8 位、群号 9 位，而 LONGNUM 阈值是 10 位
+# → 81464214 / 421632774 会原样出网。阈值又不能下调（8 位会打死 20261008），
+# 所以只能靠上下文标签。
+
+
+@pytest.mark.parametrize(
+    "raw,expected",
+    [
+        ("QQ：81464214", f"QQ：{PLACEHOLDER}"),
+        ("加我qq 81464214", f"加我qq {PLACEHOLDER}"),
+        ("群号 421632774", f"群号 {PLACEHOLDER}"),
+        ("微信号：abc123456", "微信号：abc123456"),  # 非纯数字，不该动
+    ],
+)
+def test_redacts_identity_numbers_after_label(raw, expected):
+    assert redact_text(raw) == expected
+
+
+@pytest.mark.parametrize("raw", ["第 3 教学楼", "下午 4 点 30 分", "2026 级", "共 12345 人"])
+def test_identity_rule_does_not_eat_ordinary_numbers(raw):
+    """没有身份标签的普通数字不能被误伤——否则日期地点全毁。"""
+    assert redact_text(raw) == raw
+
+
+def test_phone_does_not_leave_residue_in_long_digits():
+    """缺数字边界时，13 位数字会被咬掉前 11 位、留下 `90` 的残渣。"""
+    out = redact_text("订单号6217001381234567890")
+    assert "567890" not in out, "不该留下残渣"
+    assert out == f"订单号{PLACEHOLDER}"
+
+
+# ── 匿名者 ────────────────────────────────────────────────────────
+
+
+def test_actor_rejects_empty_uid():
+    """匿名者没有身份——静默返回共享代号会让模型把不同人当成同一人。"""
+    with pytest.raises(ValueError, match="匿名"):
+        Redactor().actor("")
+
+
+def test_actor_rejection_does_not_shift_real_codes():
+    """一次误调用不该影响真实 uid 的代号分配（W1 审查实测的隐患）。"""
+    r = Redactor()
+    with pytest.raises(ValueError):
+        r.actor("")
+    assert r.actor("u_a") == "U1"
+    assert r.actor("u_b") == "U2"
+
+
 def test_redactor_is_stable_within_run():
     """同一 uid 必须一直拿到同一个代号，否则模型看不出「同一人说了两次」。"""
     r = Redactor()
@@ -647,11 +776,22 @@ Expected: FAIL —— `ModuleNotFoundError: No module named 'vigil.redact'`
 （「储运263班主任助理卞雨琦19551968610」），这是判断「谁发的、
 是不是官方」最可靠的信号，剥掉等于废掉抽取层。
 
-抹掉手机号与长数字串（学号）——这两样在实测的群昵称里高频出现
-（`2600090309张韩18368500707`），是真正的身份标识。
+四层遮蔽，各挡一类东西：
 
-为什么不会误伤日期：`2026-10-08` 中间的连字符让它不命中 `\\d{10,}`，
-`9月15日` 同理。这条边界有测试守着（test_does_not_touch_dates_or_amounts）。
+1. **URL 段整体豁免**（见 ``redact_text``）——链接里的文档 ID / 分享 token
+   是结构化标识符，不是身份号；抹掉会把链接打烂，而 ``links`` 是 item
+   schema 的一等字段。**实测依据**：不豁免时全库 34 条链接有 2 条被打烂
+   （B 站分享链的 32 位 hex ``vd_source``）。
+2. **手机号** —— 两侧带数字边界，不在更长的数字串内部匹配。缺了边界，
+   ``1788234567890`` 的前 11 位会被咬掉、留下 ``90`` 的残渣。
+3. **长数字串（≥10 位）** —— 学号、订单号一类。
+4. **身份标签后的短数字** —— QQ 号常见 8 位、群号 9 位，**位数阈值够不着**，
+   只能靠上下文。**实测依据**：不加这条时 ``81464214``（QQ）、
+   ``421632774``（群号）会原样出网。
+
+为什么不会误伤日期：``2026-10-08`` 中间的连字符让它不命中 ``\\d{10,}``，
+``9月15日`` 同理；身份标签规则要求前面必须有 ``QQ``/``群号`` 之类的词，
+所以 ``第 3 教学楼`` 不会被误伤。两条边界都有测试守着。
 """
 
 from __future__ import annotations
@@ -660,17 +800,48 @@ import re
 
 PLACEHOLDER = "<号码>"
 
-# 手机号：11 位、1 开头、第二位 3-9
-PHONE = re.compile(r"1[3-9]\d{9}")
+# 链接：整段豁免。\S+ 是刻意的——QQ 消息里的链接后面常紧跟中文标点。
+URL = re.compile(r"https?://\S+|www\.\S+")
 
-# 学号等长数字串。放 10 位是有意的：QQ 号最长 11 位、
-# 学号常见 10-12 位，而日期与金额都远短于 10 位。
+# 手机号：11 位、1 开头、第二位 3-9。
+# 两侧的数字边界不能省：没有它，13 位的 1788234567890 会被咬掉前 11 位、
+# 留下 "90" 这样的残渣（W1 审查实测）。
+PHONE = re.compile(r"(?<!\d)1[3-9]\d{9}(?!\d)")
+
+# 学号/订单号一类。10 位是下限：日期与金额远短于此，不会误伤。
 LONGNUM = re.compile(r"\d{10,}")
+
+# 身份标签后的短数字。QQ 号/群号常见 5-9 位，位数阈值挡不住，
+# 只能靠上下文——所以只在明确标签后面抹，避免打死普通数字。
+IDENTITY_NUM = re.compile(
+    r"((?:QQ|qq|Q群|Q号|企鹅|群号|学号|工号|微信号|微信|WX|wx|VX|vx)\s*[:：]?\s*)"
+    r"(\d{5,11})"
+)
+
+
+def _redact_segment(text: str) -> str:
+    """对**不含 URL** 的片段做遮蔽。"""
+    text = IDENTITY_NUM.sub(lambda m: m.group(1) + PLACEHOLDER, text)
+    text = PHONE.sub(PLACEHOLDER, text)
+    return LONGNUM.sub(PLACEHOLDER, text)
 
 
 def redact_text(text: str) -> str:
-    """抹掉手机号与长数字串，保留其余一切。"""
-    return LONGNUM.sub(PLACEHOLDER, PHONE.sub(PLACEHOLDER, text))
+    """抹掉可识别到个人的号码，保留其余一切（含姓名）。
+
+    URL 段**整体豁免**：链接里的文档 ID / 分享 token 是结构化标识符，
+    抹掉会把链接打烂，而报名链接正是本项目最想抽出来的东西。
+    代价是 URL 里若嵌了手机号会一并放行——这个取舍是刻意的：
+    打在链接上的损失是确定的（实测 2/34），而手机号出现在 URL 里极罕见。
+    """
+    parts: list[str] = []
+    last = 0
+    for match in URL.finditer(text):
+        parts.append(_redact_segment(text[last : match.start()]))
+        parts.append(match.group(0))  # URL 原样保留
+        last = match.end()
+    parts.append(_redact_segment(text[last:]))
+    return "".join(parts)
 
 
 class Redactor:
@@ -678,6 +849,15 @@ class Redactor:
 
     映射只活在内存里：`items` 表存的是原始 `group_id` 与 `sender_uid`，
     回填时不需要从代号反解，所以这套映射不落盘——落盘反而是多余的泄漏面。
+
+    ⚠️ ``actor('')`` 会抛 ``ValueError``，这是刻意的。匿名发送者
+    （实测全库 1,218 条 = 2.55%）**没有身份可言**：给它们一个共享代号，
+    模型就会把互不相识的人当成同一个人。调用方必须对空 uid 特判、
+    逐条区分（见 ``refine.build_user_prompt``）。
+
+    至于为什么用 fail-fast 而不是静默返回一个占位符：静默的话，
+    一次误调用就会把后续**所有真实 uid 的代号整体错位**（W1 审查实测），
+    而错误要到产出质量变差时才被发现——那时已经烧掉一整轮 token 了。
     """
 
     def __init__(self) -> None:
@@ -690,6 +870,11 @@ class Redactor:
         return self._groups[gid]
 
     def actor(self, uid: str) -> str:
+        if not uid:
+            raise ValueError(
+                "actor() 不接受空 uid——匿名发送者没有身份，"
+                "必须由调用方逐条区分（见 refine.build_user_prompt）"
+            )
         if uid not in self._actors:
             self._actors[uid] = f"U{len(self._actors) + 1}"
         return self._actors[uid]
@@ -700,8 +885,11 @@ class Redactor:
 
 - [ ] **Step 4: 运行测试确认通过**
 
-Run: `.venv/Scripts/python.exe -m pytest tests/test_redact.py -v`
-Expected: 17 passed
+Run: `.venv/Scripts/python.exe -m pytest tests/test_redact.py -vv`
+Expected: 33 passed
+
+> 数从 16 涨到 33，是 W1 审查后补的覆盖：URL 豁免 6 条、身份短号 8 条、
+> 残渣 1 条、匿名者守卫 2 条。原先的 16 条对这三类**零覆盖**。
 
 - [ ] **Step 5: Commit**
 
@@ -1286,6 +1474,46 @@ def test_flood_does_not_catch_different_people(msg_factory):
     assert stats.dropped_flood == 0
 
 
+def test_flood_does_not_cross_groups(msg_factory):
+    """⚠️ W1 波级审查实测抓出的缺陷：不同群的匿名者曾被当成同一个人。
+
+    三个群的匿名者 60 秒内转发同一条通知 → 旧实现（桶键不含 group_id）
+    判为刷屏、整批丢弃。而「被转发的通知」恰恰是本项目最想保住的东西。
+    """
+    msgs = [
+        msg_factory(i, "转发通知：明天停课", ts=1000 + i, group_id=gid, uid="")
+        for i, gid in enumerate([100, 200, 300], start=1)
+    ]
+    kept, stats = screen(msgs, tier_of=NORMAL)
+    assert stats.dropped_flood == 0, "跨群的同内容不该判为刷屏"
+    assert _keep_ids(kept) == {1, 2, 3}, "匿名者转发的通知必须保住"
+
+
+def test_flood_ignores_anonymous_senders(msg_factory):
+    """匿名者（uid 为空串）不参与刷屏判定——**空串不是身份**。
+
+    实测全库 1,218 条（2.55%）匿名消息；把空串当桶键等于把互不相识的人
+    当成同一个人。
+    """
+    msgs = [
+        msg_factory(i, "校园卡办理联系我", ts=1000 + i, group_id=100, uid="")
+        for i in range(3)
+    ]
+    _, stats = screen(msgs, tier_of=NORMAL)
+    assert stats.dropped_flood == 0
+
+
+def test_flood_still_catches_same_group_spammer(msg_factory):
+    """收紧之后，真正的同群刷屏仍必须被抓住——别把修复做成功能阉割。"""
+    msgs = [
+        msg_factory(i, "校园卡办理 联系QQ123", ts=1000 + i, group_id=100, uid="spammer")
+        for i in range(3)
+    ]
+    kept, stats = screen(msgs, tier_of=NORMAL)
+    assert kept == []
+    assert stats.dropped_flood == 3
+
+
 # ── 保留 ──────────────────────────────────────────────
 
 
@@ -1623,13 +1851,25 @@ def _normalized(text: str) -> str:
 def _flood_ids(
     messages: Sequence[PendingMessage], *, window: int = 60, threshold: int = 3
 ) -> set[int]:
-    """找出刷屏消息：同一 uid 在 window 秒内发出 threshold 条以上相同内容。"""
-    buckets: dict[tuple[str, str], list[PendingMessage]] = {}
+    """找出刷屏消息：**同一群内**同一 uid 在 window 秒内发出 threshold 条以上相同内容。
+
+    ⚠️ 两个约束都不能少——W1 波级审查实测抓出的缺陷，改前先读懂为什么：
+
+    * **必须按群分桶**。只按 (uid, 内容) 分桶会让全部 15 个群的匿名者
+      共用同一个桶：三个群的匿名者 60 秒内转发同一条通知，就会被误判成
+      「刷屏」整批丢掉——而**被转发的通知恰恰是本项目最想保住的东西**。
+    * **匿名者（uid 为空串）整体跳过**。实测全库 1,218 条（2.55%）匿名消息；
+      `pending_messages` 把 NULL uid 规范化成 `''`，而**空串不是身份**——
+      拿它当桶键等于把互不相识的人当成同一个人。
+    """
+    buckets: dict[tuple[int, str, str], list[PendingMessage]] = {}
     for m in messages:
+        if not m.sender_uid:  # 匿名者无法归属身份，不参与刷屏判定
+            continue
         body = _normalized(m.content)
         if not body:
             continue
-        buckets.setdefault((m.sender_uid, body), []).append(m)
+        buckets.setdefault((m.group_id, m.sender_uid, body), []).append(m)
 
     out: set[int] = set()
     for group in buckets.values():
@@ -2414,6 +2654,19 @@ def test_refine_survives_llm_error(seeded, monkeypatch):
     ).fetchone()[0] > 0
 
 
+def test_refine_rejects_redo_with_limit(seeded):
+    """redo + limit 会重复产出 items 并白烧 token——必须快速失败挡住。
+
+    W1 Task 4 审查实测：`pending_messages(redo=True, limit=2)` 返回 [1,2,3,4,5]
+    里含已处理的；CLI 上 `--redo --limit N` 是个安静的烧钱陷阱。
+    """
+    with pytest.raises(ValueError, match="redo"):
+        refine.refine(
+            StubConfig(), api_key="k", conn=seeded, redo=True, limit=2,
+            on_progress=lambda *a, **k: None,
+        )
+
+
 def test_dry_run_makes_no_calls(seeded, monkeypatch):
     """--dry-run 只报告不调模型、不写库。"""
     fake = FakeLLM()
@@ -2554,14 +2807,24 @@ def build_user_prompt(
 ) -> str:
     """用户提示词。**脱敏在这一步完成**——所有离开本机的内容都经过这里。
 
-    形如 ``[msg_id] U3: 内容``：msg_id 让模型能指回来源，
-    发信人用代号（姓名保留，号码已抹）。
+    有身份的发送者形如 ``[msg_id] U3 昵称: 内容``：msg_id 让模型能指回来源，
+    代号（姓名保留、号码已抹）让模型能看出「同一人说了两次」。
+
+    ⚠️ 匿名发送者（uid 为空串）**必须逐条区分**。实测全库 1,218 条（2.55%）
+    匿名消息；若一律走 ``redactor.actor('')``，它们会全部拿到同一个代号
+    （W1 波级审查实测：两个不同群的匿名者都是 ``U1``），模型便会把互不相识
+    的人当成同一个人，并把这个错误认知写进 title/detail。
+    **匿名者没有身份可言，所以给每条一个互不相同的标记。**
     """
     lines = []
     for m in messages:
-        sender = redactor.text(m.sender) or "未知"
         body = redactor.text(m.content)
-        lines.append(f"[{m.msg_id}] {redactor.actor(m.sender_uid)} {sender}: {body}")
+        if m.sender_uid:
+            name = redactor.text(m.sender) or "未知"
+            who = f"{redactor.actor(m.sender_uid)} {name}"
+        else:
+            who = f"匿名{m.msg_id}"  # 逐条唯一——避免把不同人当成同一人
+        lines.append(f"[{m.msg_id}] {who}: {body}")
     return f"今天的日期是 {today}。\n\n消息如下：\n" + "\n".join(lines)
 
 
@@ -2658,6 +2921,16 @@ def refine(
     cats = load_categories()
     known_kinds = frozenset(c.slug for c in cats)
     stats = RefineStats()
+
+    # redo + limit 叠加是有害组合（W1 Task 4 审查实测）：
+    # redo 把已抽过的消息重新抽一遍，limit 又只取最早的 N 条——
+    # 结果是重复产出 items、白烧 token。快速失败挡住它，别让它静默发生。
+    if redo and limit is not None:
+        raise ValueError(
+            "redo 与 limit 不能同时用：redo 会重抽已处理的消息，"
+            "limit 又只取最早的 N 条，两者叠加会重复产出 items 并白烧 token。"
+            "要限量重抽，请用 since/until 圈定时间窗。"
+        )
 
     owns_conn = conn is None
     if conn is None:
