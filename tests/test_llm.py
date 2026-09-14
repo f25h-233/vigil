@@ -131,6 +131,31 @@ def test_raises_on_unparsable_content(monkeypatch, cfg):
         chat_json(cfg, system="s", user="u", sleep=lambda _: None)
 
 
+@pytest.mark.parametrize(
+    "raw_content",
+    [
+        None,  # 模型返回工具调用 / 被内容过滤时，content 就是 null
+        12345,  # 数字
+        "[1, 2, 3]",  # 裸数组
+    ],
+)
+def test_rejects_non_object_content(monkeypatch, cfg, raw_content):
+    """⚠️ 契约必须挡住非字符串 content 与非对象顶层（W2 审查实测抓出）。
+
+    这两种都会**穿透 `chat_json` 的契约**，而不是变成 LLMError：
+    * `content = None` → `None.strip()` 抛 `AttributeError`
+    * 裸数组 → `_loads` 返回 list，下游 `payload.get()` 抛 `AttributeError`
+
+    调用方按常理只 `except LLMError`，所以两种都会崩掉整轮 refine。
+    """
+    monkeypatch.setattr(
+        "urllib.request.urlopen",
+        lambda req, timeout=None: FakeResponse(_envelope(raw_content)),
+    )
+    with pytest.raises(LLMError, match="解析"):
+        chat_json(cfg, system="s", user="u", sleep=lambda _: None)
+
+
 def test_backoff_is_exponential(monkeypatch, cfg):
     delays = []
     monkeypatch.setattr(
