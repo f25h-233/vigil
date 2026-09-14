@@ -88,7 +88,7 @@ def test_build_user_prompt_injects_today():
     ]
     text = refine.build_user_prompt(msgs, Redactor(), today="2026-09-13")
     assert "2026-09-13" in text
-    assert "[1]" in text
+    assert "1. " in text
     assert "班长小王" in text
 
 
@@ -157,6 +157,39 @@ def test_build_user_prompt_keeps_named_senders_stable():
     assert text.count("U1") == 2, "同一人的两条消息应共用一个代号"
 
 
+def test_prompt_uses_sequential_indices_not_msg_ids():
+    """⚠️ 必须用**批内序号**而不是 msg_id——Task 8 冒烟实测逼出的关键改动。
+
+    msg_id 是 19 位雪花号，同一批 30 条只有末 3 位不同。实测模型在
+    「抄 30 个几乎相同的长数字」上**系统性**出错：对照实验里 msg_id 版
+    命中 0/2，返回的都是「在批内但不对应」的 ID，错归因被静默接受，
+    可回溯性直接失效。换 1-2 位序号后命中 1/1，输入 token 还降 43%。
+
+    这条测试守两件事：**长 ID 不出现在提示词里** + **序号从 1 起连续**。
+    """
+    from vigil.redact import Redactor
+    from vigil.store import PendingMessage
+
+    msgs = [
+        PendingMessage(msg_id=7685024133064673881, group_id=100, ts=1000,
+                       sender_uid="u_a", sender="甲", content="第一条"),
+        PendingMessage(msg_id=7685024133064673978, group_id=100, ts=1001,
+                       sender_uid="", sender="", content="第二条"),
+        PendingMessage(msg_id=7685024133064673918, group_id=100, ts=1002,
+                       sender_uid="u_b", sender="乙", content="第三条"),
+    ]
+    text = refine.build_user_prompt(msgs, Redactor(), today="2026-09-13")
+
+    # 19 位 msg_id 一个都不许出现
+    for mid in (7685024133064673881, 7685024133064673978, 7685024133064673918):
+        assert str(mid) not in text, f"提示词里不该出现长 msg_id: {mid}"
+    # 序号从 1 起、连续
+    for i in (1, 2, 3):
+        assert f"\n{i}. " in text, f"缺序号 {i}"
+    # 匿名者的标记也走序号（不再用 msg_id）
+    assert "匿名2" in text
+
+
 def test_cli_refine_model_falls_back_to_default(monkeypatch, tmp_path):
     """⚠️ argparse 不给 `--model` 时传的是 `None`，而 `None` 会**绕过**
     `refine()` 的默认参数值（默认值只在「未传参」时生效）。
@@ -203,7 +236,7 @@ def test_refine_saves_items(seeded, monkeypatch):
         lambda user: {
             "items": [
                 {
-                    "msg_id": 1, "kind": "activity", "title": "西太湖报告厅有讲座",
+                    "idx": 1, "kind": "activity", "title": "西太湖报告厅有讲座",
                     "detail": None, "deadline": None, "place": "西太湖报告厅",
                     "amount": None, "confidence": 0.9,
                 }
@@ -240,7 +273,7 @@ def test_refine_is_idempotent(seeded, monkeypatch):
     fake = FakeLLM(
         lambda user: {
             "items": [
-                {"msg_id": 1, "kind": "activity", "title": "讲座", "detail": None,
+                {"idx": 1, "kind": "activity", "title": "讲座", "detail": None,
                  "deadline": None, "place": None, "amount": None, "confidence": 0.9}
             ]
         }
@@ -259,7 +292,7 @@ def test_refine_parses_deadline(seeded, monkeypatch):
     fake = FakeLLM(
         lambda user: {
             "items": [
-                {"msg_id": 3, "kind": "academic", "title": "数学作业截止",
+                {"idx": 3, "kind": "academic", "title": "数学作业截止",
                  "detail": None, "deadline": "2026-09-07", "place": None,
                  "amount": None, "confidence": 0.9}
             ]
@@ -275,12 +308,16 @@ def test_refine_parses_deadline(seeded, monkeypatch):
     assert dt.datetime.fromtimestamp(deadline).strftime("%Y-%m-%d") == "2026-09-07"
 
 
-def test_refine_ignores_hallucinated_msg_id(seeded, monkeypatch):
-    """模型可能编出不存在的 msg_id——必须丢弃而不是崩溃。"""
+def test_refine_ignores_out_of_range_idx(seeded, monkeypatch):
+    """模型可能编出越界的序号——必须丢弃而不是崩溃。
+
+    越界即丢不只是防御：**宁可少一条，也不能把条目挂到错误的消息上**，
+    那会让「可回溯」变成假的（M1 出口标准要求能跳回原文且内容对得上）。
+    """
     fake = FakeLLM(
         lambda user: {
             "items": [
-                {"msg_id": 999999, "kind": "notice", "title": "编的",
+                {"idx": 999, "kind": "notice", "title": "编的",
                  "detail": None, "deadline": None, "place": None,
                  "amount": None, "confidence": 0.9}
             ]
