@@ -26,6 +26,15 @@
 8. **任务 4 修改 `tests/conftest.py` 时必须追加而非覆盖**——它已由任务 1 建立。
 9. **每个任务一个独立 commit**，消息格式 `feat: ...` / `test: ...` / `chore: ...`。
 
+### 逃逸舱（wave 模式：收紧版）
+
+计划里若出现与实现不符的断言/命令/顺序：
+
+- **pipeline 模式**：按实际情况修正并继续，**无需请示**，但必须在报告里写明偏差。
+- **wave 模式（本里程碑）**：**只允许在你自己 `Touches:` 声明的文件范围内修正**。一旦发现需要改动 `Touches:` 之外的文件——**停下，报告 controller，等裁决**。不要用"就改一个文件而已"说服自己越界：同波其它 implementer 可能正在写同一个文件，越界是波内打架的头号入口。
+
+  若某一步**根本走不通**，同样停下报告，不要硬凑一个"看起来通过"的结果。
+
 ---
 
 ## 与 spec 的四点偏差（实施时按本计划，勿按 spec）
@@ -89,6 +98,10 @@ Task 4 → Task 5 有依赖（`prefilter` 用 `store.PendingMessage`）。其余
 **Files:**
 - Modify: `pyproject.toml`
 - Create: `tests/conftest.py`
+
+**Dependencies:** 无
+
+**Touches:** `pyproject.toml`, `tests/conftest.py`, `tests/test_smoke.py`, `uv.lock`
 
 **Interfaces:**
 - Consumes: 无
@@ -227,6 +240,10 @@ git commit -m "chore: 加测试骨架与 vigil 可执行入口"
 
 **Files:**
 - Create: `config/categories.toml`, `vigil/categories.py`, `tests/test_categories.py`
+
+**Dependencies:** [Task 1]
+
+**Touches:** `config/categories.toml`, `vigil/categories.py`, `tests/test_categories.py`
 
 **Interfaces:**
 - Consumes: `vigil.config.REPO_ROOT`
@@ -513,6 +530,10 @@ git commit -m "feat: 加类目配置与校验（七个类目，配置驱动）"
 **Files:**
 - Create: `vigil/redact.py`, `tests/test_redact.py`
 
+**Dependencies:** [Task 1]
+
+**Touches:** `vigil/redact.py`, `tests/test_redact.py`
+
 **Interfaces:**
 - Consumes: 无
 - Produces:
@@ -696,6 +717,10 @@ git commit -m "feat: 加发送前脱敏（保姓名、抹号码，数字遮蔽�
 **Files:**
 - Create: `vigil/store.py`, `tests/test_store.py`
 - Modify: `tests/conftest.py`（追加 `msg_factory` 夹具）
+
+**Dependencies:** [Task 1]
+
+**Touches:** `vigil/store.py`, `tests/test_store.py`, `tests/conftest.py`
 
 **Interfaces:**
 - Consumes: 无
@@ -1153,6 +1178,10 @@ git commit -m "feat: 加抽取层持久化（items/item_sources/refine_runs 三�
 **Files:**
 - Create: `vigil/prefilter.py`, `tests/test_prefilter.py`
 - Modify: `vigil/config.py`（加 `Group.tier` 字段）
+
+**Dependencies:** [Task 1, Task 4]
+
+**Touches:** `vigil/prefilter.py`, `tests/test_prefilter.py`, `vigil/config.py`, `config/groups.toml`
 
 **Interfaces:**
 - Consumes: `vigil.store.PendingMessage`（Task 4）、`vigil.text.NON_TEXT`
@@ -1772,6 +1801,10 @@ git commit -m "feat: 加规则预筛、上下文展开与切批，并给群加 t
 **Files:**
 - Create: `vigil/llm.py`, `tests/test_llm.py`
 
+**Dependencies:** [Task 1]
+
+**Touches:** `vigil/llm.py`, `tests/test_llm.py`
+
 **Interfaces:**
 - Consumes: 无（只用 stdlib）
 - Produces:
@@ -2114,6 +2147,10 @@ git commit -m "feat: 加 SiliconFlow 客户端（stdlib 实现，含重试与稳
 **Files:**
 - Create: `vigil/refine.py`, `tests/test_refine.py`
 - Modify: `vigil/config.py`（加 `load_llm_key`）、`vigil/cli.py`（加 `refine` 子命令）
+
+**Dependencies:** [Task 1, Task 2, Task 3, Task 4, Task 5, Task 6]
+
+**Touches:** `vigil/refine.py`, `tests/test_refine.py`, `vigil/config.py`, `vigil/cli.py`
 
 **Interfaces:**
 - Consumes: Task 2 `categories`、Task 3 `redact`、Task 4 `store`、Task 5 `prefilter` + `config.tier_of`、Task 6 `llm`
@@ -2855,6 +2892,10 @@ git commit -m "feat: 加抽取编排与 vigil refine 命令"
 **Files:**
 - Modify: `_probe_refine.py`（改造成可复用的验收脚本，或删除）
 - 无源码改动（除非冒烟抓到 bug，那时走 scoped fix）
+
+**Dependencies:** [Task 1–7 全部]
+
+**Touches:** `docs/DATA-NOTES.md`, `_probe_refine.py`
 
 **这是 M1 的出口证据，不是可选项。**
 
