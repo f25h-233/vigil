@@ -41,21 +41,25 @@ enabled = true
 id = 1074335063
 name = "储运263班级群"
 enabled = true
+tier = "high"
 
 [[groups]]
 id = 932222509
 name = "西太湖新媒体部门招新群"
 enabled = true
+tier = "high"
 
 [[groups]]
 id = 740631117
 name = "2026级石工本科生群"
 enabled = true
+tier = "high"
 
 [[groups]]
 id = 1124073041
 name = "26级高数（一）储运"
 enabled = true
+tier = "high"
 
 [[groups]]
 id = 1109467949
@@ -66,6 +70,7 @@ enabled = true
 id = 1109468222
 name = "求索技术部的小窝"
 enabled = true
+tier = "high"
 
 [[groups]]
 id = 949603689
@@ -81,11 +86,13 @@ enabled = true
 id = 1046517740
 name = "2026级储运工程制图"
 enabled = true
+tier = "high"
 
 [[groups]]
 id = 1101855355
 name = "26级宿舍长"
 enabled = true
+tier = "high"
 
 [[groups]]
 id = 1091630376
@@ -96,6 +103,7 @@ enabled = true
 id = 1055988015
 name = "263团员小群"
 enabled = true
+tier = "high"
 
 # ── 待定（看着像校园社团，你确认后可打开）──────────────────
 #

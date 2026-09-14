@@ -20,11 +20,19 @@ class ConfigError(RuntimeError):
     """配置层面的错误——快速失败。"""
 
 
+# 群分级：high = 不受关键词过滤（班级群/课程群/部门群里的
+# 「闲聊」往往是真通知）；normal = 需要关键词或角色昵称命中。
+TIER_HIGH = "high"
+TIER_NORMAL = "normal"
+VALID_TIERS = frozenset({TIER_HIGH, TIER_NORMAL})
+
+
 @dataclass(frozen=True)
 class Group:
     id: int
     name: str
     enabled: bool = True
+    tier: str = TIER_NORMAL
 
 
 @dataclass(frozen=True)
@@ -42,6 +50,13 @@ class Config:
             if g.id == gid:
                 return g.name
         return ""
+
+    def tier_of(self, gid: int) -> str:
+        """未知群的默认档位是 normal——保守，宁可多筛不可漏喂。"""
+        for g in self.groups:
+            if g.id == gid:
+                return g.tier
+        return TIER_NORMAL
 
 
 def load_config(path: pathlib.Path | None = None) -> Config:
@@ -73,8 +88,18 @@ def load_config(path: pathlib.Path | None = None) -> Config:
         gid = entry.get("id")
         if not isinstance(gid, int) or gid <= 0:
             raise ConfigError(f"{path}: 群号必须为正整数，实际是 {gid!r}")
+        tier = str(entry.get("tier", TIER_NORMAL))
+        if tier not in VALID_TIERS:
+            raise ConfigError(
+                f"{path}: 群 {gid} 的 tier 只能是 {sorted(VALID_TIERS)}，实际是 {tier!r}"
+            )
         groups.append(
-            Group(id=gid, name=entry.get("name", ""), enabled=entry.get("enabled", True))
+            Group(
+                id=gid,
+                name=entry.get("name", ""),
+                enabled=entry.get("enabled", True),
+                tier=tier,
+            )
         )
 
     if not groups:
