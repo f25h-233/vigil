@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import re
 import sqlite3
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -62,11 +63,14 @@ def build_system_prompt(cats: tuple[Category, ...]) -> str:
 
 输出必须是 JSON 对象，形如 {{"items": [...]}}，其中 items 是数组。
 每个元素的结构：
-{{"idx": 29, "kind": "notice", "title": "一句话摘要（≤{_BATCH_TITLE_MAX}字）",
+{{"quote": "从原消息里逐字摘录的连续片段",
+ "kind": "notice", "title": "一句话摘要（≤{_BATCH_TITLE_MAX}字）",
  "detail": "补充细节或null", "deadline": "YYYY-MM-DD 或 null",
  "place": "地点或null", "amount": "金额或null", "confidence": 0.9}}
 
-⚠️ `idx` 是下面消息列表里的**序号**（从 1 开始），**不是消息 ID**。
+⚠️ `quote` 必须是原消息里**原样连续出现**的片段（10-30 字）。**不要改写、
+不要补全、不要跨消息拼接**——程序会拿它去逐字匹配来源消息。
+摘录不准的条目会被直接丢弃，所以**宁可短而准**。
 
 死线日期必须结合下面提供的「今天」推算正确年份。没有死线的填 null。"""
 
@@ -76,17 +80,20 @@ def build_user_prompt(
 ) -> str:
     """用户提示词。**脱敏在这一步完成**——所有离开本机的内容都经过这里。
 
-    形如 ``29. U3 昵称: 内容``：**序号让模型能指回来源**，代号（姓名保留、
-    号码已抹）让模型能看出「同一人说了两次」。
+    形如 ``- U3 昵称: 内容``：代号（姓名保留、号码已抹）让模型能看出
+    「同一人说了两次」。**消息本身不带任何编号**——来源定位走 `quote`。
 
-    ⚠️ 用**批内序号**而不是 msg_id——这是 Task 8 冒烟实测逼出来的关键改动：
+    ⚠️ 为什么不用编号（msg_id 和序号都试过了，都不行）——Task 8 冒烟实测结论：
 
-    msg_id 是 19 位雪花号，同一批 30 条的 ID 只有末 3 位不同
-    （`…673881` / `…673929` / `…673918`）。实测模型在这种「抄 30 个几乎相同的
-    长数字」上的错误是**系统性**的：对照实验里 msg_id 版**命中 0/2**，且返回的
-    都是「在批内但不对应」的 ID——错归因被静默接受，可回溯性直接失效。
+    * **msg_id 不行**：19 位雪花号，同批 30 条只有末 3 位不同
+      （`…673881` / `…673929` / `…673918`）。实测命中 **0/2**，返回的全是
+      「在批内但不对应」的 ID——错归因被静默接受。
+    * **序号也不行**：换 1-2 位序号后 A/B 测试命中 1/1，但**真实管线里仍然错**
+      ——实测一个 4 条消息的批次，真来源在第 3 位，模型读对了内容却返回
+      `idx=1`。7B 在「4 条里选 1 个序号」这种任务上也不可靠。
 
-    换成 1-2 位序号后**命中 1/1**，输入 token 还从 1424 降到 819（**-43%**）。
+    最终方案是**不问模型编号**：让它逐字摘录，由 `_match_source` 本地定位。
+    7B 上实测命中，且**自校验**——匹配不上就丢弃，不可能静默挂错来源。
 
     ⚠️ 匿名发送者（uid 为空串）**必须逐条区分**。实测全库 1,218 条（2.55%）
     匿名消息；若一律走 ``redactor.actor('')``，它们会全部拿到同一个代号
@@ -94,14 +101,17 @@ def build_user_prompt(
     的人当成同一个人。**匿名者没有身份可言，所以给每条一个互不相同的标记。**
     """
     lines = []
-    for index, m in enumerate(messages, start=1):
+    anonymous = 0
+    for m in messages:
         body = redactor.text(m.content)
         if m.sender_uid:
             name = redactor.text(m.sender) or "未知"
             who = f"{redactor.actor(m.sender_uid)} {name}"
         else:
-            who = f"匿名{index}"  # 逐条唯一——避免把不同人当成同一人
-        lines.append(f"{index}. {who}: {body}")
+            # 批内计数器，不用 msg_id——不给模型任何长数字，断掉它"抄数字"的路径
+            anonymous += 1
+            who = f"匿名{anonymous}"
+        lines.append(f"- {who}: {body}")
     return f"今天的日期是 {today}。\n\n消息如下：\n" + "\n".join(lines)
 
 
@@ -115,26 +125,51 @@ def _parse_deadline(value: object) -> int | None:
         return None
 
 
+# 归一化时剥掉的字符：空白与常见中英文标点。
+# 目的是容忍「（640）」vs「(640)」这类**格式**差异，而不是容忍改写。
+_PUNCT = re.compile(r"[\s，。！？、：；「」『』【】（）()\[\]…~～\-—]+")
+
+
+def _normalize(text: str) -> str:
+    return _PUNCT.sub("", text)
+
+
+def _match_source(quote: str, batch: list[PendingMessage]) -> PendingMessage | None:
+    """按【逐字摘录】在批次里定位来源消息。
+
+    ⚠️ 这是 Task 8 冒烟实测逼出来的设计——**不问模型要编号**：
+
+    * **msg_id 不行**：19 位雪花号，同批 30 条只有末 3 位不同（`…673881` /
+      `…673929`）。实测命中 0/2，返回的全是「在批内但不对应」的 ID。
+    * **批内序号也不行**：实测一个 4 条消息的批次，真来源在第 3 位，
+      模型读对了内容却返回 `idx=1`。7B 在「4 条里选 1 个序号」上也不可靠。
+
+    改成让模型逐字摘录、由本地匹配后，**7B 上一次命中**。
+
+    **匹配不上就返回 None，调用方丢弃该条目。** 宁可少一条，也不能把来源挂错
+    ——M1 出口标准要求能跳回原文**且内容对得上**，挂错的来源比没有来源更糟。
+    """
+    needle = _normalize(quote)
+    if len(needle) < 4:  # 太短的摘录容易误命中，宁可丢
+        return None
+    for m in batch:
+        if needle in _normalize(m.content):
+            return m
+    return None
+
+
 def _to_item(
     raw: dict, batch: list[PendingMessage], *, known_kinds: frozenset[str]
 ) -> store.ExtractedItem | None:
     """把模型返回的一条 JSON 转成 ExtractedItem。
 
-    任何不合法（idx 越界、类目不在表里、缺 title）都返回 None——
+    任何不合法（摘录匹配不上、类目不在表里、缺 title）都返回 None——
     模型会编，宁可不入库也不入脏数据。
-
-    ⚠️ `idx` 是**批内序号**（1 基），与 `build_user_prompt` 的编号一一对应。
-    越界即丢弃：宁可少一条，也不能把条目挂到错误的消息上——那会让
-    「可回溯」变成假的（M1 出口标准要求能跳回原文**且内容对得上**）。
     """
-    try:
-        idx = int(raw["idx"])
-    except (KeyError, TypeError, ValueError):
+    quote = str(raw.get("quote") or "").strip()
+    source = _match_source(quote, batch)
+    if source is None:
         return None
-
-    if not 1 <= idx <= len(batch):
-        return None
-    source = batch[idx - 1]
 
     kind = str(raw.get("kind", "")).strip()
     if kind not in known_kinds:
