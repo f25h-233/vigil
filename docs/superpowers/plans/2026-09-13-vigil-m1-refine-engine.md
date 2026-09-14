@@ -2715,7 +2715,7 @@ def test_build_user_prompt_injects_today():
     ]
     text = refine.build_user_prompt(msgs, Redactor(), today="2026-09-13")
     assert "2026-09-13" in text
-    assert "[1]" in text
+    assert "1. " in text  # 序号格式，不是旧的 [msg_id]
     assert "班长小王" in text
 
 
@@ -2954,6 +2954,39 @@ def test_refine_ignores_out_of_range_idx(seeded, monkeypatch):
     stats = refine.refine(StubConfig(), api_key="k", conn=seeded,
                           on_progress=lambda *a, **k: None)
     assert stats.items_saved == 0
+    assert seeded.execute("SELECT count(*) FROM items").fetchone()[0] == 0
+
+
+def test_to_item_indexes_into_batch_not_in_scope(seeded, monkeypatch):
+    """⚠️ `_to_item` 必须按【当前批次】取序号，**不能按 `in_scope`**。
+
+    这是个静默杀手：传错列表不会报错，而是让**整批的序号系统性错位**——
+    比原来「偶发抄错 msg_id」更糟（那时是偶发，错位是必然）。
+
+    种子数据默认单批且 `in_scope == batch`，分辨不出两者，所以这里用
+    `batch_size=1` 强制每批只含 1 条：
+      · 按 `batch` 取 → `idx=2` 越界 → 丢弃 → `items_saved == 0` ✓
+      · 若误按 `in_scope`（3 条）取 → `idx=2` 合法 → 会从一条**已被硬丢弃**
+        的消息（"已完成"）里造出 item ✗
+
+    （本条由 fix 审查指出缺口后补：原实现正确，但把 `batch` 换成
+     `in_scope` 后 17 条测试全绿——零守护。）
+    """
+    fake = FakeLLM(
+        lambda user: {
+            "items": [
+                {"idx": 2, "kind": "notice", "title": "不该被造出来",
+                 "detail": None, "deadline": None, "place": None,
+                 "amount": None, "confidence": 0.9}
+            ]
+        }
+    )
+    monkeypatch.setattr(refine, "chat_json", fake)
+    stats = refine.refine(
+        StubConfig(), api_key="k", conn=seeded, batch_size=1,
+        on_progress=lambda *a, **k: None,
+    )
+    assert stats.items_saved == 0, "序号必须相对【批次】，不是 in_scope"
     assert seeded.execute("SELECT count(*) FROM items").fetchone()[0] == 0
 
 
