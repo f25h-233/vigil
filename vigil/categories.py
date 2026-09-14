@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import pathlib
+import re
 import tomllib
 from dataclasses import dataclass
 
@@ -17,6 +18,12 @@ DEFAULT_CATEGORIES = REPO_ROOT / "config" / "categories.toml"
 
 # 保留字：被丢弃的消息在 refine_runs 里记这个值，所以不能用作类目名
 DISCARD = "discard"
+
+# slug 会被写进 items.kind 列、渲染进提示词、当作 CLI 与前端的筛选键，
+# 所以必须是小写英文标识符。
+# ⚠️ 只查 str.isidentifier() 不够——它放行 'Notice' 和 '通知'，
+# 而两者都会在下游造成麻烦（W1 审查实测）。用正则收紧。
+_SLUG_RE = re.compile(r"^[a-z][a-z0-9_]*$")
 
 
 class CategoryError(RuntimeError):
@@ -48,8 +55,10 @@ def load_categories(path: pathlib.Path | None = None) -> tuple[Category, ...]:
 
     for entry in entries:
         slug = str(entry.get("slug", ""))
-        if not slug or not slug.isidentifier():
-            raise CategoryError(f"{path}: slug 必须是小写英文标识符，实际是 {slug!r}")
+        if not _SLUG_RE.match(slug):
+            raise CategoryError(
+                f"{path}: slug 必须匹配 {_SLUG_RE.pattern}，实际是 {slug!r}"
+            )
         if slug in seen:
             raise CategoryError(f"{path}: slug 重复: {slug}")
         if slug == DISCARD:

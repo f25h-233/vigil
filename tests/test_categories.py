@@ -48,6 +48,40 @@ desc = "重复了"
         categories.load_categories(p)
 
 
+@pytest.mark.parametrize(
+    "bad", ["Notice", "NOTICE", "通知", "2notice", "no-tice", "no.tice", "", "notice "]
+)
+def test_rejects_non_lowercase_ascii_slug(tmp_path, bad):
+    """slug 会进 items.kind 列、提示词、前端筛选键——必须是小写英文标识符。
+
+    `str.isidentifier()` 不够：它放行 `Notice` 与 `通知`（W1 审查实测）。
+    """
+    p = _write(
+        tmp_path,
+        f"""
+[[categories]]
+slug = "{bad}"
+label = "x"
+desc = "y"
+""",
+    )
+    with pytest.raises(CategoryError):
+        categories.load_categories(p)
+
+
+def test_accepts_underscore_and_digits_after_first_letter(tmp_path):
+    p = _write(
+        tmp_path,
+        """
+[[categories]]
+slug = "part_time_job2"
+label = "x"
+desc = "y"
+""",
+    )
+    assert categories.load_categories(p)[0].slug == "part_time_job2"
+
+
 def test_rejects_discard_as_slug(tmp_path):
     """discard 是保留字（表示「丢弃」），不能当类目名。"""
     p = _write(
