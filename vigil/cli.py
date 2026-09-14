@@ -244,6 +244,7 @@ def cmd_refine(args) -> int:
             budget_tokens=args.budget,
             # --model 不给时是 None，而 None 会绕过 refine() 的默认值，所以这里兜底
             model=args.model or refine_mod.DEFAULT_MODEL,
+            enable_thinking=args.think,
             prompt_ver=args.prompt_ver,
             dry_run=args.dry_run,
         )
@@ -325,6 +326,12 @@ def main(argv: list[str] | None = None) -> int:
     p_refine.add_argument("--context", type=int, default=2, help="候选各带几条上下文")
     p_refine.add_argument("--budget", type=int, help="token 预算上限")
     p_refine.add_argument("--model", default=None, help="覆盖默认模型")
+    p_refine.add_argument(
+        "--think",
+        action="store_true",
+        help="打开模型的思考模式（默认关闭：实测 Qwen3.5-35B-A3B 开思考时"
+        "单批要 111.5s / 11,124 输出 token，关掉只要 2.8s / 220 token）",
+    )
     p_refine.add_argument(
         "--prompt-ver", default=refine_mod.PROMPT_VERSION,
         help="提示词版本号；改了提示词就换个号，便于区分与重跑",
