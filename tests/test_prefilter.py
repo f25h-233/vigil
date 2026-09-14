@@ -82,18 +82,41 @@ def test_flood_does_not_catch_different_people(msg_factory):
 
 
 def test_flood_does_not_cross_groups(msg_factory):
-    """⚠️ W1 波级审查实测抓出的缺陷：不同群的匿名者曾被当成同一个人。
+    """**同一个人**在不同群转发同一条通知，不该被判刷屏。
 
-    三个群的匿名者 60 秒内转发同一条通知 → 旧实现（桶键不含 group_id）
-    判为刷屏、整批丢弃。而「被转发的通知」恰恰是本项目最想保住的东西。
+    ⚠️ uid 必须是**非空**的。写成匿名者的话，消息会被 `_flood_ids` 开头的
+    「跳过匿名者」分支先拦下，测试就退化成**空守卫**——把 `group_id` 从桶键里
+    删掉也照样绿（W2 审查用变异测试实测抓出：29 条测试全绿）。
+
+    这条守的是「**桶键必须含 group_id**」。
+    """
+    msgs = [
+        msg_factory(
+            i, "转发通知：明天停课", ts=1000 + i, group_id=gid, uid="u_forwarder"
+        )
+        for i, gid in enumerate([100, 200, 300], start=1)
+    ]
+    kept, stats = screen(msgs, tier_of=NORMAL)
+    assert stats.dropped_flood == 0, "同人跨群的同内容不该判为刷屏"
+    assert _keep_ids(kept) == {1, 2, 3}
+
+
+def test_flood_does_not_catch_anonymous_across_groups(msg_factory):
+    """匿名者在不同群发同样的话，不该被判刷屏。
+
+    ⚠️ 这条与上一条守的是**不同**的规则：这条守「**跳过匿名者**」，
+    上一条守「桶键含 group_id」。
+
+    两者**必须分开写**。合成一条的话，「跳过匿名者」分支会先命中，
+    从而把 `group_id` 的缺失整个掩盖掉——这正是第一条测试最初的写法错误。
     """
     msgs = [
         msg_factory(i, "转发通知：明天停课", ts=1000 + i, group_id=gid, uid="")
         for i, gid in enumerate([100, 200, 300], start=1)
     ]
     kept, stats = screen(msgs, tier_of=NORMAL)
-    assert stats.dropped_flood == 0, "跨群的同内容不该判为刷屏"
-    assert _keep_ids(kept) == {1, 2, 3}, "匿名者转发的通知必须保住"
+    assert stats.dropped_flood == 0, "匿名者的同内容不该判为刷屏"
+    assert _keep_ids(kept) == {1, 2, 3}
 
 
 def test_flood_ignores_anonymous_senders(msg_factory):
