@@ -12,6 +12,7 @@ import sys
 
 from . import export as export_mod
 from . import qqdb, reader
+from . import refine as refine_mod
 from .config import ConfigError, load_config, load_key
 
 
@@ -205,6 +206,64 @@ def cmd_media(args) -> int:
     return 0
 
 
+def cmd_refine(args) -> int:
+    """抽取：把消息变成结构化条目。"""
+    from . import refine as refine_mod
+    from .config import load_llm_key
+
+    config = _load_config_only()
+    db = _require_export_db(config)
+
+    api_key = load_llm_key()
+    if not api_key and not args.dry_run:
+        sys.exit(
+            "[配置错误] 没有 LLM 密钥。\n"
+            "  请在仓库根目录的 .env 里写入：SILICONFLOW_API_KEY=sk-...\n"
+            "  （--dry-run 不需要密钥）"
+        )
+
+    try:
+        since_ts = reader._to_epoch(args.since)
+        until_ts = reader._to_epoch(args.until)
+    except ValueError as exc:
+        sys.exit(f"[参数错误] {exc}")
+
+    stats = refine_mod.refine(
+        config,
+        api_key=api_key,
+        db_path=db,
+        since=since_ts,
+        until=until_ts,
+        limit=args.limit,
+        redo=args.redo,
+        batch_size=args.batch,
+        context=args.context,
+        budget_tokens=args.budget,
+        # --model 不给时是 None，而 None 会绕过 refine() 的默认值，所以这里兜底
+        model=args.model or refine_mod.DEFAULT_MODEL,
+        prompt_ver=args.prompt_ver,
+        dry_run=args.dry_run,
+    )
+
+    print("-" * 60)
+    print(
+        f"完成：扫描 {stats.scanned:,} 条，本地丢弃 {stats.discarded_local:,} 条，"
+        f"送模型 {stats.sent_messages:,} 条（{stats.batches:,} 批）"
+    )
+    print(f"产出条目：{stats.items_saved:,} 条")
+    if not args.dry_run:
+        print(f"token 用量：输入 {stats.input_tokens:,} / 输出 {stats.output_tokens:,}")
+    if stats.budget_hit:
+        print("[注意] 达到预算上限提前停止，剩余消息留待下次（或调大 --budget）")
+    if stats.errors:
+        print(f"\n[失败] {len(stats.errors)} 批出错：")
+        for e in stats.errors[:5]:
+            print(f"  {e}")
+    if args.dry_run:
+        print("（--dry-run：未调用模型、未写库）")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="vigil", description="VIGIL 守夜人")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -238,6 +297,22 @@ def main(argv: list[str] | None = None) -> int:
     p_media.add_argument("--since", help="起始日期 YYYY-MM-DD")
     p_media.add_argument("--limit", type=int, default=20, help="显示条数")
     p_media.set_defaults(func=cmd_media)
+
+    p_refine = sub.add_parser("refine", help="抽取：把消息提炼成结构化条目")
+    p_refine.add_argument("--since", help="起始日期 YYYY-MM-DD")
+    p_refine.add_argument("--until", help="结束日期 YYYY-MM-DD")
+    p_refine.add_argument("--limit", type=int, help="最多处理多少条")
+    p_refine.add_argument("--redo", action="store_true", help="重抽已处理过的消息")
+    p_refine.add_argument("--batch", type=int, default=30, help="每批消息数")
+    p_refine.add_argument("--context", type=int, default=2, help="候选各带几条上下文")
+    p_refine.add_argument("--budget", type=int, help="token 预算上限")
+    p_refine.add_argument("--model", default=None, help="覆盖默认模型")
+    p_refine.add_argument(
+        "--prompt-ver", default=refine_mod.PROMPT_VERSION,
+        help="提示词版本号；改了提示词就换个号，便于区分与重跑",
+    )
+    p_refine.add_argument("--dry-run", action="store_true", help="只报告不调用模型")
+    p_refine.set_defaults(func=cmd_refine)
 
     args = parser.parse_args(argv)
     return args.func(args)

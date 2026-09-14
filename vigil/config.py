@@ -108,19 +108,34 @@ def load_config(path: pathlib.Path | None = None) -> Config:
     return Config(qq_db_dir=qq_db_dir, output_db=output_db, groups=tuple(groups))
 
 
-def load_key(env_path: pathlib.Path | None = None) -> str:
-    """读取数据库密钥：优先环境变量，其次仓库根的 .env。"""
-    key = os.environ.get("VIGIL_DB_KEY", "").strip()
-    if key:
-        return key
+def _read_env(name: str, env_path: pathlib.Path | None = None) -> str:
+    """先读同名环境变量，再读仓库根的 .env。找不到返回空串。"""
+    value = os.environ.get(name, "").strip()
+    if value:
+        return value
 
-    env_path = env_path or DEFAULT_ENV
-    if env_path.is_file():
-        for line in env_path.read_text(encoding="utf-8").splitlines():
-            line = line.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            name, _, value = line.partition("=")
-            if name.strip() == "VIGIL_DB_KEY":
-                return value.strip().strip("'\"")
+    path = env_path or DEFAULT_ENV
+    if not path.is_file():
+        return ""
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, raw = line.partition("=")
+        if key.strip() == name:
+            return raw.strip().strip("'\"")
     return ""
+
+
+def load_key(env_path: pathlib.Path | None = None) -> str:
+    """读取数据库密钥：优先环境变量 VIGIL_DB_KEY，其次仓库根的 .env。"""
+    return _read_env("VIGIL_DB_KEY", env_path)
+
+
+def load_llm_key(env_path: pathlib.Path | None = None) -> str:
+    """读取 LLM 密钥：优先环境变量 SILICONFLOW_API_KEY，其次 .env。
+
+    与数据库密钥分开取名，是因为它们是完全不同的凭证——
+    混用会让「换模型」变成一件危险的事。
+    """
+    return _read_env("SILICONFLOW_API_KEY", env_path)
