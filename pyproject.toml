@@ -5,5 +5,19 @@ description = "VIGIL 守夜人 —— QQ 群信息聚合器（路线 C：本地�
 requires-python = ">=3.11"
 dependencies = ["sqlcipher3>=0.6.2"]
 
+[project.scripts]
+vigil = "vigil.cli:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
 [tool.setuptools.packages.find]
 include = ["vigil*"]
+
+[dependency-groups]
+dev = ["pytest>=8.0"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
