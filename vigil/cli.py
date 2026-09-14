@@ -254,11 +254,15 @@ def cmd_refine(args) -> int:
     # ⚠️ 账目必须自洽：只报「硬丢弃」的话，用户会拿 scanned − discarded_local
     # 去对 sent_messages，然后发现差了三万多条不知道去哪了（Task 7 审查实测）。
     # 所以主数字用「本地筛掉」（= scanned − sent），硬丢弃作为其中一项列出。
+    #
+    # dry-run 时要报**计划**批数：实际批数必然是 0，显示「0 批」会让人
+    # 以为什么都没准备好（Task 7 fix 实测指出）。
+    shown_batches = stats.batches_planned if args.dry_run else stats.batches
     print(
         f"完成：扫描 {stats.scanned:,} 条 → 本地筛掉 "
         f"{stats.scanned - stats.sent_messages:,} 条"
         f"（其中硬丢弃 {stats.discarded_local:,} 条）"
-        f" → 送模型 {stats.sent_messages:,} 条（{stats.batches:,} 批）"
+        f" → 送模型 {stats.sent_messages:,} 条（{shown_batches:,} 批）"
     )
     print(f"产出条目：{stats.items_saved:,} 条")
     if not args.dry_run:
