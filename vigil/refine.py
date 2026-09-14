@@ -62,9 +62,11 @@ def build_system_prompt(cats: tuple[Category, ...]) -> str:
 
 输出必须是 JSON 对象，形如 {{"items": [...]}}，其中 items 是数组。
 每个元素的结构：
-{{"msg_id": 123, "kind": "notice", "title": "一句话摘要（≤{_BATCH_TITLE_MAX}字）",
+{{"idx": 29, "kind": "notice", "title": "一句话摘要（≤{_BATCH_TITLE_MAX}字）",
  "detail": "补充细节或null", "deadline": "YYYY-MM-DD 或 null",
  "place": "地点或null", "amount": "金额或null", "confidence": 0.9}}
+
+⚠️ `idx` 是下面消息列表里的**序号**（从 1 开始），**不是消息 ID**。
 
 死线日期必须结合下面提供的「今天」推算正确年份。没有死线的填 null。"""
 
@@ -74,24 +76,32 @@ def build_user_prompt(
 ) -> str:
     """用户提示词。**脱敏在这一步完成**——所有离开本机的内容都经过这里。
 
-    有身份的发送者形如 ``[msg_id] U3 昵称: 内容``：msg_id 让模型能指回来源，
-    代号（姓名保留、号码已抹）让模型能看出「同一人说了两次」。
+    形如 ``29. U3 昵称: 内容``：**序号让模型能指回来源**，代号（姓名保留、
+    号码已抹）让模型能看出「同一人说了两次」。
+
+    ⚠️ 用**批内序号**而不是 msg_id——这是 Task 8 冒烟实测逼出来的关键改动：
+
+    msg_id 是 19 位雪花号，同一批 30 条的 ID 只有末 3 位不同
+    （`…673881` / `…673929` / `…673918`）。实测模型在这种「抄 30 个几乎相同的
+    长数字」上的错误是**系统性**的：对照实验里 msg_id 版**命中 0/2**，且返回的
+    都是「在批内但不对应」的 ID——错归因被静默接受，可回溯性直接失效。
+
+    换成 1-2 位序号后**命中 1/1**，输入 token 还从 1424 降到 819（**-43%**）。
 
     ⚠️ 匿名发送者（uid 为空串）**必须逐条区分**。实测全库 1,218 条（2.55%）
     匿名消息；若一律走 ``redactor.actor('')``，它们会全部拿到同一个代号
     （W1 波级审查实测：两个不同群的匿名者都是 ``U1``），模型便会把互不相识
-    的人当成同一个人，并把这个错误认知写进 title/detail。
-    **匿名者没有身份可言，所以给每条一个互不相同的标记。**
+    的人当成同一个人。**匿名者没有身份可言，所以给每条一个互不相同的标记。**
     """
     lines = []
-    for m in messages:
+    for index, m in enumerate(messages, start=1):
         body = redactor.text(m.content)
         if m.sender_uid:
             name = redactor.text(m.sender) or "未知"
             who = f"{redactor.actor(m.sender_uid)} {name}"
         else:
-            who = f"匿名{m.msg_id}"  # 逐条唯一——避免把不同人当成同一人
-        lines.append(f"[{m.msg_id}] {who}: {body}")
+            who = f"匿名{index}"  # 逐条唯一——避免把不同人当成同一人
+        lines.append(f"{index}. {who}: {body}")
     return f"今天的日期是 {today}。\n\n消息如下：\n" + "\n".join(lines)
 
 
@@ -106,21 +116,25 @@ def _parse_deadline(value: object) -> int | None:
 
 
 def _to_item(
-    raw: dict, by_id: dict[int, PendingMessage], *, known_kinds: frozenset[str]
+    raw: dict, batch: list[PendingMessage], *, known_kinds: frozenset[str]
 ) -> store.ExtractedItem | None:
     """把模型返回的一条 JSON 转成 ExtractedItem。
 
-    任何不合法（msg_id 不存在、类目不在表里、缺 title）都返回 None——
+    任何不合法（idx 越界、类目不在表里、缺 title）都返回 None——
     模型会编，宁可不入库也不入脏数据。
+
+    ⚠️ `idx` 是**批内序号**（1 基），与 `build_user_prompt` 的编号一一对应。
+    越界即丢弃：宁可少一条，也不能把条目挂到错误的消息上——那会让
+    「可回溯」变成假的（M1 出口标准要求能跳回原文**且内容对得上**）。
     """
     try:
-        msg_id = int(raw["msg_id"])
+        idx = int(raw["idx"])
     except (KeyError, TypeError, ValueError):
         return None
 
-    source = by_id.get(msg_id)
-    if source is None:
+    if not 1 <= idx <= len(batch):
         return None
+    source = batch[idx - 1]
 
     kind = str(raw.get("kind", "")).strip()
     if kind not in known_kinds:
@@ -157,7 +171,7 @@ def _to_item(
         links=links,
         amount=_text("amount"),
         confidence=max(0.0, min(1.0, confidence)),
-        src_msg_ids=(msg_id,),
+        src_msg_ids=(source.msg_id,),
     )
 
 
@@ -250,7 +264,6 @@ def refine(
             return stats
 
         system = build_system_prompt(cats)
-        by_id = {m.msg_id: m for m in in_scope}
         today = dt.date.today().isoformat()
         llm_cfg = LLMConfig(api_key=api_key, model=model)
 
@@ -292,7 +305,7 @@ def refine(
             for raw in raw_items:
                 if not isinstance(raw, dict):
                     continue
-                item = _to_item(raw, by_id, known_kinds=known_kinds)
+                item = _to_item(raw, batch, known_kinds=known_kinds)
                 if item is None:
                     continue
                 produced.append(item)
