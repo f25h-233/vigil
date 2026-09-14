@@ -23,3 +23,29 @@ def memdb():
     conn = sqlite3.connect(":memory:")
     yield conn
     conn.close()
+
+
+@pytest.fixture
+def msg_factory():
+    """快速造 PendingMessage。Task 5 的预筛测试要用。"""
+    from vigil.store import PendingMessage
+
+    def make(
+        msg_id: int,
+        content: str,
+        *,
+        group_id: int = 100,
+        ts: int = 1_700_000_000,
+        sender: str = "某同学",
+        uid: str = "u_x",
+    ) -> PendingMessage:
+        return PendingMessage(
+            msg_id=msg_id,
+            group_id=group_id,
+            ts=ts,
+            sender_uid=uid,
+            sender=sender,
+            content=content,
+        )
+
+    return make
