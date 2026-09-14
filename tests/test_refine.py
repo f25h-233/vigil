@@ -88,8 +88,8 @@ def test_build_user_prompt_injects_today():
     ]
     text = refine.build_user_prompt(msgs, Redactor(), today="2026-09-13")
     assert "2026-09-13" in text
-    assert "1. " in text
-    assert "班长小王" in text
+    # 行格式：`- 代号 姓名: 内容`，不带任何编号
+    assert "- U1 班长小王: 作业截止9月7号" in text
 
 
 def test_build_user_prompt_redacts_numbers():
@@ -157,15 +157,16 @@ def test_build_user_prompt_keeps_named_senders_stable():
     assert text.count("U1") == 2, "同一人的两条消息应共用一个代号"
 
 
-def test_prompt_uses_sequential_indices_not_msg_ids():
-    """⚠️ 必须用**批内序号**而不是 msg_id——Task 8 冒烟实测逼出的关键改动。
+def test_prompt_carries_no_numbers_at_all():
+    """⚠️ 提示词里**不能出现任何编号**——msg_id 和序号都试过了，都不行。
 
-    msg_id 是 19 位雪花号，同一批 30 条只有末 3 位不同。实测模型在
-    「抄 30 个几乎相同的长数字」上**系统性**出错：对照实验里 msg_id 版
-    命中 0/2，返回的都是「在批内但不对应」的 ID，错归因被静默接受，
-    可回溯性直接失效。换 1-2 位序号后命中 1/1，输入 token 还降 43%。
+    Task 8 冒烟实测逼出的结论：
+      * **msg_id**（19 位雪花号，同批只差末 3 位）→ 命中 **0/2**
+      * **批内序号** → A/B 测试命中 1/1，但**真实管线里仍然错**：
+        4 条消息的批次，真来源在第 3 位，模型读对了内容却返回 `idx=1`
 
-    这条测试守两件事：**长 ID 不出现在提示词里** + **序号从 1 起连续**。
+    所以改成**不问模型编号**：消息不带编号，来源靠 `quote` 逐字摘录本地匹配。
+    这条测试守「不给模型任何可抄的编号」这个前提。
     """
     from vigil.redact import Redactor
     from vigil.store import PendingMessage
@@ -183,11 +184,14 @@ def test_prompt_uses_sequential_indices_not_msg_ids():
     # 19 位 msg_id 一个都不许出现
     for mid in (7685024133064673881, 7685024133064673978, 7685024133064673918):
         assert str(mid) not in text, f"提示词里不该出现长 msg_id: {mid}"
-    # 序号从 1 起、连续
+    # 也不该有行首序号
     for i in (1, 2, 3):
-        assert f"\n{i}. " in text, f"缺序号 {i}"
-    # 匿名者的标记也走序号（不再用 msg_id）
-    assert "匿名2" in text
+        assert f"\n{i}. " not in text, f"提示词里不该出现序号 {i}"
+    # 发信人代号仍要保留——它是判断「同一人说了两次」的信号
+    assert "U1 甲" in text
+    assert "U2 乙" in text
+    # 匿名者仍要逐条区分
+    assert "匿名1" in text
 
 
 def test_cli_refine_model_falls_back_to_default(monkeypatch, tmp_path):
@@ -236,7 +240,8 @@ def test_refine_saves_items(seeded, monkeypatch):
         lambda user: {
             "items": [
                 {
-                    "idx": 1, "kind": "activity", "title": "西太湖报告厅有讲座",
+                    "quote": "明天下午有讲座", "kind": "activity",
+                    "title": "西太湖报告厅有讲座",
                     "detail": None, "deadline": None, "place": "西太湖报告厅",
                     "amount": None, "confidence": 0.9,
                 }
@@ -273,7 +278,7 @@ def test_refine_is_idempotent(seeded, monkeypatch):
     fake = FakeLLM(
         lambda user: {
             "items": [
-                {"idx": 1, "kind": "activity", "title": "讲座", "detail": None,
+                {"quote": "明天下午有讲座", "kind": "activity", "title": "讲座", "detail": None,
                  "deadline": None, "place": None, "amount": None, "confidence": 0.9}
             ]
         }
@@ -292,7 +297,8 @@ def test_refine_parses_deadline(seeded, monkeypatch):
     fake = FakeLLM(
         lambda user: {
             "items": [
-                {"idx": 3, "kind": "academic", "title": "数学作业截止",
+                {"quote": "数学作业截止到9月7号", "kind": "academic",
+                 "title": "数学作业截止",
                  "detail": None, "deadline": "2026-09-07", "place": None,
                  "amount": None, "confidence": 0.9}
             ]
@@ -308,18 +314,18 @@ def test_refine_parses_deadline(seeded, monkeypatch):
     assert dt.datetime.fromtimestamp(deadline).strftime("%Y-%m-%d") == "2026-09-07"
 
 
-def test_refine_ignores_out_of_range_idx(seeded, monkeypatch):
-    """模型可能编出越界的序号——必须丢弃而不是崩溃。
+def test_refine_drops_unmatchable_quote(seeded, monkeypatch):
+    """摘录匹配不上就必须丢弃，不能挂到随便某条消息上。
 
-    越界即丢不只是防御：**宁可少一条，也不能把条目挂到错误的消息上**，
-    那会让「可回溯」变成假的（M1 出口标准要求能跳回原文且内容对得上）。
+    这是「可回溯」的最后一道闸：M1 出口标准要求能跳回原文**且内容对得上**，
+    **挂错的来源比没有来源更糟**——它会让人以为数据没问题。
     """
     fake = FakeLLM(
         lambda user: {
             "items": [
-                {"idx": 999, "kind": "notice", "title": "编的",
-                 "detail": None, "deadline": None, "place": None,
-                 "amount": None, "confidence": 0.9}
+                {"quote": "这段文字不在任何消息里啊", "kind": "notice",
+                 "title": "编的", "detail": None, "deadline": None,
+                 "place": None, "amount": None, "confidence": 0.9}
             ]
         }
     )
@@ -330,37 +336,35 @@ def test_refine_ignores_out_of_range_idx(seeded, monkeypatch):
     assert seeded.execute("SELECT count(*) FROM items").fetchone()[0] == 0
 
 
-def test_to_item_indexes_into_batch_not_in_scope(seeded, monkeypatch):
-    """⚠️ `_to_item` 必须按【当前批次】取序号，**不能按 `in_scope`**。
+def test_match_source_tolerates_punctuation_but_not_rewriting():
+    """摘录匹配容忍**标点/空白**差异，但不容忍**改写**。
 
-    这是个静默杀手：传错列表不会报错，而是让**整批的序号系统性错位**——
-    比原来「偶发抄错 msg_id」更糟（那时是偶发，错位是必然）。
+    这条守的是 `_normalize` 的两侧边界：
+      · **容忍**：全角括号 vs 半角、多余空格——模型转写时的格式差异
+      · **不容忍**：换了词——那就是编的，必须丢（挂错来源比没来源更糟）
+      · **太短不匹配**（`len(needle) < 4`）——否则「收到」会命中一大片
 
-    种子数据默认单批且 `in_scope == batch`，分辨不出两者，所以这里用
-    `batch_size=1` 强制每批只含 1 条：
-      · 按 `batch` 取 → `idx=2` 越界 → 丢弃 → `items_saved == 0` ✓
-      · 若误按 `in_scope`（3 条）取 → `idx=2` 合法 → 会从一条**已被硬丢弃**
-        的消息（"已完成"）里造出 item ✗
-
-    （本条由 fix 审查指出缺口后补：原实现正确，但把 `batch` 换成
-     `in_scope` 后 17 条测试全绿——零守护。）
+    ⚠️ 原先这里是一条「序号必须相对 batch 而非 in_scope」的测试。
+    改用摘录匹配后它**失去了区分力**：`in_scope` 是所有批次的并集，
+    摘录匹配到哪条就是哪条，搜 `batch` 与搜 `in_scope` 结果必然相同。
+    测试的前提没了就该删，而不是留着装作还在守什么。
     """
-    fake = FakeLLM(
-        lambda user: {
-            "items": [
-                {"idx": 2, "kind": "notice", "title": "不该被造出来",
-                 "detail": None, "deadline": None, "place": None,
-                 "amount": None, "confidence": 0.9}
-            ]
-        }
-    )
-    monkeypatch.setattr(refine, "chat_json", fake)
-    stats = refine.refine(
-        StubConfig(), api_key="k", conn=seeded, batch_size=1,
-        on_progress=lambda *a, **k: None,
-    )
-    assert stats.items_saved == 0, "序号必须相对【批次】，不是 in_scope"
-    assert seeded.execute("SELECT count(*) FROM items").fetchone()[0] == 0
+    from vigil.store import PendingMessage
+
+    batch = [
+        PendingMessage(
+            msg_id=9, group_id=1, ts=1, sender_uid="u", sender="x",
+            content="有人捡到校园卡和钥匙（640）吗",
+        )
+    ]
+    # 全角 → 半角：容忍
+    assert refine._match_source("有人捡到校园卡和钥匙(640)吗", batch) is not None
+    # 标点被剥掉：容忍
+    assert refine._match_source("有人捡到校园卡和钥匙", batch) is not None
+    # 改写：不容忍
+    assert refine._match_source("有人丢失了校园卡和钥匙", batch) is None
+    # 太短：不匹配
+    assert refine._match_source("校园卡", batch) is None
 
 
 def test_refine_respects_budget(seeded, monkeypatch):
