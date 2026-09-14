@@ -23,7 +23,9 @@ DISCARD = "discard"
 # 所以必须是小写英文标识符。
 # ⚠️ 只查 str.isidentifier() 不够——它放行 'Notice' 和 '通知'，
 # 而两者都会在下游造成麻烦（W1 审查实测）。用正则收紧。
-_SLUG_RE = re.compile(r"^[a-z][a-z0-9_]*$")
+# ⚠️ 用 \Z 而不是 $：Python 里 $ 允许结尾有一个换行，
+# 于是 "notice\n" 会被放行（fix 审查实测）。
+_SLUG_RE = re.compile(r"^[a-z][a-z0-9_]*\Z")
 
 
 class CategoryError(RuntimeError):
@@ -43,8 +45,14 @@ def load_categories(path: pathlib.Path | None = None) -> tuple[Category, ...]:
     if not path.is_file():
         raise CategoryError(f"找不到类目配置: {path}")
 
-    with open(path, "rb") as f:
-        raw = tomllib.load(f)
+    try:
+        with open(path, "rb") as f:
+            raw = tomllib.load(f)
+    except tomllib.TOMLDecodeError as exc:
+        # 必须包成 CategoryError：TOMLDecodeError 继承自 ValueError 而不是
+        # RuntimeError，不包的话会绕过 cli 的错误处理契约，用户看到的是
+        # 原始 traceback 而不是一行可读的配置错误。
+        raise CategoryError(f"{path}: TOML 语法错误——{exc}") from exc
 
     entries = raw.get("categories")
     if not entries:

@@ -99,16 +99,39 @@ def test_url_exemption_is_scoped():
         ("QQ：81464214", f"QQ：{PLACEHOLDER}"),
         ("加我qq 81464214", f"加我qq {PLACEHOLDER}"),
         ("群号 421632774", f"群号 {PLACEHOLDER}"),
+        # ↓ 下面四条来自真实语料（fix 审查捞出来的）——第一版规则**全部漏掉**，
+        #   因为第一版只枚举了 `QQ|群号|微信` 这类字面标签，而中文写法太散。
+        ("加qq群 831560802", f"加qq群 {PLACEHOLDER}"),
+        ("QQ通知群：421632774", f"QQ通知群：{PLACEHOLDER}"),
+        ("交流群548412164", f"交流群{PLACEHOLDER}"),
+        ("q群967911480", f"q群{PLACEHOLDER}"),
         ("微信号：abc123456", "微信号：abc123456"),  # 非纯数字，不该动
     ],
 )
 def test_redacts_identity_numbers_after_label(raw, expected):
+    """**「群」字本身就是标签**——这是第二版修法的核心。"""
     assert redact_text(raw) == expected
+
+
+def test_identity_rule_leaves_no_residue():
+    """12 位数字不该被 `\\d{5,12}` 咬掉一段、留下尾巴。"""
+    out = redact_text("群号 123456789012")
+    assert "123456789012" not in out
+    assert out == f"群号 {PLACEHOLDER}"
 
 
 @pytest.mark.parametrize("raw", ["第 3 教学楼", "下午 4 点 30 分", "2026 级", "共 12345 人"])
 def test_identity_rule_does_not_eat_ordinary_numbers(raw):
     """没有身份标签的普通数字不能被误伤——否则日期地点全毁。"""
+    assert redact_text(raw) == raw
+
+
+@pytest.mark.parametrize("raw", ["第3群有20人", "群里有300多人", "群里一共 120 人"])
+def test_group_label_rule_needs_enough_digits(raw):
+    """把「群」当标签后，后面的位数必须够长才抹——否则人数、楼号全毁。
+
+    这也是为什么下限是 5 位：队里 3 个人、第 2 群、300 多人，都远短于 5 位。
+    """
     assert redact_text(raw) == raw
 
 
