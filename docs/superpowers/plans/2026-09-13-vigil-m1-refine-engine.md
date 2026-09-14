@@ -2784,6 +2784,39 @@ def test_build_user_prompt_keeps_named_senders_stable():
     assert text.count("U1") == 2, "同一人的两条消息应共用一个代号"
 
 
+def test_prompt_uses_sequential_indices_not_msg_ids():
+    """⚠️ 必须用**批内序号**而不是 msg_id——Task 8 冒烟实测逼出的关键改动。
+
+    msg_id 是 19 位雪花号，同一批 30 条只有末 3 位不同。实测模型在
+    「抄 30 个几乎相同的长数字」上**系统性**出错：对照实验里 msg_id 版
+    命中 0/2，返回的都是「在批内但不对应」的 ID，错归因被静默接受，
+    可回溯性直接失效。换 1-2 位序号后命中 1/1，输入 token 还降 43%。
+
+    这条测试守两件事：**长 ID 不出现在提示词里** + **序号从 1 起连续**。
+    """
+    from vigil.redact import Redactor
+    from vigil.store import PendingMessage
+
+    msgs = [
+        PendingMessage(msg_id=7685024133064673881, group_id=100, ts=1000,
+                       sender_uid="u_a", sender="甲", content="第一条"),
+        PendingMessage(msg_id=7685024133064673978, group_id=100, ts=1001,
+                       sender_uid="", sender="", content="第二条"),
+        PendingMessage(msg_id=7685024133064673918, group_id=100, ts=1002,
+                       sender_uid="u_b", sender="乙", content="第三条"),
+    ]
+    text = refine.build_user_prompt(msgs, Redactor(), today="2026-09-13")
+
+    # 19 位 msg_id 一个都不许出现
+    for mid in (7685024133064673881, 7685024133064673978, 7685024133064673918):
+        assert str(mid) not in text, f"提示词里不该出现长 msg_id: {mid}"
+    # 序号从 1 起、连续
+    for i in (1, 2, 3):
+        assert f"\n{i}. " in text, f"缺序号 {i}"
+    # 匿名者的标记也走序号（不再用 msg_id）
+    assert "匿名2" in text
+
+
 def test_cli_refine_model_falls_back_to_default(monkeypatch, tmp_path):
     """⚠️ argparse 不给 `--model` 时传的是 `None`，而 `None` 会**绕过**
     `refine()` 的默认参数值（默认值只在「未传参」时生效）。
@@ -2830,7 +2863,7 @@ def test_refine_saves_items(seeded, monkeypatch):
         lambda user: {
             "items": [
                 {
-                    "msg_id": 1, "kind": "activity", "title": "西太湖报告厅有讲座",
+                    "idx": 1, "kind": "activity", "title": "西太湖报告厅有讲座",
                     "detail": None, "deadline": None, "place": "西太湖报告厅",
                     "amount": None, "confidence": 0.9,
                 }
@@ -2867,7 +2900,7 @@ def test_refine_is_idempotent(seeded, monkeypatch):
     fake = FakeLLM(
         lambda user: {
             "items": [
-                {"msg_id": 1, "kind": "activity", "title": "讲座", "detail": None,
+                {"idx": 1, "kind": "activity", "title": "讲座", "detail": None,
                  "deadline": None, "place": None, "amount": None, "confidence": 0.9}
             ]
         }
@@ -2886,7 +2919,7 @@ def test_refine_parses_deadline(seeded, monkeypatch):
     fake = FakeLLM(
         lambda user: {
             "items": [
-                {"msg_id": 3, "kind": "academic", "title": "数学作业截止",
+                {"idx": 3, "kind": "academic", "title": "数学作业截止",
                  "detail": None, "deadline": "2026-09-07", "place": None,
                  "amount": None, "confidence": 0.9}
             ]
@@ -2902,12 +2935,16 @@ def test_refine_parses_deadline(seeded, monkeypatch):
     assert dt.datetime.fromtimestamp(deadline).strftime("%Y-%m-%d") == "2026-09-07"
 
 
-def test_refine_ignores_hallucinated_msg_id(seeded, monkeypatch):
-    """模型可能编出不存在的 msg_id——必须丢弃而不是崩溃。"""
+def test_refine_ignores_out_of_range_idx(seeded, monkeypatch):
+    """模型可能编出越界的序号——必须丢弃而不是崩溃。
+
+    越界即丢不只是防御：**宁可少一条，也不能把条目挂到错误的消息上**，
+    那会让「可回溯」变成假的（M1 出口标准要求能跳回原文且内容对得上）。
+    """
     fake = FakeLLM(
         lambda user: {
             "items": [
-                {"msg_id": 999999, "kind": "notice", "title": "编的",
+                {"idx": 999, "kind": "notice", "title": "编的",
                  "detail": None, "deadline": None, "place": None,
                  "amount": None, "confidence": 0.9}
             ]
@@ -3108,9 +3145,11 @@ def build_system_prompt(cats: tuple[Category, ...]) -> str:
 
 输出必须是 JSON 对象，形如 {{"items": [...]}}，其中 items 是数组。
 每个元素的结构：
-{{"msg_id": 123, "kind": "notice", "title": "一句话摘要（≤{_BATCH_TITLE_MAX}字）",
+{{"idx": 29, "kind": "notice", "title": "一句话摘要（≤{_BATCH_TITLE_MAX}字）",
  "detail": "补充细节或null", "deadline": "YYYY-MM-DD 或 null",
  "place": "地点或null", "amount": "金额或null", "confidence": 0.9}}
+
+⚠️ `idx` 是下面消息列表里的**序号**（从 1 开始），**不是消息 ID**。
 
 死线日期必须结合下面提供的「今天」推算正确年份。没有死线的填 null。"""
 
@@ -3120,24 +3159,32 @@ def build_user_prompt(
 ) -> str:
     """用户提示词。**脱敏在这一步完成**——所有离开本机的内容都经过这里。
 
-    有身份的发送者形如 ``[msg_id] U3 昵称: 内容``：msg_id 让模型能指回来源，
-    代号（姓名保留、号码已抹）让模型能看出「同一人说了两次」。
+    形如 ``29. U3 昵称: 内容``：**序号让模型能指回来源**，代号（姓名保留、
+    号码已抹）让模型能看出「同一人说了两次」。
+
+    ⚠️ 用**批内序号**而不是 msg_id——这是 Task 8 冒烟实测逼出来的关键改动：
+
+    msg_id 是 19 位雪花号，同一批 30 条的 ID 只有末 3 位不同
+    （`…673881` / `…673929` / `…673918`）。实测模型在这种「抄 30 个几乎相同的
+    长数字」上的错误是**系统性**的：对照实验里 msg_id 版**命中 0/2**，且返回的
+    都是「在批内但不对应」的 ID——错归因被静默接受，可回溯性直接失效。
+
+    换成 1-2 位序号后**命中 1/1**，输入 token 还从 1424 降到 819（**-43%**）。
 
     ⚠️ 匿名发送者（uid 为空串）**必须逐条区分**。实测全库 1,218 条（2.55%）
     匿名消息；若一律走 ``redactor.actor('')``，它们会全部拿到同一个代号
     （W1 波级审查实测：两个不同群的匿名者都是 ``U1``），模型便会把互不相识
-    的人当成同一个人，并把这个错误认知写进 title/detail。
-    **匿名者没有身份可言，所以给每条一个互不相同的标记。**
+    的人当成同一个人。**匿名者没有身份可言，所以给每条一个互不相同的标记。**
     """
     lines = []
-    for m in messages:
+    for index, m in enumerate(messages, start=1):
         body = redactor.text(m.content)
         if m.sender_uid:
             name = redactor.text(m.sender) or "未知"
             who = f"{redactor.actor(m.sender_uid)} {name}"
         else:
-            who = f"匿名{m.msg_id}"  # 逐条唯一——避免把不同人当成同一人
-        lines.append(f"[{m.msg_id}] {who}: {body}")
+            who = f"匿名{index}"  # 逐条唯一——避免把不同人当成同一人
+        lines.append(f"{index}. {who}: {body}")
     return f"今天的日期是 {today}。\n\n消息如下：\n" + "\n".join(lines)
 
 
@@ -3152,21 +3199,25 @@ def _parse_deadline(value: object) -> int | None:
 
 
 def _to_item(
-    raw: dict, by_id: dict[int, PendingMessage], *, known_kinds: frozenset[str]
+    raw: dict, batch: list[PendingMessage], *, known_kinds: frozenset[str]
 ) -> store.ExtractedItem | None:
     """把模型返回的一条 JSON 转成 ExtractedItem。
 
-    任何不合法（msg_id 不存在、类目不在表里、缺 title）都返回 None——
+    任何不合法（idx 越界、类目不在表里、缺 title）都返回 None——
     模型会编，宁可不入库也不入脏数据。
+
+    ⚠️ `idx` 是**批内序号**（1 基），与 `build_user_prompt` 的编号一一对应。
+    越界即丢弃：宁可少一条，也不能把条目挂到错误的消息上——那会让
+    「可回溯」变成假的（M1 出口标准要求能跳回原文**且内容对得上**）。
     """
     try:
-        msg_id = int(raw["msg_id"])
+        idx = int(raw["idx"])
     except (KeyError, TypeError, ValueError):
         return None
 
-    source = by_id.get(msg_id)
-    if source is None:
+    if not 1 <= idx <= len(batch):
         return None
+    source = batch[idx - 1]
 
     kind = str(raw.get("kind", "")).strip()
     if kind not in known_kinds:
@@ -3203,7 +3254,7 @@ def _to_item(
         links=links,
         amount=_text("amount"),
         confidence=max(0.0, min(1.0, confidence)),
-        src_msg_ids=(msg_id,),
+        src_msg_ids=(source.msg_id,),
     )
 
 
@@ -3296,7 +3347,6 @@ def refine(
             return stats
 
         system = build_system_prompt(cats)
-        by_id = {m.msg_id: m for m in in_scope}
         today = dt.date.today().isoformat()
         llm_cfg = LLMConfig(api_key=api_key, model=model)
 
@@ -3338,7 +3388,7 @@ def refine(
             for raw in raw_items:
                 if not isinstance(raw, dict):
                     continue
-                item = _to_item(raw, by_id, known_kinds=known_kinds)
+                item = _to_item(raw, batch, known_kinds=known_kinds)
                 if item is None:
                     continue
                 produced.append(item)
@@ -3508,9 +3558,16 @@ git commit -m "feat: 加抽取编排与 vigil refine 命令"
 
 Run:
 ```bash
-.venv/Scripts/vigil.exe refine --limit 150
+.venv/Scripts/vigil.exe refine --since 2026-09-12
 ```
-Expected: 产出若干 items，token 用量在几百到几千之间
+Expected: 产出十几到几十条 items，输入 token 在万级
+
+> ⚠️ **必须用 `--since` 不能用 `--limit`**——这是实测踩出来的：
+> `pending_messages` 按 `ts ASC` 排序，`--limit` 取的是**最旧**的消息。
+> 而这个语料最早那批恰好是**群刚建时玩互动功能**产生的
+> （`戳了戳` / `的头，要长不高了` / `加入了群聊。`），里面没有任何有价值信息。
+> 实测 `--limit 150` 只得 1 条 item，且那 150 条里有 14 条是 `ts=0` 脏数据。
+> 换成时间窗才有代表性内容（失物招领、通知、二手都有）。
 
 - [ ] **Step 2: 人工抽验分类准确率** ⚠️ **需用户本人参与**
 
