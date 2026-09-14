@@ -2345,6 +2345,31 @@ def test_raises_on_unparsable_content(monkeypatch, cfg):
         chat_json(cfg, system="s", user="u", sleep=lambda _: None)
 
 
+@pytest.mark.parametrize(
+    "raw_content",
+    [
+        None,  # 模型返回工具调用 / 被内容过滤时，content 就是 null
+        12345,  # 数字
+        "[1, 2, 3]",  # 裸数组
+    ],
+)
+def test_rejects_non_object_content(monkeypatch, cfg, raw_content):
+    """⚠️ 契约必须挡住非字符串 content 与非对象顶层（W2 审查实测抓出）。
+
+    这两种都会**穿透 `chat_json` 的契约**，而不是变成 LLMError：
+    * `content = None` → `None.strip()` 抛 `AttributeError`
+    * 裸数组 → `_loads` 返回 list，下游 `payload.get()` 抛 `AttributeError`
+
+    调用方按常理只 `except LLMError`，所以两种都会崩掉整轮 refine。
+    """
+    monkeypatch.setattr(
+        "urllib.request.urlopen",
+        lambda req, timeout=None: FakeResponse(_envelope(raw_content)),
+    )
+    with pytest.raises(LLMError, match="解析"):
+        chat_json(cfg, system="s", user="u", sleep=lambda _: None)
+
+
 def test_backoff_is_exponential(monkeypatch, cfg):
     delays = []
     monkeypatch.setattr(
@@ -2423,15 +2448,32 @@ class LLMResult:
 
 
 def _loads(text: str) -> dict:
-    """稳健解析模型输出：容忍 ``` 围栏与前后缀噪声。"""
+    """稳健解析模型输出：容忍 ``` 围栏与前后缀噪声。
+
+    ⚠️ 两道闸都不能省——W2 审查实测抓出，两者都会**穿透 chat_json 的契约**：
+
+    * **content 可能不是字符串**（`null` 或数字）。模型返回工具调用、或被内容
+      过滤时就是 `null`，此时 `None.strip()` 抛 `AttributeError`；
+      调用方按常理 `except LLMError`，会被崩掉整轮 refine。
+    * **顶层可能是裸数组**。直接返回 list 的话，下游 `payload.get("items")`
+      会抛 `AttributeError`——同样穿透契约。本函数声明的是 `-> dict`，
+      就必须保证真的是 dict。
+    """
+    if not isinstance(text, str):
+        raise ValueError(f"content 不是字符串，而是 {type(text).__name__}")
+
     stripped = _FENCE.sub("", text.strip())
     try:
-        return json.loads(stripped)
+        parsed = json.loads(stripped)
     except json.JSONDecodeError:
         start, end = stripped.find("{"), stripped.rfind("}")
-        if start >= 0 and end > start:
-            return json.loads(stripped[start : end + 1])
-        raise
+        if start < 0 or end <= start:
+            raise
+        parsed = json.loads(stripped[start : end + 1])
+
+    if not isinstance(parsed, dict):
+        raise ValueError(f"顶层不是 JSON 对象，而是 {type(parsed).__name__}")
+    return parsed
 
 
 def chat_json(
@@ -2489,7 +2531,10 @@ def chat_json(
     try:
         content = raw["choices"][0]["message"]["content"]
         payload = _loads(content)
-    except (KeyError, IndexError, TypeError, json.JSONDecodeError) as exc:
+    except (KeyError, IndexError, TypeError, ValueError) as exc:
+        # ⚠️ 用 ValueError 而不是 json.JSONDecodeError：_loads 的两道
+        # 「类型闸」抛的是 ValueError，而 JSONDecodeError 本就是它的子类，
+        # 所以这一条同时覆盖两者。少 Catch 一种就会让它穿透契约。
         raise LLMError(f"响应解析失败: {type(exc).__name__}: {exc}") from exc
 
     usage = raw.get("usage") or {}
