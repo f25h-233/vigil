@@ -1996,7 +1996,22 @@ def _drop_reason(m: PendingMessage, *, flood: set[int]) -> str | None:
     body = m.content.strip()
     if not body or body == NON_TEXT:
         return "empty"
-    if len(body.encode("utf-8")) < MIN_BYTES:
+    # ⚠️ 这里的 `not (...)` 不能省——它是计划自相矛盾被实测逼出来的修补。
+    #
+    # 原计划把「< MIN_BYTES」直接判 short，但那样 `"OK"`（2 字节）会被
+    # 记成 dropped_short，而 test_drops_bare_acknowledgements 要求
+    # dropped_ack；两者矛盾，原样实现是 1 failed。
+    #
+    # 单纯把 BARE_ACK 判定前移也修不好：`"好"`（3 字节）同样命中 `好(的)?`，
+    # 会变成 ack，反过来挂掉 test_drops_too_short。两个测试分别锁死两个方向。
+    #
+    # 出路是**按字符数而非字节数区分**：单字符（"好"、"1"）确实没信息量，
+    # 算 short；多字符的纯应答（"OK"、"嗯嗯"）是应答噪声，归 ack。
+    # 两者都会被丢，保留集完全不变——只是让计数反映「应答噪声」的真实规模
+    # （探针实测班级群 15 条里 8 条是「已完成」）。
+    if len(body.encode("utf-8")) < MIN_BYTES and not (
+        len(body) > 1 and BARE_ACK.match(body)
+    ):
         return "short"
     if m.ts <= 0:
         return "bad_time"
