@@ -2937,7 +2937,14 @@ def test_refine_respects_budget(seeded, monkeypatch):
         on_progress=lambda *a, **k: None,
     )
     assert stats.budget_hit is True
-    assert stats.batches == 3, "应该只跑了一部分就停"
+    # ⚠️ 这里必须同时钉住两个数：`batches_planned` 是"切成几批"，
+    # `batches` 是"实际跑了几批"。只断言后者的话，把 planned 算错也发现不了；
+    # 只断言前者的话，护栏没生效也发现不了。
+    # （controller 改 `batches` 语义时漏改过这条断言，照抄计划会红 `assert 1 == 3`——
+    #   由 fix 审查实测抓出。）
+    assert stats.batches_planned == 3, "样本应被切成 3 批"
+    assert stats.batches == 1, "只跑了 1 批就撞上预算闸"
+    assert stats.batches < stats.batches_planned, "实际必须少于计划，否则这条没验到东西"
     assert len(seeded.execute(
         "SELECT 1 FROM refine_runs WHERE status = 'ok'"
     ).fetchall()) < 3
@@ -3416,11 +3423,15 @@ def cmd_refine(args) -> int:
     # ⚠️ 账目必须自洽：只报「硬丢弃」的话，用户会拿 scanned − discarded_local
     # 去对 sent_messages，然后发现差了三万多条不知道去哪了（Task 7 审查实测）。
     # 所以主数字用「本地筛掉」（= scanned − sent），硬丢弃作为其中一项列出。
+    #
+    # dry-run 时要报**计划**批数：实际批数必然是 0，显示「0 批」会让人
+    # 以为什么都没准备好（Task 7 fix 实测指出）。
+    shown_batches = stats.batches_planned if args.dry_run else stats.batches
     print(
         f"完成：扫描 {stats.scanned:,} 条 → 本地筛掉 "
         f"{stats.scanned - stats.sent_messages:,} 条"
         f"（其中硬丢弃 {stats.discarded_local:,} 条）"
-        f" → 送模型 {stats.sent_messages:,} 条（{stats.batches:,} 批）"
+        f" → 送模型 {stats.sent_messages:,} 条（{shown_batches:,} 批）"
     )
     print(f"产出条目：{stats.items_saved:,} 条")
     if not args.dry_run:
