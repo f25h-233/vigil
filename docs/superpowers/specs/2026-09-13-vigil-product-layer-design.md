@@ -180,7 +180,6 @@ CREATE TABLE items (
 
     group_id    INTEGER NOT NULL,
     actor_uid   TEXT,               -- 发送者 uid，本地保留（不发往 LLM）
-    actor_label TEXT,               -- 脱敏代号，如 U7
 
     place       TEXT,               -- 地点
     links       TEXT,               -- JSON 数组：报名链接等
@@ -213,7 +212,7 @@ CREATE TABLE refine_runs (
     err        TEXT
 );
 
--- 日报
+-- 日报（⚠️ M2 才建，M1 不建——建了也没有写入方）
 CREATE TABLE digests (
     digest_id   INTEGER PRIMARY KEY,
     window_from INTEGER NOT NULL,
@@ -223,7 +222,7 @@ CREATE TABLE digests (
     created_at  INTEGER NOT NULL
 );
 
--- 日报 ↔ 条目 的互跳
+-- 日报 ↔ 条目 的互跳（⚠️ 同样属 M2）
 CREATE TABLE digest_items (
     digest_id INTEGER NOT NULL,
     item_id   INTEGER NOT NULL,
@@ -265,10 +264,12 @@ CREATE VIRTUAL TABLE items_fts USING fts5(
 
 ```
 ① 规则预筛（本地，零 API 成本）
-   ├ 硬丢弃
+   ├ 硬丢弃（先于保留规则判定，命中即丢）
    │   ├ content == "[非文本]" 且无 CJK
    │   ├ 长度 < 4 字节（"dd"/"1" 一类）
    │   ├ ts == 0 或落在 1970-01-01（§1.3 的脏数据）
+   │   ├ 整条即纯应答：已完成/收到/好的/嗯嗯/OK（**全匹配**——
+   │   │   「收到，明天9点集合」不能被丢）
    │   └ 同 uid 在 60 秒内 ≥3 条内容高度相似（刷屏广告）
    └ 保留候选（满足任一）
        ├ 命中关键词表：通知/报名/截止/考试/作业/选课/讲座/招新/面试/成绩/
@@ -278,7 +279,11 @@ CREATE VIRTUAL TABLE items_fts USING fts5(
        └ 所在群为高价值群（见下方 `[[groups]].tier`）
 ```
 
-**群分级**：`config/groups.toml` 的每个 `[[groups]]` 增加 `tier` 字段，取值 `high` / `normal`（缺省 `normal`）。高价值群里**全部消息都进候选**（不做关键词过滤），因为班级群/课程群/部门群里"看着像闲聊"的消息常常才是真通知。
+**群分级**：`config/groups.toml` 的每个 `[[groups]]` 增加 `tier` 字段，取值 `high` / `normal`（缺省 `normal`）。
+
+> ⚠️ **精确语义**：`high` = **不受关键词过滤**，但**硬丢弃仍然生效**。
+> 不是"全部消息都进候选"——实测班级群 15 条里有 8 条是「已完成」，
+> 全喂 LLM 纯属浪费。硬丢弃规则的设计就是为了挡住这类。
 
 ```toml
 [[groups]]
@@ -453,7 +458,7 @@ SDD 流程的硬性依赖，必须在 M1 开工前完成：
 | 0.4 | `pyproject.toml` 补 `[build-system]` + `[project.scripts]`（`vigil = "vigil.cli:main"`） | 冒烟出口要真实进程；现在只能 `python -m vigil` |
 | 0.5 | `npm config set cache D:\npm-cache` | C: 仅剩 7.8 GB，npm 缓存在 C 盘会雪上加霜 |
 | 0.6 | 安装 Tailscale | D2 的落地前提（M3 前完成即可） |
-| 0.7 | 补日志模块，把库层的 `print()` 换成 `logging` | 自动化后 `print()` 无处可去；`export(config, key, on_progress=print)` 的默认值要改 |
+| 0.7 | ~~补日志模块~~ **移入 M4** | M1 阶段 `on_progress` 回调就是进度通道；现在建日志模块没有消费者，是悬空工件。到 M4（自动化）时它才有真正的前提 |
 
 ---
 
