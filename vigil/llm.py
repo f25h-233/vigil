@@ -45,6 +45,13 @@ class LLMConfig:
     timeout: int = 180
     max_retries: int = 3
     temperature: float = 0.1
+    # None = 不发这个字段。混合思考模型（Qwen3/Qwen3.5）**默认是思考的**，
+    # 实测 Qwen3.5-35B-A3B 不传该字段要 111.5s / 11,124 输出 token，
+    # 传 false 只要 2.8s / 220 token——40 倍差距，且思考会让延迟撞穿超时
+    # （Qwen3.5-4B 那 30 条 `read operation timed out` 就是这么来的）。
+    # 留 None 而不是 False 做默认：老模型（Qwen2.5）不一定认这个字段，
+    # 「不发」才是对它们最安全的形状。
+    enable_thinking: bool | None = None
 
 
 @dataclass(frozen=True)
@@ -94,17 +101,18 @@ def chat_json(
 
     sleep 可注入，测试里传 ``lambda _: None`` 就能免去真实等待。
     """
-    body = json.dumps(
-        {
-            "model": cfg.model,
-            "messages": [
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ],
-            "temperature": cfg.temperature,
-            "response_format": {"type": "json_object"},
-        }
-    ).encode("utf-8")
+    request_body: dict = {
+        "model": cfg.model,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+        "temperature": cfg.temperature,
+        "response_format": {"type": "json_object"},
+    }
+    if cfg.enable_thinking is not None:
+        request_body["enable_thinking"] = cfg.enable_thinking
+    body = json.dumps(request_body).encode("utf-8")
 
     last_error: Exception | None = None
 

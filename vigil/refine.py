@@ -224,6 +224,7 @@ def refine(
     context: int = 2,
     budget_tokens: int | None = None,
     model: str = DEFAULT_MODEL,
+    enable_thinking: bool | None = False,
     prompt_ver: str = PROMPT_VERSION,
     dry_run: bool = False,
     on_progress=print,
@@ -300,7 +301,9 @@ def refine(
 
         system = build_system_prompt(cats)
         today = dt.date.today().isoformat()
-        llm_cfg = LLMConfig(api_key=api_key, model=model)
+        llm_cfg = LLMConfig(
+            api_key=api_key, model=model, enable_thinking=enable_thinking
+        )
 
         for index, batch in enumerate(batches, start=1):
             if budget_tokens is not None and stats.total_tokens >= budget_tokens:

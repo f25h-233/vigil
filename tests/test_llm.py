@@ -71,6 +71,48 @@ def test_sends_auth_header_and_model(monkeypatch, cfg):
     assert captured["body"]["messages"][0] == {"role": "system", "content": "sys"}
 
 
+def test_sends_thinking_false_when_configured(monkeypatch):
+    """显式关思考时，请求体里必须带上这个字段。
+
+    实测依据：Qwen3.5-35B-A3B 不传该字段要 111.5s / 11,124 输出 token，
+    传 false 只要 2.8s / 220 token。少了这个字段就是 40 倍的代价。
+    """
+    captured = {}
+
+    def fake_urlopen(req, timeout=None):
+        captured["body"] = json.loads(req.data.decode("utf-8"))
+        return FakeResponse(_envelope("{}"))
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    chat_json(
+        LLMConfig(api_key="k", enable_thinking=False),
+        system="s",
+        user="u",
+        sleep=lambda _: None,
+    )
+
+    assert captured["body"]["enable_thinking"] is False
+
+
+def test_omits_thinking_field_by_default(monkeypatch, cfg):
+    """默认（None）**不发**这个字段——不是发 false。
+
+    这条和上一条是一对，必须都在：只测「发了 false」的话，
+    把 `if cfg.enable_thinking is not None` 写成「永远发」也能通过，
+    而 Qwen2.5 这类老模型收到的就是它们没约定的字段。
+    """
+    captured = {}
+
+    def fake_urlopen(req, timeout=None):
+        captured["body"] = json.loads(req.data.decode("utf-8"))
+        return FakeResponse(_envelope("{}"))
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    chat_json(cfg, system="s", user="u", sleep=lambda _: None)
+
+    assert "enable_thinking" not in captured["body"]
+
+
 def test_tolerates_markdown_fence(monkeypatch, cfg):
     """模型有时会把 JSON 包在 ```json 围栏里。"""
     monkeypatch.setattr(

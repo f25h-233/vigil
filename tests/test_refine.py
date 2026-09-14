@@ -262,6 +262,40 @@ def test_refine_saves_items(seeded, monkeypatch):
     assert seeded.execute("SELECT item_id, msg_id FROM item_sources").fetchall() == [(1, 1)]
 
 
+def test_refine_passes_thinking_switch_to_llm(seeded, monkeypatch):
+    """思考开关必须一路到得了请求层。
+
+    只断言 `refine()` 收得下参数是不够的——那正是「空守卫」的形状：
+    参数在签名里、被接受、被忽略，测试照样绿。这里断言的是它
+    **真的传到了交给 chat_json 的 LLMConfig 上**。
+
+    实测依据见 llm.LLMConfig 的注释：Qwen3.5-35B-A3B 开思考 111.5s /
+    11,124 输出 token，关掉 2.8s / 220 token。这个参数丢了就是 40 倍代价。
+    """
+    seen = []
+
+    def fake(cfg, *, system, user, sleep=None):
+        seen.append(cfg)
+        return LLMResult(payload={"items": []}, input_tokens=1, output_tokens=1)
+
+    monkeypatch.setattr(refine, "chat_json", fake)
+    quiet = lambda *a, **k: None
+
+    refine.refine(
+        StubConfig(), api_key="k", conn=seeded, batch_size=1, on_progress=quiet
+    )
+    assert seen, "一批都没跑，这条测试就没在验证任何东西"
+    assert all(c.enable_thinking is False for c in seen), "默认必须关思考"
+
+    seen.clear()
+    refine.refine(
+        StubConfig(), api_key="k", conn=seeded, batch_size=1, redo=True,
+        enable_thinking=True, on_progress=quiet,
+    )
+    assert seen, "redo 那轮一批都没跑"
+    assert all(c.enable_thinking is True for c in seen), "--think 没传到请求层"
+
+
 def test_refine_records_discarded_for_noise(seeded, monkeypatch):
     """硬丢弃的消息也要记账——M1 出口要求 refine_runs 无遗漏。"""
     monkeypatch.setattr(refine, "chat_json", FakeLLM())
