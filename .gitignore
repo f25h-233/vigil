@@ -9,6 +9,9 @@ __pycache__/
 *.py[oc]
 .venv/
 
+# editable 安装产生的构建元数据（uv pip install -e . 生成，机器相关）
+*.egg-info/
+
 # 下载的第三方工具（qqcli 60 MB，可从 release 重新获取——
 # 写进 git 历史后很难撤，所以不入库）
 .cache/
@@ -18,3 +21,6 @@ __pycache__/
 
 # 前端依赖（M3 引入 React 时用；不挡的话 git add -A 会吞掉几百 MB）
 node_modules/
+
+# SDD 过程产物（ledger / brief / 报告 / review-package）——本地过程记忆，不入库
+.superpowers/
