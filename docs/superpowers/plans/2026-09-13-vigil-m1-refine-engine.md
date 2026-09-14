@@ -1122,6 +1122,23 @@ def test_pending_messages_skips_already_run(memdb):
     assert [m.msg_id for m in store.pending_messages(memdb)] == [2, 3]
 
 
+def test_pending_messages_retries_error_rows(memdb):
+    """⚠️ error 行必须被重试，不能当成「已处理」（Task 7 审查实测抓出）。
+
+    写成 `NOT IN (SELECT msg_id FROM refine_runs)` 的话，一次网络抖动
+    （429/超时）就会把那批消息**永久跳过**，且没有任何自动重试机制——
+    静默的永久数据丢失。error 的语义是「试过但没成功」，不是「已处理」。
+    """
+    _seed_messages(memdb)
+    store.ensure_schema(memdb)
+    store.record_run(memdb, [1], status=store.STATUS_OK, prompt_ver="v1")
+    store.record_run(memdb, [2], status=store.STATUS_ERROR, prompt_ver="v1", err="429")
+    store.record_run(memdb, [3], status=store.STATUS_DISCARDED, prompt_ver="v1")
+
+    # 只有 error 那条会被重新取出——ok 与 discarded 都算真处理过了
+    assert [m.msg_id for m in store.pending_messages(memdb)] == [2]
+
+
 def test_redo_returns_everything(memdb):
     _seed_messages(memdb)
     store.ensure_schema(memdb)
@@ -1374,7 +1391,14 @@ def pending_messages(
     params: list[object] = []
 
     if not redo:
-        where.append("m.msg_id NOT IN (SELECT msg_id FROM refine_runs)")
+        # ⚠️ 必须排除 error 行重试，不能把它们当成「已处理」。
+        # 写成 `NOT IN (SELECT msg_id FROM refine_runs)` 的话，一次网络抖动
+        # （429/超时）就会把那批消息**永久跳过**，且没有任何自动重试机制——
+        # 静默的永久数据丢失。error 行是「试过但没成功」，不是「已处理」。
+        where.append(
+            "m.msg_id NOT IN (SELECT msg_id FROM refine_runs WHERE status != ?)"
+        )
+        params.append(STATUS_ERROR)
     if since is not None:
         where.append("m.ts >= ?")
         params.append(since)
@@ -2711,6 +2735,95 @@ def test_build_user_prompt_redacts_numbers():
     assert "张韩" in text, "姓名要保留——它是判断发送者身份的信号"
 
 
+def test_build_user_prompt_distinguishes_anonymous_senders():
+    """⚠️ 匿名发送者必须**逐条区分**。
+
+    本条的存在本身就是审查的产物：Task 7 审查实测「**删掉这个特判，128 条
+    测试全绿**」——实现是对的，但零守护。这是「空守卫」在同一里程碑里的
+    第四次重现，所以补上。
+
+    为什么重要：W1 波级审查实测全库 1,218 条匿名消息里 **1,196 条是实质正文**，
+    含班主任助理张皓宇、卞雨琦各 11 条。若全归一个代号，模型会把互不相识的
+    人当成同一个人，并把这个错误认知写进 title/detail。
+    """
+    from vigil.redact import Redactor
+    from vigil.store import PendingMessage
+
+    msgs = [
+        PendingMessage(
+            msg_id=1, group_id=100, ts=1000, sender_uid="",
+            sender="", content="转发通知：明天停课",
+        ),
+        PendingMessage(
+            msg_id=2, group_id=200, ts=1001, sender_uid="",
+            sender="", content="转发通知：明天停课",
+        ),
+    ]
+    text = refine.build_user_prompt(msgs, Redactor(), today="2026-09-13")
+    assert "匿名1" in text, "第一条匿名消息要有自己的标记"
+    assert "匿名2" in text, "第二条必须是**不同**的标记"
+    assert text.count("匿名") == 2
+
+
+def test_build_user_prompt_keeps_named_senders_stable():
+    """有 uid 的仍走稳定代号——同一人两次发言必须看得出是同一人。
+
+    与上一条互补：匿名者**逐条区分**，有身份者**稳定复用**。两条一起才
+    完整描述 `build_user_prompt` 的发信人标记规则。
+    """
+    from vigil.redact import Redactor
+    from vigil.store import PendingMessage
+
+    msgs = [
+        PendingMessage(msg_id=1, group_id=100, ts=1000, sender_uid="u_a",
+                       sender="班长小王", content="第一句"),
+        PendingMessage(msg_id=2, group_id=100, ts=1001, sender_uid="u_a",
+                       sender="班长小王", content="第二句"),
+    ]
+    text = refine.build_user_prompt(msgs, Redactor(), today="2026-09-13")
+    assert text.count("U1") == 2, "同一人的两条消息应共用一个代号"
+
+
+def test_cli_refine_model_falls_back_to_default(monkeypatch, tmp_path):
+    """⚠️ argparse 不给 `--model` 时传的是 `None`，而 `None` 会**绕过**
+    `refine()` 的默认参数值（默认值只在「未传参」时生效）。
+
+    CLI 不自己兜底的话，会把 `None` 当模型名发给 SiliconFlow。
+    """
+    from vigil import cli, refine as refine_mod
+
+    captured = {}
+
+    def fake_refine(config, **kwargs):
+        captured.update(kwargs)
+        return refine_mod.RefineStats()
+
+    monkeypatch.setattr(refine_mod, "refine", fake_refine)
+    monkeypatch.setattr(cli, "_load_config_only", lambda: object())
+    monkeypatch.setattr(cli, "_require_export_db", lambda c: tmp_path / "x.db")
+
+    assert cli.main(["refine", "--dry-run"]) == 0
+    assert captured["model"] == refine_mod.DEFAULT_MODEL
+    assert captured["dry_run"] is True
+
+
+def test_load_llm_key_prefers_env_over_file(monkeypatch, tmp_path):
+    """密钥读取：环境变量优先于 `.env`；都没有时返回空串而不是抛错。"""
+    from vigil.config import load_llm_key
+
+    env = tmp_path / ".env"
+    env.write_text("SILICONFLOW_API_KEY=sk-from-file\n", encoding="utf-8")
+
+    monkeypatch.delenv("SILICONFLOW_API_KEY", raising=False)
+    assert load_llm_key(env) == "sk-from-file"
+
+    monkeypatch.setenv("SILICONFLOW_API_KEY", "sk-from-env")
+    assert load_llm_key(env) == "sk-from-env", "环境变量应优先于 .env"
+
+    monkeypatch.delenv("SILICONFLOW_API_KEY", raising=False)
+    assert load_llm_key(tmp_path / "nonexistent.env") == "", "文件不存在不该崩"
+
+
 def test_refine_saves_items(seeded, monkeypatch):
     """一条消息产出条目 → 落库 → 记账。"""
     fake = FakeLLM(
@@ -2964,7 +3077,8 @@ class RefineStats:
     scanned: int = 0
     discarded_local: int = 0
     sent_messages: int = 0
-    batches: int = 0
+    batches_planned: int = 0  # 计划要跑多少批
+    batches: int = 0  # **实际**跑了几批——预算 break 之后会小于 planned
     items_saved: int = 0
     input_tokens: int = 0
     output_tokens: int = 0
@@ -3165,7 +3279,7 @@ def refine(
         in_scope = prefilter.expand_context(messages, candidates, context=context)
         batches = prefilter.make_batches(in_scope, max_batch=batch_size)
         stats.sent_messages = len(in_scope)
-        stats.batches = len(batches)
+        stats.batches_planned = len(batches)
 
         if dry_run:
             on_progress(
@@ -3188,6 +3302,7 @@ def refine(
                 )
                 break
 
+            stats.batches += 1  # 实际跑了——放在预算闸之后，break 的那批不算跑过
             redactor = Redactor()
             user = build_user_prompt(batch, redactor, today=today)
             batch_ids = [m.msg_id for m in batch]
@@ -3275,33 +3390,47 @@ def cmd_refine(args) -> int:
     except ValueError as exc:
         sys.exit(f"[参数错误] {exc}")
 
-    stats = refine_mod.refine(
-        config,
-        api_key=api_key,
-        db_path=db,
-        since=since_ts,
-        until=until_ts,
-        limit=args.limit,
-        redo=args.redo,
-        batch_size=args.batch,
-        context=args.context,
-        budget_tokens=args.budget,
-        # --model 不给时是 None，而 None 会绕过 refine() 的默认值，所以这里兜底
-        model=args.model or refine_mod.DEFAULT_MODEL,
-        prompt_ver=args.prompt_ver,
-        dry_run=args.dry_run,
-    )
+    # refine() 会对 --redo/--limit 的非法组合抛 ValueError。不接的话用户看到的是
+    # 裸 traceback，而不是一行可读的参数错误——与 other 子命令的既有风格不一致。
+    try:
+        stats = refine_mod.refine(
+            config,
+            api_key=api_key,
+            db_path=db,
+            since=since_ts,
+            until=until_ts,
+            limit=args.limit,
+            redo=args.redo,
+            batch_size=args.batch,
+            context=args.context,
+            budget_tokens=args.budget,
+            # --model 不给时是 None，而 None 会绕过 refine() 的默认值，所以这里兜底
+            model=args.model or refine_mod.DEFAULT_MODEL,
+            prompt_ver=args.prompt_ver,
+            dry_run=args.dry_run,
+        )
+    except ValueError as exc:
+        sys.exit(f"[参数错误] {exc}")
 
     print("-" * 60)
+    # ⚠️ 账目必须自洽：只报「硬丢弃」的话，用户会拿 scanned − discarded_local
+    # 去对 sent_messages，然后发现差了三万多条不知道去哪了（Task 7 审查实测）。
+    # 所以主数字用「本地筛掉」（= scanned − sent），硬丢弃作为其中一项列出。
     print(
-        f"完成：扫描 {stats.scanned:,} 条，本地丢弃 {stats.discarded_local:,} 条，"
-        f"送模型 {stats.sent_messages:,} 条（{stats.batches:,} 批）"
+        f"完成：扫描 {stats.scanned:,} 条 → 本地筛掉 "
+        f"{stats.scanned - stats.sent_messages:,} 条"
+        f"（其中硬丢弃 {stats.discarded_local:,} 条）"
+        f" → 送模型 {stats.sent_messages:,} 条（{stats.batches:,} 批）"
     )
     print(f"产出条目：{stats.items_saved:,} 条")
     if not args.dry_run:
         print(f"token 用量：输入 {stats.input_tokens:,} / 输出 {stats.output_tokens:,}")
     if stats.budget_hit:
-        print("[注意] 达到预算上限提前停止，剩余消息留待下次（或调大 --budget）")
+        # 报「实际跑了多少」而不是计划数——预算 break 后两者会差很多
+        print(
+            f"[注意] 达到预算上限提前停止：实际跑了 {stats.batches} 批，"
+            f"计划 {stats.batches_planned} 批。剩余消息留待下次（或调大 --budget）"
+        )
     if stats.errors:
         print(f"\n[失败] {len(stats.errors)} 批出错：")
         for e in stats.errors[:5]:
