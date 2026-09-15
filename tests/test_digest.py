@@ -1837,3 +1837,61 @@ def test_digest_zero_sent_progress_line_has_no_zero_counts(seeded, monkeypatch,
     out = capsys.readouterr().out
     assert "0 条" not in out
     assert "一条也没送模型" in out
+
+
+# ── 非空日的覆盖率（Task 12，用户 2026-09-15 裁定追加）──────────
+#
+# 覆盖率检查原先**只存在于空窗分支**：非空日若只抽取了一部分（`vigil refine`
+# 撞预算护栏 `--budget` 会中途停），日报照常写「当天 9 个群 514 条消息，提炼出
+# 6 条」——**读起来像读遍了 514 条，实际只看了一部分**。这是同一句「可能的假话」
+# 的第四个变体，也是 M4 自动化（实跑 `refine → digest`）最容易撞上的一个。
+#
+# 判据：**只在覆盖不全时**加限定；覆盖完整时输出**一字不变**（用户已验收的
+# 9/11、9/12、9/13 三篇覆盖率实测都是 100%）。
+
+
+def test_stat_line_unchanged_when_fully_refined():
+    """覆盖完整时一字不变——用户已验收的三篇走的正是这条。"""
+    assert (
+        digest.stat_line(groups=9, messages=514, items=6, refined=514)
+        == "当天 9 个群 514 条消息，提炼出 6 条。"
+    )
+
+
+def test_stat_line_defaults_to_no_qualifier():
+    """默认不加限定，既有调用点行为不变。"""
+    assert "仅抽取" not in digest.stat_line(groups=9, messages=514, items=6)
+
+
+def test_stat_line_shows_partial_coverage():
+    """⚠️ 覆盖不全时必须说清楚，否则日报读起来像读遍了全部消息。"""
+    line = digest.stat_line(groups=9, messages=514, items=4, refined=300)
+
+    assert "仅抽取了 300/514" in line
+    assert "提炼出 4 条" in line
+
+
+def test_digest_nonempty_window_flags_partial_coverage(seeded, monkeypatch, tmp_path):
+    """端到端：非空日只抽取了一部分时，正文必须带限定。"""
+    from vigil import store
+
+    conn, since, until = seeded
+    conn.execute("DELETE FROM messages")
+    conn.executemany(
+        "INSERT INTO messages VALUES (?,?,?,?,?)",
+        [(1, 100, since + 10, "u_a", "通知：明天交体检表"),
+         (2, 100, since + 20, "u_b", "收到"),
+         (3, 100, since + 30, "u_c", "有讲座")],
+    )
+    # 只记账前两条 → 覆盖 2/3
+    store.record_run(conn, [1, 2], status=store.STATUS_DISCARDED, prompt_ver="v2")
+    conn.commit()
+    fake = _FakeLLM([{"quotes": ["体检表"], "label": "体检", "text": ""}])
+    monkeypatch.setattr("vigil.digest.chat_json", fake)
+
+    digest.digest(_Config({100: "班级群"}), api_key="k", conn=conn,
+                  since=since, until=until, day_label="2026-09-13",
+                  output_dir=tmp_path)
+
+    body = (tmp_path / "2026-09-13.md").read_text(encoding="utf-8")
+    assert "仅抽取了 2/3" in body
