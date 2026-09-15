@@ -336,6 +336,12 @@ def cmd_digest(args) -> int:
             f"[注意] 其中 {stats.mechanical} 行是程序补的（模型没写到），"
             f"读起来会生硬——这通常意味着提示词该调了"
         )
+    if stats.deadlines_dropped:
+        # 静默丢弃截止日是另一种失败——降级必须看得见
+        print(
+            f"[注意] {stats.deadlines_dropped} 条截止日在源消息里找不到字面依据，"
+            f"未进「别忘」（条目本身仍照常出现）——已保留 {stats.deadlines_kept} 条"
+        )
     if stats.unmatched_quotes:
         print(f"[注意] 有 {stats.unmatched_quotes} 处摘录没匹配上条目，已丢弃")
     if args.dry_run:

@@ -186,6 +186,70 @@ def _norm(text: str) -> str:
     return _PUNCT.sub("", text)
 
 
+# 归一化空白：实测源文里有「9 月 16 日」这种带空格写法。
+_WS = re.compile(r"\s+")
+
+
+def _date_forms(ts: int) -> tuple[str, ...]:
+    """同一个日期在中文语料里**带月份**的常见写法。全部**去空白**后比较。"""
+    d = dt.datetime.fromtimestamp(ts)
+    return (
+        f"{d.year}-{d.month:02d}-{d.day:02d}",
+        f"{d.year}/{d.month:02d}/{d.day:02d}",
+        f"{d.month}月{d.day}日",
+        f"{d.month}月{d.day}号",
+        f"{d.month:02d}-{d.day:02d}",
+        f"{d.month}-{d.day}",
+        f"{d.month}/{d.day}",
+        f"{d.month:02d}/{d.day:02d}",
+    )
+
+
+def _day_only(ts: int) -> re.Pattern[str]:
+    """**不带月份**的写法（源文实测有「16日12:00开始报名缴费」这种，只写日）。
+
+    ⚠️ 它必须走正则、**不能当普通子串比**：``"3日" in "13日"`` 为真，
+    于是源文「13日交表」会把一条 **3 日**的（模型编的）截止日判成「源文里
+    有依据」，照样进「别忘」——那正是本任务要防的同类错，只是换了个入口。
+    加数字边界后，只有这个数字**不是更长数字的一部分**时才算命中。
+    """
+    d = dt.datetime.fromtimestamp(ts)
+    return re.compile(rf"(?<!\d){d.day}[日号]")
+
+
+def deadline_supported(deadline_ts: int | None, sources: str) -> bool:
+    """源文里能不能逐字找到这个日期。**找不到就是没有依据。**
+
+    ⚠️ 判据刻意做成机械可判的（不是再叫一个模型去判）：
+    源文里找得到就是找得到，找不到就是没有依据。这样它可以被测试守卫，
+    也不会引入第二个模型的判断。
+
+    ⚠️ 为什么要这一步（首次冒烟的真实数据破坏）：M1 的抽取会补出原文没有的
+    实体，源文只写「明早7:20集合」「周六下午4.00-8.00」时它照样填了具体日期，
+    而「⏰ 别忘」把这个幻觉洗成了机器权威——用户拿去办事的地方在骗人。
+    """
+    if not deadline_ts:
+        return False
+    haystack = _WS.sub("", sources)
+    if any(form in haystack for form in _date_forms(deadline_ts)):
+        return True
+    return _day_only(deadline_ts).search(haystack) is not None
+
+
+def verified_deadlines(
+    items: list[store.WindowItem], sources: dict[int, str]
+) -> set[int]:
+    """哪些 item 的截止日在源文里有字面依据。
+
+    没有来源行的 item（``sources`` 里查不到）一律按**无依据**处理。
+    """
+    return {
+        it.item_id
+        for it in items
+        if deadline_supported(it.deadline_ts, sources.get(it.item_id, ""))
+    }
+
+
 @dataclass(frozen=True)
 class DigestLine:
     """模型返回的一行，已匹配回具体的 items。"""
@@ -206,6 +270,10 @@ class Row:
     deadline_ts: int | None
     low_confidence: bool
     mechanical: bool = False
+    # 截止日在**源文里**有没有字面依据（见 ``verified_deadlines``）。
+    # 只有 True 的行才进「⏰ 别忘」、才被打「截止 MM-DD」戳。
+    # 默认 False 是刻意的：失败方向要选安全的那边（宁可漏催，不可乱催）。
+    deadline_trusted: bool = False
 
 
 def match_lines(
@@ -286,13 +354,23 @@ def build_rows(
     items: list[store.WindowItem],
     *,
     low_confidence: float = LOW_CONFIDENCE,
+    trusted: set[int] | None = None,
 ) -> list[Row]:
     """命中行 + 机械补行 → 最终的渲染行清单。
 
     **没被任何一行引用的 item 会被机械补一行**（label 用 title、text 用 detail）。
     日报的价值在「不漏事」，所以宁可读起来生硬，也不能因为模型漏写就丢条目
     ——那正是 spec §2.3 要避免的「日报有、列表没有」的反面：列表有、日报没有。
+
+    ``trusted`` 是**截止日在源文里有字面依据**的 item_id 集合（见
+    ``verified_deadlines``）。合并行只要有一条的截止日没依据，整行就不算
+    可信——行里的日期是 ``min()`` 出来的一个数，说不清它是哪条的依据。
+
+    ⚠️ 默认必须是 ``None`` → 空集 → **全部截止日都不进「别忘」**。
+    默认成全信任的话，任何忘记传参的调用方都会静默退回危险行为：
+    把模型编出来的日期用机器口吻打出来催人办事。**失败方向选安全的那边。**
     """
+    trusted = set() if trusted is None else trusted
     by_id = {it.item_id: it for it in items}
     used: set[int] = set()
     rows: list[Row] = []
@@ -311,6 +389,8 @@ def build_rows(
                 group_id=picked[0].group_id,
                 deadline_ts=min(deadlines) if deadlines else None,
                 low_confidence=all(it.confidence < low_confidence for it in picked),
+                deadline_trusted=bool(deadlines)
+                and all(it.item_id in trusted for it in picked if it.deadline_ts),
             )
         )
 
@@ -326,6 +406,7 @@ def build_rows(
                 deadline_ts=item.deadline_ts,
                 low_confidence=item.confidence < low_confidence,
                 mechanical=True,
+                deadline_trusted=item.item_id in trusted,
             )
         )
     return rows
@@ -366,6 +447,9 @@ def render_markdown(
     * 「别忘」= 有 deadline 且 **deadline 不早于窗口起点** 的行。加下界是真实
       数据逼出来的：全库有 1 条 item 的截止日早于事件日（8/5 的条目挂 5/6），
       不过滤就会在八月日报里冒出「别忘 5 月 6 日」。
+    * **截止日还必须在源文里有字面依据**（``deadline_trusted``，Task 6）。
+      实测 4 条里 3 条是模型编的，而「别忘」正是用户拿去办事的地方。
+      没有依据的行**照常出现在它的类目区块里**（不漏事），只是不再以权威口吻催办。
     * 进了「别忘」的行**不再出现在类目区块**——同一件事读两遍是负担。
     * 低置信度的行只进「拿不准的」，即使它有截止日：存疑的信息不该催人去办。
     """
@@ -374,8 +458,12 @@ def render_markdown(
         return head + "\n没有值得一提的信息。\n"
 
     alert_idx = {
-        i for i, r in enumerate(rows)
-        if r.deadline_ts and r.deadline_ts >= window_from and not r.low_confidence
+        i
+        for i, r in enumerate(rows)
+        if r.deadline_trusted
+        and r.deadline_ts
+        and r.deadline_ts >= window_from
+        and not r.low_confidence
     }
     unsure_idx = {i for i, r in enumerate(rows) if r.low_confidence}
 
@@ -451,6 +539,10 @@ class DigestStats:
     items: int = 0
     lines: int = 0          # 模型返回且匹配成功的行数
     mechanical: int = 0     # 程序补的行数——**不为 0 就说明模型漏写了**
+    # 截止日核验（Task 6）：源文里有字面依据的 / 找不到依据被降级的。
+    # 静默丢弃截止日是另一种失败，所以两个数都要如实上报、由 CLI 打出来。
+    deadlines_kept: int = 0
+    deadlines_dropped: int = 0
     unmatched_quotes: int = 0
     messages: int = 0
     groups: int = 0
@@ -498,6 +590,16 @@ def digest(
     try:
         store.ensure_schema(conn)
         items = store.window_items(conn, since=since, until=until)
+        # 截止日核验：只有能在**该条自己的源消息**里逐字找到的日期才进「别忘」。
+        # 数据是 M1 抽的（它会补出原文没有的实体），核验放在 M2 是因为
+        # 「催办」这个动作发生在 M2——本设计裁决原意是可靠，实测却把幻觉
+        # 洗成了机器权威。降级的条数照实上报（见 CLI），不静默丢。
+        sources = store.item_sources_text(conn, [it.item_id for it in items])
+        trusted = verified_deadlines(items, sources)
+        stats.deadlines_kept = len(trusted)
+        stats.deadlines_dropped = sum(
+            1 for it in items if it.deadline_ts and it.item_id not in trusted
+        )
         messages, groups = store.window_stats(conn, since=since, until=until)
         stats.items = len(items)
         stats.messages = messages
@@ -555,7 +657,7 @@ def digest(
         stats.output_tokens = result.output_tokens
 
         lines, unmatched = match_lines(result.payload.get("lines"), items)
-        rows = build_rows(lines, items)
+        rows = build_rows(lines, items, trusted=trusted)
         stats.lines = len(lines)
         stats.unmatched_quotes = len(unmatched)
         stats.mechanical = sum(1 for r in rows if r.mechanical)

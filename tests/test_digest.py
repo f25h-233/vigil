@@ -481,6 +481,13 @@ def _render(rows, cats, *, window_from=0, names=None, groups=3, messages=412):
     )
 
 
+def _row(label, text="", kind="notice", group_id=100, deadline_ts=None,
+         low_confidence=False, mechanical=False, deadline_trusted=False):
+    """构造 ``Row`` 的助手——避免每处都写一串位置参数（Task 6 加了第 8 个字段）。"""
+    return digest.Row(label, text, kind, group_id, deadline_ts, low_confidence,
+                      mechanical, deadline_trusted)
+
+
 def test_render_header_and_stat_line(cats):
     out = _render([digest.Row("体检表", "10月8日前交", "notice", 100, None, False)], cats)
 
@@ -507,7 +514,14 @@ def test_render_omits_tail_when_group_unknown(cats):
 
 
 def test_render_alerts_section_for_future_deadline(cats):
-    rows = [digest.Row("体检表", "交到辅导员处", "notice", 100, 5000, False)]
+    """⚠️ Task 6 后「进别忘」多了一个前提：截止日必须在源文里**有依据**。
+
+    这条守的是**版式**（截至日在窗口内就进「别忘」、进了就不再在类目区块重复），
+    所以夹具给它 ``deadline_trusted=True``——三条断言一条没动，**不是弱化**。
+    「没依据就不进别忘」由 `test_render_excludes_untrusted_deadline_from_alerts` 守。
+    """
+    rows = [_row("体检表", "交到辅导员处", "notice", 100, 5000, False,
+                 deadline_trusted=True)]
 
     out = _render(rows, cats, window_from=1000)
 
@@ -1066,3 +1080,220 @@ def test_cli_digest_passes_api_key_to_llm(cli_env, monkeypatch, tmp_path):
     assert cli.main(["digest", "--date", "2026-09-13"]) == 0
 
     assert fake.configs[0].api_key == "k-cli"
+
+
+# ── 截止日核验（Task 6，冒烟抓到的真实数据破坏）────────────────
+
+
+def test_deadline_supported_finds_chinese_date():
+    import datetime as dt
+
+    ts = int(dt.datetime(2026, 9, 16, 12, 0).timestamp())
+
+    assert digest.deadline_supported(ts, "16日12:00开始报名缴费")
+    assert digest.deadline_supported(ts, "9月16日截止")
+
+
+def test_deadline_supported_tolerates_spaces_in_source():
+    """实测源文里有「9 月 16 日」这种带空格的写法。"""
+    import datetime as dt
+
+    ts = int(dt.datetime(2026, 9, 16).timestamp())
+
+    assert digest.deadline_supported(ts, "9 月 16 日 截 止")
+
+
+def test_deadline_supported_rejects_relative_time_words():
+    """⚠️ 冒烟实测：源文只写「明早」「明天」「周六下午」时，M1 却把 deadline 填成了具体日期。
+
+    这类**没有字面依据**的日期必须判为不支持——否则「别忘」会把已经发生的事
+    说成「别忘了」。
+    """
+    import datetime as dt
+
+    ts = int(dt.datetime(2026, 9, 15).timestamp())
+
+    assert not digest.deadline_supported(ts, "各位小班：明早7:20在宿舍楼下集合")
+    assert not digest.deadline_supported(ts, "周六下午4.00-8.00")
+    assert not digest.deadline_supported(ts, "明天下午5点到6点有补录的机会")
+
+
+def test_deadline_supported_false_when_no_deadline():
+    assert not digest.deadline_supported(None, "随便什么 9月16日")
+
+
+def test_deadline_supported_ignores_day_number_inside_a_longer_number():
+    """⚠️ 不写月份的那种「16日」也是**真实存在**的依据（源文实测有
+    「16日12:00开始报名缴费」），但它**不能当裸子串比**。
+
+    ``"3日" in "13日"`` 为真——不做数字边界的话，源文「13日交表」会让一条
+    **3 日**的（模型编的）截止日被判成「源文里有依据」，于是它照样被打上
+    「截止 09-03」戳进「别忘」。那正是本任务要防的同类错，只是换了个入口。
+    """
+    import datetime as dt
+
+    ts_3rd = int(dt.datetime(2026, 9, 3).timestamp())
+
+    assert not digest.deadline_supported(ts_3rd, "13日交表")
+    assert not digest.deadline_supported(ts_3rd, "23日下午面试")
+    assert digest.deadline_supported(ts_3rd, "3日截止")
+    assert digest.deadline_supported(ts_3rd, "9月3日截止")
+
+
+def test_verified_deadlines_returns_only_supported_ids():
+    import datetime as dt
+
+    ts = int(dt.datetime(2026, 9, 16).timestamp())
+    items = [
+        _item(1, title="有依据", deadline_ts=ts),
+        _item(2, title="没依据", deadline_ts=ts, event_ts=2000),
+    ]
+    sources = {1: "16日12:00开始报名", 2: "周六下午4.00-8.00"}
+
+    assert digest.verified_deadlines(items, sources) == {1}
+
+
+def test_build_rows_defaults_to_not_trusting_any_deadline():
+    """⚠️ 默认必须是「全不信任」——默认全信任的话，忘记传参的调用方会静默退回危险行为。"""
+    items = [_item(1, title="甲", deadline_ts=5000)]
+
+    rows = digest.build_rows([], items)
+
+    assert rows[0].deadline_trusted is False
+
+
+def test_build_rows_marks_trusted_deadline():
+    items = [_item(1, title="甲", deadline_ts=5000)]
+
+    rows = digest.build_rows([], items, trusted={1})
+
+    assert rows[0].deadline_trusted is True
+
+
+def test_build_rows_untrusted_when_any_merged_deadline_is_untrusted():
+    """合并行里只要有一条截止日没依据，整行就不进「别忘」。"""
+    items = [
+        _item(1, title="甲", deadline_ts=5000),
+        _item(2, title="乙", deadline_ts=6000, event_ts=2000),
+    ]
+    lines, _ = digest.match_lines(
+        [{"quotes": ["甲", "乙"], "label": "合并", "text": ""}], items
+    )
+
+    rows = digest.build_rows(lines, items, trusted={1})
+
+    assert rows[0].deadline_trusted is False
+
+
+def test_render_excludes_untrusted_deadline_from_alerts(cats):
+    """没依据的截止日不许进「别忘」，也不许被打上「截止 MM-DD」戳。"""
+    rows = [_row("存疑日期", "明天下午", "notice", 100, 5000, False)]
+
+    out = _render(rows, cats, window_from=1000)
+
+    assert "## ⏰ 别忘" not in out
+    assert "截止" not in out
+    assert "- **存疑日期**" in out        # 条目本身照常出现，不漏事
+
+
+def test_render_includes_trusted_deadline_in_alerts(cats):
+    rows = [
+        _row("有依据", "16日12:00开始", "notice", 100, 5000, False,
+             deadline_trusted=True)
+    ]
+
+    out = _render(rows, cats, window_from=1000)
+
+    assert "## ⏰ 别忘" in out
+    assert "截止 " in out
+
+
+def test_row_deadline_trusted_defaults_to_false(cats):
+    """⚠️ ``Row.deadline_trusted`` 的**字段默认值**也必须是不信任。
+
+    变异反证（实测）：把 ``Row`` 的 `deadline_trusted: bool = False` 改成
+    ``= True`` → **230 全绿存活**。原因是别处带截止日的夹具都显式传了这个参数，
+    而其余 Row 根本没有截止日（``alert_idx`` 要求 ``r.deadline_ts``），
+    所以默认值那条路径没人走过。
+
+    这个默认值兜的是**将来**的调用方：谁忘了传，谁就该得到「不催办」这个
+    安全方向（与 ``build_rows`` 的 ``trusted=None`` 同一个道理）。
+    """
+    row = digest.Row("体检表", "交到辅导员处", "notice", 100, 5000, False)
+
+    out = _render([row], cats, window_from=1000)
+
+    assert row.deadline_trusted is False
+    assert "## ⏰ 别忘" not in out
+
+
+def test_digest_wires_deadline_verification(seeded, monkeypatch, tmp_path):
+    """接线的端到端：源文有字面日期的进「别忘」，没有的不进，且计数如实上报。"""
+    import datetime as dt
+    from vigil import store
+
+    conn, since, until = seeded
+    conn.execute("DELETE FROM items")
+    conn.execute("DELETE FROM messages")
+    ts_ok = int(dt.datetime(2026, 9, 16, 12, 0).timestamp())
+    conn.execute(
+        "INSERT INTO messages VALUES (1, 100, ?, 'u_a', '9月16日12:00开始报名缴费')",
+        (since + 60,),
+    )
+    conn.execute(
+        "INSERT INTO messages VALUES (2, 100, ?, 'u_b', '明天下午5点有补录机会')",
+        (since + 120,),
+    )
+    conn.executemany(
+        "INSERT INTO items (item_id, kind, title, detail, event_ts, deadline_ts,"
+        " group_id, actor_uid, place, links, amount, confidence, model,"
+        " prompt_ver, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        [
+            (1, "academic", "四六级报名", None, since + 60, ts_ok, 100, None,
+             None, "[]", None, 0.9, "m", "v2", 1),
+            (2, "activity", "补录面试", None, since + 120, ts_ok, 100, None,
+             None, "[]", None, 0.9, "m", "v2", 1),
+        ],
+    )
+    conn.executemany(
+        "INSERT INTO item_sources (item_id, msg_id) VALUES (?,?)", [(1, 1), (2, 2)]
+    )
+    conn.commit()
+    fake = _FakeLLM([{"quotes": ["四六级报名", "补录面试"], "label": "两件事", "text": ""}])
+    monkeypatch.setattr("vigil.digest.chat_json", fake)
+
+    stats = digest.digest(_Config({100: "班级群"}), api_key="k", conn=conn,
+                          since=since, until=until, day_label="2026-09-13",
+                          output_dir=tmp_path)
+
+    assert stats.deadlines_kept == 1
+    assert stats.deadlines_dropped == 1
+    body = (tmp_path / "2026-09-13.md").read_text(encoding="utf-8")
+    # 合并行的截止日不可信 → 不该进「别忘」
+    assert "## ⏰ 别忘" not in body
+
+
+def test_cli_digest_reports_dropped_deadlines(cli_env, monkeypatch, capsys):
+    """⚠️ 降级必须**看得见**：静默丢弃截止日是另一种失败。
+
+    变异反证：删掉 ``cmd_digest`` 里那段 ``if stats.deadlines_dropped:`` 的打印
+    → 本条红（brief 那 10 条全都守不住「打印出来」这一半——`DigestStats` 上的
+    计数有测试，`cli.py` 的可见性没有）。
+    """
+    from vigil import cli
+
+    # item 1「体检表」的源消息是「通知：明天交体检表」——挂任何具体日期都没有字面依据
+    conn = sqlite3.connect(str(cli_env))
+    conn.execute("UPDATE items SET deadline_ts=? WHERE item_id=1", (5000,))
+    conn.execute("INSERT INTO item_sources (item_id, msg_id) VALUES (1, 1)")
+    conn.commit()
+    conn.close()
+    fake = _FakeLLM([{"quotes": ["体检表", "讲座"], "label": "全部", "text": ""}])
+    monkeypatch.setattr("vigil.digest.chat_json", fake)
+
+    rc = cli.main(["digest", "--date", "2026-09-13"])
+
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "1 条截止日在源消息里找不到字面依据" in out
+    assert "已保留 0 条" in out
