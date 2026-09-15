@@ -783,6 +783,57 @@ def test_search_escapes_like_wildcards():
     assert total == 0
 
 
+def _seed_two_items_for_search(conn: sqlite3.Connection) -> None:
+    """两行，且**第二行让「返回全表」区分得出来**（全表 = 2 ≠ 任何正确答案 1）。"""
+    store.ensure_schema(conn)
+    _insert_item(conn, 1, title="选课通知", kind="academic")
+    _insert_item(conn, 2, title="失物招领", kind="lostfound")
+
+
+def test_search_strips_nul_before_the_trigram_branch():
+    """⚠️ 分支一（`len(q) >= 3` → FTS5）：NUL 会让**引号不闭合**。
+
+    FTS5 解析器在 NUL 处截断，`_fts_phrase` 包出来的短语因此缺右引号
+    → 未捕获的 `OperationalError: unterminated string` → T3 上线后就是一个 **500**。
+
+    ⚠️ 阳性对照不是可选项：只断言「NUL 查询不抛异常」的话，
+    「搜索整个坏掉、永远返 0」也照样绿。所以紧跟一个**不带 NUL 的同义查询**。
+    """
+    conn = sqlite3.connect(":memory:")
+    _seed_two_items_for_search(conn)
+
+    assert store.search_items(conn, q="\x00选课通知")[1] == 1
+    assert store.search_items(conn, q="选\x00课\x00通\x00知")[1] == 1
+    # 阳性对照：剥掉 NUL 就是同一个查询，结果必须一致
+    assert store.search_items(conn, q="选课通知")[1] == 1
+    # 阴性对照：确实没有的词仍旧返回 0（守「不是永远返 1」）
+    assert store.search_items(conn, q="\x00不存在的词条")[1] == 0
+
+
+def test_search_strips_nul_before_the_like_branch():
+    """⚠️ 分支二（`len(q) <= 2` → LIKE）：NUL 会让 pattern **截断成 `%`**。
+
+    实测（不净化时，2 行的库里）：`q="\\x00课"` → `total=2`，
+    而正确答案是 **1**（只有「选课通知」含「课」）。这比 500 危险得多——
+    它是个**假数字**：页面说「共 2 条」，用户以为筛过了，其实一行都没筛。
+
+    ⚠️ 阳性对照同上：每条 NUL 查询都配一条不带 NUL 的同义查询。
+    """
+    conn = sqlite3.connect(":memory:")
+    _seed_two_items_for_search(conn)
+
+    # 正确答案 1；不净化时 LIKE 被截断成 '%' → 2（全表）
+    assert store.search_items(conn, q="\x00课")[1] == 1
+    assert store.search_items(conn, q="\x00选课")[1] == 1
+    # 阳性对照
+    assert store.search_items(conn, q="课")[1] == 1
+    assert store.search_items(conn, q="选课")[1] == 1
+
+    # ── 剥完为空串 = 不筛选（与既有「空 q 等于不筛选」契约一致）──
+    # 这里与 `q=""` 同义、返回全表是**契约**而非 bug：用户没输入任何可搜的字符。
+    assert store.search_items(conn, q="\x00\x00")[1] == store.search_items(conn, q="")[1] == 2
+
+
 def test_search_filters_by_kind_and_window():
     conn = sqlite3.connect(":memory:")
     store.ensure_schema(conn)
