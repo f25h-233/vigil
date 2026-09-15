@@ -750,12 +750,22 @@ def test_search_finds_three_chinese_chars_via_trigram():
 
 
 def test_search_survives_fts5_syntax_characters():
-    """用户输入直接喂 MATCH 会抛 OperationalError——必须被包成短语。"""
+    """用户输入直接喂 MATCH 会抛 OperationalError——必须被包成短语。
+
+    ⚠️ **必须带断言 + 阳性对照**。「调用一下不抛异常」是空守卫：
+    搜索整个坏掉（永远返回 0）时，它照样绿。
+    """
     conn = sqlite3.connect(":memory:")
     store.ensure_schema(conn)
     _insert_item(conn, 1, title="选课通知", kind="academic")
     for q in ["NOT", 'a"b', "(", "补退选 -卡", "a OR b"]:
-        store.search_items(conn, q=q)      # 不抛异常即通过
+        _, total = store.search_items(conn, q=q)
+        assert total == 0, f"{q!r} 应 0 条，实际 {total}"
+    # 阳性对照：这些字符**确实能被搜到**——否则上面那组 0 分不清
+    # 「搜索坏了」与「确实没有」。
+    _insert_item(conn, 2, title="通知（补）", kind="notice")
+    _, total = store.search_items(conn, q="（补）")
+    assert total == 1
 
 
 def test_search_escapes_like_wildcards():
