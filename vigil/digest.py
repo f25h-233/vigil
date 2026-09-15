@@ -680,7 +680,34 @@ def digest(
             total, refined = store.window_refine_coverage(
                 conn, since=since, until=until
             )
-            if refined < total:
+            if messages == 0:
+                # ⚠️ 退化输入 ①（Task 11）：窗口内一条消息都没有。
+                #
+                # 必须**排在 `refined < total` 前面**：那条判据在这里是
+                # `0 < 0`，为假——不先拦下的话，一个从没导出过的日子会走进
+                # 「已覆盖」分支说「没有值得一提的信息」，还附上「0 条被本地
+                # 规则筛掉…0 条送到模型…」两行退化句子。
+                #
+                # 此时**也不该调 `screening_breakdown`**：它只会返回 (0,0,0)，
+                # 而那句进度行「本地筛掉 0 条，送到模型 0 条」正是同一个退化
+                # 句子换了块屏幕。判据与正文共用 `_window_outside_span`。
+                span = store.message_span(conn)
+                outside = _window_outside_span((since, until), span)
+                body = render_empty_day(
+                    day=day_label, groups=groups, messages=messages,
+                    refined=refined, local_dropped=0, sent=0,
+                    span=span, window=(since, until),
+                )
+                on_progress(
+                    f"[digest] {day_label}：窗口内一条消息记录也没有——"
+                    + (
+                        "数据库里也没有覆盖这一天的数据，日报照实说「先跑 vigil export」"
+                        if outside
+                        else "但前后都有数据，日报照实说「这天真的没人说话」"
+                    )
+                    + "，不调用模型"
+                )
+            elif refined < total:
                 body = render_empty_day(
                     day=day_label, groups=groups, messages=messages,
                     refined=refined, local_dropped=0, sent=0,
@@ -697,9 +724,11 @@ def digest(
                     day=day_label, groups=groups, messages=messages,
                     refined=refined, local_dropped=local, sent=sent,
                 )
+                # ⚠️ `sent == 0` 时进度行同样不许说「送到模型 0 条」（退化输入 ②）：
+                # 这里是 `local == messages > 0`，所以「本地筛掉 N 条」本身不退化。
                 on_progress(
-                    f"[digest] {day_label}：窗口内没有条目"
-                    f"（本地筛掉 {local:,} 条，送到模型 {sent:,} 条）"
+                    f"[digest] {day_label}：窗口内没有条目（本地筛掉 {local:,} 条，"
+                    + ("一条也没送模型）" if sent == 0 else f"送到模型 {sent:,} 条）")
                 )
             return _persist(stats, conn, body, model, prompt_ver, [], write_file,
                             out_dir, day_label)
@@ -788,6 +817,23 @@ def screening_breakdown(
     return len(msgs), len(msgs) - sent, sent
 
 
+def _window_outside_span(
+    window: tuple[int, int] | None, span: tuple[int, int] | None
+) -> bool:
+    """窗口是否落在全库消息时间跨度**之外**（库为空 / 判不了时算「之外」）。
+
+    「判不了算之外」是**保守的一侧**：宁可说「这天没数据、先跑 vigil export」
+    （一句用户能验证、也能行动的话），也不许在没把握时说「这天没事」
+    ——后者正是 Task 9 审查抓到的 F1：**同一句假话换了个入口**。
+
+    提取成函数是为了让 ``digest()`` 的进度行与日报正文**共用同一个判据**：
+    两处各写一份的话，改了一处就会出现「屏幕说没数据、文件说没人说话」。
+    """
+    if span is None or window is None:
+        return True
+    return window[1] <= span[0] or window[0] > span[1]
+
+
 def render_empty_day(
     *,
     day: str,
@@ -796,16 +842,32 @@ def render_empty_day(
     refined: int,
     local_dropped: int,
     sent: int,
+    span: tuple[int, int] | None = None,
+    window: tuple[int, int] | None = None,
 ) -> str:
     """空窗日的日报正文。
 
-    **两条判据，缺一不可**：
+    **三条判据**：
 
-    1. 窗口内消息**全部有 refine_runs 记账** → 出筛除分布 +「没有值得一提的信息」
-    2. 覆盖不全 → **不许说「没有值得一提的信息」**，改说「尚未抽取」并提示先跑 refine
+    1. 窗口内**一条消息都没有** → 分两种（Task 11）：
+       ① 窗口在数据库跨度之外 → 「这天没数据，先跑 ``vigil export``」
+       ② 在跨度之内 → 「前后都有数据，这天是真的没人说话」
+    2. 窗口内消息**全部有 refine_runs 记账** → 出筛除分布 +「没有值得一提的信息」
+    3. 覆盖不全 → **不许说「没有值得一提的信息」**，改说「尚未抽取」并提示先跑 refine
 
-    第 2 条是这条需求的真正价值：把一句**可能为假**的话，换成一句**一定为真**的话。
-    在此之前，「这天确实没事」与「这天压根没抽取过」在日报里长得一模一样。
+    第 1、3 条是同一件事的三次打磨：把一句**可能为假**的话，换成一句**一定为真**
+    的话。在此之前，「这天确实没事」「这天压根没抽取过」「这天压根没导出过」
+    在日报里长得一模一样——而只有第一种是真的没事。
+
+    ⚠️ **判据 1 为什么必须排在 2 前面**：``refined < messages`` 在
+    ``messages == 0`` 时是 ``0 < 0``，**为假**——不先拦下的话，一个从没导出过
+    的日子会径直走进「已覆盖」分支，说出「没有值得一提的信息」，还附上
+    「其中 0 条被本地规则筛掉…0 条送到模型…」两行退化句子（F1）。
+    这不是新引入的，但 M4 自动化会真撞上：``vigil export`` 失败那天，
+    日报会说「今天很安静」而不是「今天没数据」。
+
+    ⚠️ **判据 1 的两个分支里，只有「之内」那支带「没有值得一提的信息」**：
+    「没数据」不是「没事」，这两句话不能互相顶替——这是 F1 的全部要点。
 
     ⚠️ 筛除分布只给三个数（``local_dropped`` / ``sent`` / ``messages``），
     三个都有确定含义、且前两者之和恒等于第三者。**括注只定性**（「纯应答 / 过短 /
@@ -813,7 +875,22 @@ def render_empty_day(
     没有唯一含义（规则层面丢的 / 真没出网的 是两回事），**读者无法验证**，
     而「一个没人能验证的数字」正是这段文案存在的意义所要防的东西（修复轮次 2）。
     """
+    # ① 窗口内一条消息都没有——「没事」还是「没数据」，必须说清是哪一种。
+    if messages == 0:
+        if _window_outside_span(window, span):
+            return (
+                f"# 守夜人日报 · {day}\n\n"
+                f"当天没有任何消息记录——数据库里也没有覆盖这一天的数据。\n\n"
+                f"先跑 `vigil export`。\n"
+            )
+        return (
+            f"# 守夜人日报 · {day}\n\n"
+            f"当天没有任何消息记录。\n\n"
+            f"数据库里前后都有数据，所以这天是真的没人说话。\n"
+            f"\n没有值得一提的信息。\n"
+        )
     head = f"# 守夜人日报 · {day}\n\n当天 {groups} 个群 {messages:,} 条消息。\n"
+    # ② 覆盖不全（原判据，不变）
     if refined < messages:
         return (
             f"# 守夜人日报 · {day}\n\n"
@@ -821,12 +898,19 @@ def render_empty_day(
             f"**本窗口尚未抽取**（{refined:,}/{messages:,}）。\n\n"
             f"先跑 `vigil refine` 再生成日报。\n"
         )
-    return (
-        head
-        + f"\n其中 {local_dropped:,} 条被本地规则筛掉（纯应答 / 过短 / 刷屏广告一类），"
-        + f"\n{sent:,} 条送到模型后判为无价值。\n"
-        + "\n没有值得一提的信息。\n"
-    )
+    # ③ 已覆盖：出筛除分布。⚠️ `sent == 0` 与「送了但判为无价值」是两回事，
+    # 不许把前者渲染成「0 条送到模型后判为无价值」——那是一句**没发生的事**。
+    if sent == 0:
+        tail = (
+            f"其中 {local_dropped:,} 条被本地规则筛掉（纯应答 / 过短 / 刷屏广告一类），"
+            f"没有送模型。\n"
+        )
+    else:
+        tail = (
+            f"其中 {local_dropped:,} 条被本地规则筛掉（纯应答 / 过短 / 刷屏广告一类），"
+            f"\n{sent:,} 条送到模型后判为无价值。\n"
+        )
+    return head + "\n" + tail + "\n没有值得一提的信息。\n"
 
 
 def _persist(

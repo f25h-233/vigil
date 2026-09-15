@@ -330,6 +330,30 @@ def window_refine_coverage(
     return total, refined
 
 
+def message_span(conn: sqlite3.Connection) -> tuple[int, int] | None:
+    """全库消息的 ``(最早 ts, 最晚 ts)``；一条都没有时 None。
+
+    空窗日靠它分清「**这天没数据**」与「**这天真的没人说话**」——
+    两者在旧版里都渲染成「没有值得一提的信息」，而前者是句假话。
+
+    ⚠️ **为什么要看全库的最值、而不是「窗口前面有没有消息」**：窗口落在
+    跨度之外时，库里的消息一条都不可能与这天相邻；而只要窗口夹在
+    ``(MIN(ts), MAX(ts))`` 之间，就必然**前后都有数据**——后者正是
+    「这天真的没人说话」这句话成立的依据。只看单侧（比如「窗口之前有没有
+    消息」）会在「库里的数据全在这天之后」时说不出口径相同的结论。
+
+    ⚠️ **本库里 ``MIN(ts) = 0``**（实测 14 条 ts=0 的脏数据），所以「窗口
+    早于全部数据」那一侧实际上测不出来——真正管用的是 ``MAX(ts)`` 那一侧，
+    而 F1 要修的正是那一侧（``--date`` 默认查昨天，而库里的数据只到更早）。
+    不去过滤这批脏数据：``window_stats`` 对它们的态度也是「天然落在窗口外」，
+    这里保持一致，免得两处口径分家。
+    """
+    row = conn.execute("SELECT MIN(ts), MAX(ts) FROM messages").fetchone()
+    if not row or row[0] is None:
+        return None
+    return int(row[0]), int(row[1])
+
+
 def save_digest(
     conn: sqlite3.Connection,
     *,

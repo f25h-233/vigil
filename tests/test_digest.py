@@ -1649,5 +1649,147 @@ def test_digest_empty_window_breakdown_end_to_end(seeded, monkeypatch, tmp_path)
     assert "3/3" not in body          # 覆盖信息只在未抽取分支里出现
     # 三条都没命中保留规则 → 一条都没出网；括注只定性、不带任何计数
     assert "其中 3 条被本地规则筛掉（纯应答 / 过短 / 刷屏广告一类）" in body
-    assert "0 条送到模型后判为无价值" in body
+    # ⚠️ Task 11：`sent == 0` 时不许渲染「0 条送到模型后判为无价值」——
+    # 「没送模型」与「送了但判为无价值」是两回事，前者不能装成后者。
+    assert "没有送模型" in body
+    assert "0 条送到模型" not in body
     assert "硬丢弃" not in body
+
+
+# ── 空窗日的两个退化输入（Task 11）─────────────────────────────
+
+
+def test_render_empty_day_no_messages_at_all_outside_span():
+    """⚠️ F1：窗口落在数据库时间范围之外时，说「没事」是假话——那是**没数据**。"""
+    out = digest.render_empty_day(
+        day="2026-09-14", groups=0, messages=0, refined=0,
+        local_dropped=0, sent=0, span=(1000, 3000),
+    )
+
+    assert "没有值得一提的信息" not in out
+    assert "vigil export" in out
+    assert "0 条被本地规则筛掉" not in out        # 退化句子不许出现
+
+
+def test_render_empty_day_no_messages_but_inside_span():
+    """窗口落在范围之内却 0 条 → 是真的没人说话。"""
+    out = digest.render_empty_day(
+        day="2026-09-14", groups=0, messages=0, refined=0,
+        local_dropped=0, sent=0, span=(1000, 3000),
+        window=(2000, 2999),
+    )
+
+    assert "没有值得一提的信息" in out
+    assert "真的没人说话" in out
+
+
+def test_render_empty_day_zero_sent_does_not_say_zero():
+    """⚠️ sent == 0 时不许渲染「0 条送到模型后判为无价值」。"""
+    out = digest.render_empty_day(
+        day="2026-08-08", groups=1, messages=20, refined=20,
+        local_dropped=20, sent=0, span=(1, 10**12),
+    )
+
+    assert "0 条送到模型" not in out
+    assert "没有送模型" in out
+    assert "没有值得一提的信息" in out
+
+
+def test_digest_zero_message_window_outside_span_says_export(seeded, monkeypatch,
+                                                             tmp_path):
+    """端到端接线：窗口落在数据库跨度之外时，说「先跑 vigil export」。
+
+    ⚠️ 光测 `render_empty_day` 的参数不够——`digest()` 忘传 `span`/`window`
+    时那几条单测照样绿（默认 `None` 走「没数据」分支），而真实入口
+    （M4 自动跑 `vigil digest`，`vigil export` 失败那天）仍是老样子。
+    这条钉死接线。
+    """
+    conn, since, until = seeded
+    conn.execute("DELETE FROM items")
+    conn.commit()
+    fake = _FakeLLM([])
+    monkeypatch.setattr("vigil.digest.chat_json", fake)
+
+    out_since, out_until = digest.day_window("2026-09-20")
+    digest.digest(_Config({100: "班级群"}), api_key="k", conn=conn,
+                  since=out_since, until=out_until, day_label="2026-09-20",
+                  output_dir=tmp_path)
+
+    body = (tmp_path / "2026-09-20.md").read_text(encoding="utf-8")
+    assert "vigil export" in body
+    assert "没有值得一提的信息" not in body
+    assert "被本地规则筛掉" not in body
+
+
+def test_digest_zero_message_window_inside_span_says_really_quiet(seeded, monkeypatch,
+                                                                 tmp_path):
+    """端到端接线：前后都有数据、窗口内确实 0 条 → 「真的没人说话」。"""
+    conn, since, until = seeded
+    conn.execute("DELETE FROM items")
+    conn.execute("DELETE FROM messages")
+    conn.executemany(
+        "INSERT INTO messages VALUES (?,?,?,?,?)",
+        [(1, 100, since - 1000, "u_a", "前一天在聊"),
+         (2, 100, until + 1000, "u_b", "后一天在聊")],
+    )
+    conn.commit()
+    fake = _FakeLLM([])
+    monkeypatch.setattr("vigil.digest.chat_json", fake)
+
+    digest.digest(_Config({100: "班级群"}), api_key="k", conn=conn,
+                  since=since, until=until, day_label="2026-09-13",
+                  output_dir=tmp_path)
+
+    body = (tmp_path / "2026-09-13.md").read_text(encoding="utf-8")
+    assert "真的没人说话" in body
+    assert "vigil export" not in body
+    assert "没有值得一提的信息" in body
+
+
+def test_digest_no_data_progress_line_has_no_zero_counts(seeded, monkeypatch,
+                                                         capsys, tmp_path):
+    """⚠️ 屏幕上的进度行与日报正文同标准：退化输入下不许打印「0 条」句子。
+
+    旧代码在「已覆盖」分支无条件打印「（本地筛掉 0 条，送到模型 0 条）」——
+    正文修好了、屏幕上还在说同一句退化的话（同一个假话的第三个出口：
+    文件、进度行、CLI 汇总行）。
+    """
+    conn, since, until = seeded
+    conn.execute("DELETE FROM items")
+    conn.commit()
+    monkeypatch.setattr("vigil.digest.chat_json", _FakeLLM([]))
+
+    out_since, out_until = digest.day_window("2026-09-20")
+    digest.digest(_Config({100: "班级群"}), api_key="k", conn=conn,
+                  since=out_since, until=out_until, day_label="2026-09-20",
+                  output_dir=tmp_path)
+
+    out = capsys.readouterr().out
+    assert "0 条" not in out
+    assert "先跑 vigil export" in out
+
+
+def test_digest_zero_sent_progress_line_has_no_zero_counts(seeded, monkeypatch,
+                                                           capsys, tmp_path):
+    """`sent == 0` 时进度行同样不许说「送到模型 0 条」（退化输入 ②）。"""
+    from vigil import store
+
+    conn, since, until = seeded
+    conn.execute("DELETE FROM items")
+    conn.execute("DELETE FROM messages")
+    conn.executemany(
+        "INSERT INTO messages VALUES (?,?,?,?,?)",
+        [(1, 100, since + 10, "u_a", "收到"), (2, 100, since + 20, "u_b", "dd"),
+         (3, 100, since + 30, "u_c", "随便聊聊天气不错啊今天挺热的")],
+    )
+    store.record_run(conn, [1, 2, 3], status=store.STATUS_DISCARDED, prompt_ver="v2")
+    conn.commit()
+    monkeypatch.setattr("vigil.digest.chat_json", _FakeLLM([]))
+
+    digest.digest(_Config({100: "班级群"}), api_key="k", conn=conn,
+                  since=since, until=until, day_label="2026-09-13",
+                  output_dir=tmp_path)
+
+    out = capsys.readouterr().out
+    assert "0 条" not in out
+    assert "一条也没送模型" in out

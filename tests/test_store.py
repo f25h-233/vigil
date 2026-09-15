@@ -551,3 +551,19 @@ def test_window_refine_coverage_ignores_error_rows(memdb):
                      err="429")
 
     assert store.window_refine_coverage(memdb, since=1000, until=4000) == (3, 2)
+
+
+# ── 全库时间跨度：分清「这天没数据」与「这天没人说话」（Task 11）──────
+
+
+def test_message_span_returns_min_and_max(memdb):
+    _seed_messages(memdb)          # ts = 1000 / 2000 / 3000
+
+    assert store.message_span(memdb) == (1000, 3000)
+
+
+def test_message_span_none_when_no_messages(memdb):
+    _seed_messages(memdb)
+    memdb.execute("DELETE FROM messages")
+
+    assert store.message_span(memdb) is None
