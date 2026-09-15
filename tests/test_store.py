@@ -515,3 +515,21 @@ def test_item_sources_text_empty_input(memdb):
     store.ensure_schema(memdb)
 
     assert store.item_sources_text(memdb, []) == {}
+
+
+# ── 空窗日的抽取覆盖自证（Task 9，用户验收后追加）──────────────
+
+
+def test_window_refine_coverage_counts_recorded_messages(memdb):
+    _seed_messages(memdb)          # 3 条消息
+    store.ensure_schema(memdb)
+    store.record_run(memdb, [1, 2], status=store.STATUS_DISCARDED, prompt_ver="v2")
+
+    assert store.window_refine_coverage(memdb, since=1000, until=4000) == (3, 2)
+
+
+def test_window_refine_coverage_empty_window(memdb):
+    _seed_messages(memdb)
+    store.ensure_schema(memdb)
+
+    assert store.window_refine_coverage(memdb, since=9000, until=9999) == (0, 0)
