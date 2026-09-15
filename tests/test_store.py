@@ -478,3 +478,40 @@ def test_save_digest_records_provenance_columns(memdb):
         (digest_id,),
     ).fetchone()
     assert row == ("qwen3.5-test", "digest-v9", 12345)
+
+
+# ── 源消息正文（M2 Task 6：截止日核验）─────────────────────
+
+
+def test_item_sources_text_joins_all_messages(memdb):
+    _seed_messages(memdb)          # msg 1/2/3
+    store.ensure_schema(memdb)
+    conn = memdb
+    conn.execute(
+        "INSERT INTO items (item_id, kind, title, detail, event_ts, deadline_ts,"
+        " group_id, actor_uid, place, links, amount, confidence, model,"
+        " prompt_ver, created_at) VALUES (1,'notice','t',NULL,1000,NULL,100,"
+        " NULL,NULL,'[]',NULL,0.9,'m','v2',1)"
+    )
+    conn.executemany(
+        "INSERT INTO item_sources (item_id, msg_id) VALUES (?,?)", [(1, 1), (1, 3)]
+    )
+    conn.commit()
+
+    got = store.item_sources_text(conn, [1])
+
+    assert set(got) == {1}
+    assert "明天有讲座" in got[1] and "二手自行车出" in got[1]
+
+
+def test_item_sources_text_skips_items_without_sources(memdb):
+    _seed_messages(memdb)
+    store.ensure_schema(memdb)
+
+    assert store.item_sources_text(memdb, [999]) == {}
+
+
+def test_item_sources_text_empty_input(memdb):
+    store.ensure_schema(memdb)
+
+    assert store.item_sources_text(memdb, []) == {}

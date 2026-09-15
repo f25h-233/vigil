@@ -343,3 +343,32 @@ def save_digest(
     )
     conn.commit()
     return digest_id
+
+
+def item_sources_text(
+    conn: sqlite3.Connection, item_ids: list[int]
+) -> dict[int, str]:
+    """把每条 item 的**源消息正文**按 item_id 拼起来。
+
+    用途：核验「截止日是不是源文里真有的」（``digest.deadline_supported``）。
+
+    ⚠️ 为什么需要这么做：M1 的抽取**会补出原文没有的实体**，截止日是重灾区。
+    首次冒烟实测：窗口内 4 条 deadline 有 3 条在源文里毫无依据，且方向一致
+    地往后飘（源文「明早7:20集合」被填成 9-15、「周六下午4.00-8.00」被填成
+    9-19，而那场面试 9/12 就面完了）。
+
+    没有来源行的 item 不出现在返回里——调用方按「无依据」处理。
+    """
+    if not item_ids:
+        return {}
+    marks = ",".join("?" * len(item_ids))
+    rows = conn.execute(
+        f"SELECT s.item_id, m.content FROM item_sources s"
+        f" JOIN messages m ON m.msg_id = s.msg_id"
+        f" WHERE s.item_id IN ({marks})",
+        list(item_ids),
+    ).fetchall()
+    grouped: dict[int, list[str]] = {}
+    for item_id, content in rows:
+        grouped.setdefault(item_id, []).append(content or "")
+    return {k: "\n".join(v) for k, v in grouped.items()}
