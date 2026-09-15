@@ -545,7 +545,17 @@ def _persist(
     out_dir: Path,
     day_label: str,
 ) -> DigestStats:
-    """落库 + 落文件。两件都做，或（write_file=False）只落库。"""
+    """落库 + 落文件。两件都做，或（write_file=False）只落库。
+
+    ⚠️ **落文件必须显式 ``newline="\\n"``。** `Path.write_text` 的
+    ``newline=None`` 会把 ``\\n`` 翻译成 ``os.linesep``，于是 Windows 上
+    落出来的 ``.md`` 是 CRLF、而库里 ``body_md`` 是 LF——**同一篇日报的两个
+    副本在字节层就不相等**（审查实测：文件 204 字节 / 库 106 字节）。
+    后果不是「多了几个 \\r」这么轻：任何按字节对账的下游（M3 的 Web 与文件
+    比对、hash 校验、把 .md 提交进 git 后被 autocrlf 反复改写）都会看到
+    无意义 diff，而且「库副本 == 文件副本」这条不变量**没法用最自然的写法
+    断言**——只能打折扣按文本比，那种折扣正是将来出事的入口。
+    """
     stats.digest_id = store.save_digest(
         conn,
         window_from=stats.window_from,
@@ -558,6 +568,6 @@ def _persist(
     if write_file:
         path = out_dir / f"{day_label}.md"
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(body, encoding="utf-8")
+        path.write_text(body, encoding="utf-8", newline="\n")
         stats.output_path = str(path)
     return stats
