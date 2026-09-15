@@ -452,9 +452,19 @@ def build_rows(
     return rows
 
 
-def stat_line(*, groups: int, messages: int, items: int) -> str:
-    """日报开头那句话。数字全部由程序算，不问模型——它编过。"""
+def stat_line(
+    *, groups: int, messages: int, items: int, refined: int | None = None
+) -> str:
+    """日报开头那句话。数字全部由程序算，不问模型——它编过。
+
+    ⚠️ **覆盖不全时必须加限定**：非空日若只抽取了一部分（如 `vigil refine` 撞了
+    预算护栏中途停），不加限定的话「当天 N 条消息，提炼出 M 条」**读起来像读遍了
+    全部 N 条**。默认 ``refined=None`` 表示「不加限定」，与既有调用点兼容；
+    覆盖完整时输出一字不变（用户已验收的三篇走的正是这条）。
+    """
     base = f"当天 {groups} 个群 {messages:,} 条消息"
+    if refined is not None and refined < messages:
+        base += f"（仅抽取了 {refined:,}/{messages:,}）"
     return f"{base}，提炼出 {items} 条。" if items else f"{base}。"
 
 
@@ -645,7 +655,15 @@ def digest(
         stats.messages = messages
         stats.groups = groups
 
-        summary = stat_line(groups=groups, messages=messages, items=len(items))
+        # ⚠️ Task 12：覆盖率检查原先**只存在于空窗分支**。非空日若只抽取了一部分
+        # （`vigil refine` 撞预算护栏 `--budget` 会中途停），那句「当天 N 条消息，
+        # 提炼出 M 条」读起来就像读遍了全部 N 条——同一句假话的第四个变体，
+        # 也是 M4 自动化（实跑 `refine → digest`）最容易撞上的一个。
+        # 覆盖完整时 `stat_line` 的输出**一字不变**。
+        _, refined = store.window_refine_coverage(conn, since=since, until=until)
+        summary = stat_line(
+            groups=groups, messages=messages, items=len(items), refined=refined
+        )
 
         # ⚠️ --dry-run 必须排在「空窗」分支**前面**。
         #
