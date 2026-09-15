@@ -690,18 +690,16 @@ def digest(
                     f"**尚未抽取完**——日报只说明这个，不下「没事」的结论"
                 )
             else:
-                _, local, sent, hard_dropped = screening_breakdown(
+                _, local, sent = screening_breakdown(
                     conn, config, since=since, until=until
                 )
                 body = render_empty_day(
                     day=day_label, groups=groups, messages=messages,
                     refined=refined, local_dropped=local, sent=sent,
-                    hard_dropped=hard_dropped,
                 )
                 on_progress(
                     f"[digest] {day_label}：窗口内没有条目"
-                    f"（本地筛掉 {local:,} 条，其中硬丢弃 {hard_dropped:,} 条；"
-                    f"送到模型 {sent:,} 条）"
+                    f"（本地筛掉 {local:,} 条，送到模型 {sent:,} 条）"
                 )
             return _persist(stats, conn, body, model, prompt_ver, [], write_file,
                             out_dir, day_label)
@@ -753,8 +751,8 @@ def digest(
 
 def screening_breakdown(
     conn: sqlite3.Connection, config: Config, *, since: int, until: int
-) -> tuple[int, int, int, int]:
-    """窗口内的 (消息总数, 本地筛掉, 送模型, 硬丢弃)。
+) -> tuple[int, int, int]:
+    """窗口内的 (消息总数, 本地筛掉, 送模型)。
 
     ⚠️ **为什么要重算而不是查 `refine_runs`**：那张表只记
     ``discarded`` / ``ok``，而「本地规则筛掉」与「送模型后判无价值」
@@ -768,12 +766,14 @@ def screening_breakdown(
     （夸大约 20 倍），而这句错话恰好出在「专门用来防止假数字」的那段文案里
     （修复轮次 1）。**`screen_stats.dropped` 只是「硬丢弃」，不是「没出网」。**
 
-    ``hard_dropped`` 是**硬丢弃里确实没出网的那部分**（硬丢弃 ∩ 本地筛掉），
-    与 ``local`` 构成子集关系，文案才敢写「含 N 条硬丢弃」。
-    ⚠️ 它**不等于** ``screen_stats.dropped``：8/8 实测硬丢弃共 83 条，其中 **2 条
-    被 ``expand_context`` 当上下文邻居拉进了 ``in_scope``**——按硬规则判死、
-    却仍发给了模型，所以算在 ``sent`` 里、不算在 ``local`` 里。写成 83 的话
-    「1,014 条里含 83 条」就是**假话**（差 2 条）。
+    ⚠️ **为什么不报「硬丢弃」计数**（修复轮次 2）：``screen_stats.dropped`` 只算硬丢弃，
+    而它与 ``local`` **不是子集关系**——``expand_context`` 取 ±2 邻居时**不看那条消息
+    有没有被丢**，所以被硬规则判死的消息照样可能作为上下文出网。于是「含 N 条硬丢弃」
+    里的 N 至少有三种都讲得通的读法（规则层面丢的 83 / 真没出网的 81 / …），
+    **读者无从判断该信哪个，也没法验证**。一个没人能验证的数字不如不给：文案只留
+    ``1,014 / 45 / 1,059`` 三个**含义确定、且彼此自洽**（前两者之和 == 第三者）的数，
+    括注回到定性描述。（首版为此借过 ``prefilter._flood_ids`` / ``_drop_reason``
+    来算那个交集，已随计数一并删掉——没有消费方的私有借用就是纯异味。）
 
     ⚠️ **已知边界（固有代价，不是 bug）**：
     ① ``config/groups.toml`` 的 ``tier`` 与 ``prefilter`` 规则**与 refine 当时一致**；
@@ -785,19 +785,7 @@ def screening_breakdown(
     candidates, _ = prefilter.screen(msgs, tier_of=config.tier_of)
     in_scope = prefilter.expand_context(msgs, candidates, context=REFINE_CONTEXT)
     sent = len(in_scope)
-    # 「硬丢弃 ∩ 没出网」不能拿 `screen_stats.dropped` 顶替（见 docstring）。
-    # 这里复用 prefilter 自己的判定函数而不是另写一套：**同一套规则只该有一份
-    # 实现**，两处各写一份必然漂移。⚠️ flood 集合必须按**全窗口**算
-    # （screen 内部就是这么算的）；在子集上重算会变小，分类就对不上了。
-    scope_ids = {m.msg_id for m in in_scope}
-    flood = prefilter._flood_ids(msgs)
-    hard_dropped = sum(
-        1
-        for m in msgs
-        if m.msg_id not in scope_ids
-        and prefilter._drop_reason(m, flood=flood) is not None
-    )
-    return len(msgs), len(msgs) - sent, sent, hard_dropped
+    return len(msgs), len(msgs) - sent, sent
 
 
 def render_empty_day(
@@ -808,7 +796,6 @@ def render_empty_day(
     refined: int,
     local_dropped: int,
     sent: int,
-    hard_dropped: int = 0,
 ) -> str:
     """空窗日的日报正文。
 
@@ -820,10 +807,11 @@ def render_empty_day(
     第 2 条是这条需求的真正价值：把一句**可能为假**的话，换成一句**一定为真**的话。
     在此之前，「这天确实没事」与「这天压根没抽取过」在日报里长得一模一样。
 
-    ``hard_dropped`` 只在「覆盖完整」那条分支里读（未抽取分支一个字都不许提，
-    那时连筛都没跑过），所以默认 0 是安全的——**默认值只在覆盖不全时被忽略**。
-    ⚠️ 它必须是 ``local_dropped`` 的**子集**（见 ``screening_breakdown``），
-    文案里也照实写「**含**」：并列项与子集项在读者眼里是两件事。
+    ⚠️ 筛除分布只给三个数（``local_dropped`` / ``sent`` / ``messages``），
+    三个都有确定含义、且前两者之和恒等于第三者。**括注只定性**（「纯应答 / 过短 /
+    刷屏广告一类」）——曾经这里还带一个「含 N 条硬丢弃」的计数，已删：那个 N
+    没有唯一含义（规则层面丢的 / 真没出网的 是两回事），**读者无法验证**，
+    而「一个没人能验证的数字」正是这段文案存在的意义所要防的东西（修复轮次 2）。
     """
     head = f"# 守夜人日报 · {day}\n\n当天 {groups} 个群 {messages:,} 条消息。\n"
     if refined < messages:
@@ -835,8 +823,7 @@ def render_empty_day(
         )
     return (
         head
-        + f"\n其中 {local_dropped:,} 条被本地规则筛掉"
-        + f"（含 {hard_dropped:,} 条硬丢弃：纯应答 / 过短 / 刷屏广告），"
+        + f"\n其中 {local_dropped:,} 条被本地规则筛掉（纯应答 / 过短 / 刷屏广告一类），"
         + f"\n{sent:,} 条送到模型后判为无价值。\n"
         + "\n没有值得一提的信息。\n"
     )
