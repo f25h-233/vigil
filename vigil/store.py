@@ -541,6 +541,32 @@ def _escape_like(q: str) -> str:
     return q.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
+# C0 控制字符（U+0000–U+001F），含 NUL。它们不承担任何搜索语义。
+_CONTROL_TRANS = str.maketrans("", "", "".join(chr(c) for c in range(0x20)))
+
+
+def _strip_controls(q: str) -> str:
+    """剥掉 C0 控制字符（含 NUL）。**必须在 trigram / LIKE 分岔之前调用。**
+
+    ⚠️ 一个 NUL 能让**两条路径各出一个假结果**，而且都能从 HTTP 触发
+    （``q`` 是用户直接给的查询串）。实测（内存库 2 行）：
+
+    - ``len(q) >= 3`` → FTS5 解析器在 NUL 处**截断**，``_fts_phrase`` 包出来的
+      引号因此不闭合 → 未捕获的 ``OperationalError: unterminated string``
+      → T3 上线后就是一个 **500**。
+      实测：``q='\\x00选课通知'`` / ``q='选\\x00课'`` 都抛这个错。
+    - ``len(q) <= 2`` → SQLite 的 LIKE 把 pattern 在 NUL 处**截断成 ``%``**
+      → **返回全表**。实测：``q='\\x00课'`` 在 2 行的库里返回 ``total=2``，
+      而正确答案是 1（只有「选课通知」含「课」）。
+      这比报错危险得多——它是个**假数字**：页面会说「共 2 条」，
+      用户以为搜到了，其实一行都没筛。本项目最忌的就是这类错。
+
+    控制字符本来就不承担搜索语义，剥掉不会让哪个正常查询失去结果。
+    剥完为空串时按「不筛选」处理——与既有的「空 ``q`` 等于不筛选」契约一致。
+    """
+    return q.translate(_CONTROL_TRANS)
+
+
 @dataclass(frozen=True)
 class ApiItem:
     """喂给 Web 的一条条目。列名与 API 契约逐字对应。
@@ -667,6 +693,10 @@ def _item_filters(
     if group is not None:
         where.append("i.group_id = ?")
         params.append(group)
+    if q is not None:
+        # ⚠️ 净化必须在这里、**分岔之前**——两条路径各有各的坏法（见 _strip_controls）。
+        # 剥完为空串就与「没传 q」同义：沿用「空 q 等于不筛选」的既有契约。
+        q = _strip_controls(q)
     if q:
         if len(q) >= MIN_TRIGRAM:
             where.append(
