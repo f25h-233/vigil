@@ -8,11 +8,13 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import sqlite3
 import sys
 
 from . import export as export_mod
 from . import qqdb, reader
 from . import refine as refine_mod
+from . import store
 from .config import ConfigError, load_config, load_key
 
 
@@ -274,6 +276,12 @@ def cmd_refine(args) -> int:
             f"[注意] 达到预算上限提前停止：实际跑了 {stats.batches} 批，"
             f"计划 {stats.batches_planned} 批。剩余消息留待下次（或调大 --budget）"
         )
+    if stats.deadlines_dropped:
+        # 降级必须看得见——静默丢掉一个日期和静默编造一个日期同样有害
+        print(
+            f"[注意] {stats.deadlines_dropped} 条截止日在源消息里找不到字面依据，"
+            f"未落库（条目本身仍照常出现）"
+        )
     if stats.errors:
         print(f"\n[失败] {len(stats.errors)} 批出错：")
         for e in stats.errors[:5]:
@@ -356,6 +364,48 @@ def cmd_digest(args) -> int:
     return 0
 
 
+def cmd_deadline_audit(args) -> int:
+    """截止日核验：列出源文里**找不到字面依据**的 deadline_ts。--apply 才写库。"""
+    from . import deadline as deadline_mod
+
+    config = _load_config_only()
+    db = _require_export_db(config)
+
+    conn = sqlite3.connect(str(db))
+    try:
+        rows = store.items_with_deadline(conn)
+        if not rows:
+            print("（库里没有带截止日的条目）")
+            return 0
+        sources = store.item_sources_text(conn, [r[0] for r in rows])
+        bad = deadline_mod.unverified_item_ids(rows, sources)
+        kept = [r for r in rows if r[0] not in bad]
+
+        print(f"带截止日的条目：{len(rows)} 条")
+        print(f"  源文里找得到依据：{len(kept)} 条")
+        print(f"  找不到依据（应清掉）：{len(bad)} 条")
+        for item_id, ts in rows:
+            if item_id in bad:
+                title = conn.execute(
+                    "SELECT title FROM items WHERE item_id = ?", (item_id,)
+                ).fetchone()[0]
+                print(
+                    f"    item {item_id}: 标着 "
+                    f"{dt.datetime.fromtimestamp(ts):%Y-%m-%d} · {title[:24]}"
+                )
+        if not bad:
+            print("无需改动。")
+            return 0
+        if not args.apply:
+            print("\n（--dry-run：未写库。确认无误后加 --apply）")
+            return 0
+        changed = store.clear_deadlines(conn, sorted(bad))
+        print(f"\n已把 {changed} 条的 deadline_ts 置 NULL（其余字段未动）。")
+        return 0
+    finally:
+        conn.close()
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="vigil", description="VIGIL 守夜人")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -411,6 +461,12 @@ def main(argv: list[str] | None = None) -> int:
     )
     p_refine.add_argument("--dry-run", action="store_true", help="只报告不调用模型")
     p_refine.set_defaults(func=cmd_refine)
+
+    p_dl = sub.add_parser(
+        "deadline-audit", help="截止日核验：源文里找不到依据的一律清掉"
+    )
+    p_dl.add_argument("--apply", action="store_true", help="真的写库（默认只报告）")
+    p_dl.set_defaults(func=cmd_deadline_audit)
 
     p_digest = sub.add_parser("digest", help="日报：把 items 合成一天一页 Markdown")
     p_digest.add_argument("--date", help="日报日期 YYYY-MM-DD（默认昨天）")
