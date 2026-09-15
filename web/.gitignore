@@ -1,0 +1,7 @@
+node_modules/
+dist/
+dev-dist/
+*.local
+
+# tsc -b 的增量构建缓存（机器本地，不该入库）
+*.tsbuildinfo
