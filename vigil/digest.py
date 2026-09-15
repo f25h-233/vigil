@@ -21,10 +21,14 @@ from __future__ import annotations
 import datetime as dt
 import json
 import re
+import sqlite3
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from . import store
-from .llm import sanitize_for_llm
+from .categories import load_categories
+from .config import Config, REPO_ROOT
+from .llm import DEFAULT_MODEL, LLMConfig, LLMError, chat_json, sanitize_for_llm
 from .redact import Redactor
 
 # 日报有自己的提示词版本，与 refine.PROMPT_VERSION 各记各的。
@@ -385,3 +389,170 @@ def day_window(date_str: str) -> tuple[int, int]:
             f"日期格式应为 YYYY-MM-DD，实际是 {date_str!r}"
         ) from exc
     return int(start.timestamp()), int((start + dt.timedelta(days=1)).timestamp())
+
+
+# 日报落盘目录。相对仓库根，与 spec §4.6 的约定一致。
+DEFAULT_OUTPUT_DIR = REPO_ROOT / "docs" / "digests"
+
+
+@dataclass
+class DigestStats:
+    """如实报告——模型漏写的、匹配失败的、程序补的，都要看得见。"""
+
+    day: str = ""
+    window_from: int = 0
+    window_to: int = 0
+    items: int = 0
+    lines: int = 0          # 模型返回且匹配成功的行数
+    mechanical: int = 0     # 程序补的行数——**不为 0 就说明模型漏写了**
+    unmatched_quotes: int = 0
+    messages: int = 0
+    groups: int = 0
+    input_tokens: int = 0
+    output_tokens: int = 0
+    digest_id: int | None = None
+    output_path: str = ""
+    errors: list[str] = field(default_factory=list)
+
+
+def digest(
+    config: Config,
+    *,
+    api_key: str,
+    db_path: Path | None = None,
+    conn: sqlite3.Connection | None = None,
+    since: int,
+    until: int,
+    day_label: str,
+    model: str = DEFAULT_MODEL,
+    enable_thinking: bool | None = False,
+    output_dir: Path | None = None,
+    write_file: bool = True,
+    dry_run: bool = False,
+    prompt_ver: str = PROMPT_VERSION,
+    on_progress=print,
+) -> DigestStats:
+    """合成一天的日报并落库（可选落文件）。
+
+    连接由调用方持有：CLI 传 db_path，测试传内存 conn（与 refine 同款约定）。
+    """
+    if until <= since:
+        raise ValueError(f"结束时间必须晚于开始时间：{since} → {until}")
+
+    stats = DigestStats(
+        day=day_label, window_from=since, window_to=until,
+    )
+    names = {g.id: g.name for g in config.groups}
+    cats = load_categories()
+    out_dir = output_dir or DEFAULT_OUTPUT_DIR
+
+    owns_conn = conn is None
+    if conn is None:
+        conn = sqlite3.connect(str(db_path or config.output_db))
+    try:
+        store.ensure_schema(conn)
+        items = store.window_items(conn, since=since, until=until)
+        messages, groups = store.window_stats(conn, since=since, until=until)
+        stats.items = len(items)
+        stats.messages = messages
+        stats.groups = groups
+
+        summary = stat_line(groups=groups, messages=messages, items=len(items))
+
+        # ⚠️ --dry-run 必须排在「空窗」分支**前面**。
+        #
+        # 规划期的端到端实测抓到过这个顺序错误：原本空窗分支在前且无条件
+        # ``_persist``，于是 `vigil digest --date <空窗日> --dry-run` **照样写库
+        # 落文件**。单元测试没抓到，是因为它用的样本有 item、走的是另一条分支
+        # ——空窗 + dry-run 这个组合当时根本没被测过（「空守卫」那一类）。
+        if dry_run:
+            if items:
+                on_progress(
+                    f"[digest] --dry-run：窗口内 {len(items)} 条 item，"
+                    f"将调用 1 次模型，不写库、不落文件"
+                )
+            else:
+                on_progress(
+                    f"[digest] --dry-run：{day_label} 窗口内没有条目，"
+                    f"将写一篇「没有值得一提的信息」的日报，不调用模型、不写库"
+                )
+            return stats
+
+        # 空窗日**不调模型**：既不该花钱，也不该给模型机会编出点什么。
+        # 但照样出文件——spec §4.6 要求「明确输出没有值得一提的信息，不假装有事」。
+        if not items:
+            body = render_markdown(
+                day=day_label, stat_line=summary, rows=[], cats=cats, names=names,
+            )
+            on_progress(f"[digest] {day_label}：窗口内没有条目")
+            return _persist(stats, conn, body, model, prompt_ver, [], write_file,
+                            out_dir, day_label)
+
+        payload = build_items_payload(items, names, Redactor())
+        try:
+            result = chat_json(
+                LLMConfig(
+                    api_key=api_key, model=model,
+                    enable_thinking=enable_thinking, max_tokens=MAX_TOKENS,
+                ),
+                system=build_system_prompt(),
+                user=build_user_prompt(payload, day=day_label),
+            )
+        except LLMError as exc:
+            # ⚠️ 不降级。拼一篇只有机械行的「日报」写进 docs/digests/ 的话，
+            # 那篇文件与正常日报长得一模一样——正是不许出现的假绿。
+            stats.errors.append(f"模型调用失败: {exc}")
+            on_progress(f"[digest] {stats.errors[-1]}")
+            return stats
+
+        stats.input_tokens = result.input_tokens
+        stats.output_tokens = result.output_tokens
+
+        lines, unmatched = match_lines(result.payload.get("lines"), items)
+        rows = build_rows(lines, items)
+        stats.lines = len(lines)
+        stats.unmatched_quotes = len(unmatched)
+        stats.mechanical = sum(1 for r in rows if r.mechanical)
+
+        body = render_markdown(
+            day=day_label, stat_line=summary, rows=rows, cats=cats, names=names,
+            window_from=since,
+        )
+        # 窗口内**每条** item 都挂上——行里有的是模型写的，有的是机械补的，
+        # 但两种都对应真实条目，所以覆盖率必然是 100%。
+        return _persist(
+            stats, conn, body, model, prompt_ver,
+            [it.item_id for it in items], write_file, out_dir, day_label,
+        )
+    finally:
+        if owns_conn and conn is not None:
+            conn.close()
+
+
+def _persist(
+    stats: DigestStats,
+    conn: sqlite3.Connection,
+    body: str,
+    model: str,
+    prompt_ver: str,
+    item_ids: list[int],
+    write_file: bool,
+    out_dir: Path,
+    day_label: str,
+) -> DigestStats:
+    """落库 + 落文件。两件都做，或（write_file=False）只落库。"""
+    stats.digest_id = store.save_digest(
+        conn,
+        window_from=stats.window_from,
+        window_to=stats.window_to,
+        body_md=body,
+        model=model,
+        prompt_ver=prompt_ver,
+        item_ids=item_ids,
+    )
+    if write_file:
+        path = out_dir / f"{day_label}.md"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(body, encoding="utf-8")
+        stats.output_path = str(path)
+    return stats
