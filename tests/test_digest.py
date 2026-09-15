@@ -1090,7 +1090,7 @@ def test_deadline_supported_finds_chinese_date():
 
     ts = int(dt.datetime(2026, 9, 16, 12, 0).timestamp())
 
-    assert digest.deadline_supported(ts, "16日12:00开始报名缴费")
+    assert digest.deadline_supported(ts, "9月16日12:00开始报名缴费")
     assert digest.deadline_supported(ts, "9月16日截止")
 
 
@@ -1122,22 +1122,98 @@ def test_deadline_supported_false_when_no_deadline():
     assert not digest.deadline_supported(None, "随便什么 9月16日")
 
 
-def test_deadline_supported_ignores_day_number_inside_a_longer_number():
-    """⚠️ 不写月份的那种「16日」也是**真实存在**的依据（源文实测有
-    「16日12:00开始报名缴费」），但它**不能当裸子串比**。
+def test_deadline_supported_requires_a_month():
+    """⚠️ 只有裸日、没有月份 → **一律不算依据**（真实反例 item 88 / item 109）。
 
-    ``"3日" in "13日"`` 为真——不做数字边界的话，源文「13日交表」会让一条
-    **3 日**的（模型编的）截止日被判成「源文里有依据」，于是它照样被打上
-    「截止 09-03」戳进「别忘」。那正是本任务要防的同类错，只是换了个入口。
+    修复轮次 1（审查 F1，Important）：上一版为了满足 brief 自带的一条测试
+    （源文写的是裸日「16日12:00…」）加了「裸日回退」——只核对日、不核对月。
+    审查在真实库上实测这条路径的精度是 **0/2**，两条都错，而且错的方向正是
+    本任务要消灭的「往后飘」：
+
+    | item | 事件日 | 程序标 | 源文 |
+    |---|---|---|---|
+    | 88  | 08-06 | **09-26** | 「31号也不算早了，我有一个朋友**26号**就开学」 |
+    | 109 | 08-17 | **09-30** | 「**30号**就得到学校」 |
+
+    源文里的「26号」说的是 8 月 26（同消息语境），却被拿去给一条标着 9-26 的
+    截止日背书，再被机器口吻打进「别忘」。**核对月份这一步不能省**——找不到
+    月份就是没有依据，条目照常出现在类目区块（降级不丢事）。
     """
     import datetime as dt
 
-    ts_3rd = int(dt.datetime(2026, 9, 3).timestamp())
+    ts_26 = int(dt.datetime(2026, 9, 26).timestamp())
+    ts_30 = int(dt.datetime(2026, 9, 30).timestamp())
+    ts_3 = int(dt.datetime(2026, 9, 3).timestamp())
 
-    assert not digest.deadline_supported(ts_3rd, "13日交表")
-    assert not digest.deadline_supported(ts_3rd, "23日下午面试")
-    assert digest.deadline_supported(ts_3rd, "3日截止")
-    assert digest.deadline_supported(ts_3rd, "9月3日截止")
+    assert not digest.deadline_supported(ts_26, "31号也不算早了，我有一个朋友26号就开学")
+    assert not digest.deadline_supported(ts_30, "30号就得到学校")
+    # 裸日连「落在更长数字里」这一层都无从谈起：没有月份就是没有依据
+    assert not digest.deadline_supported(ts_3, "3日截止")
+    assert not digest.deadline_supported(ts_3, "13日交表")
+    # 带上月份才认（裸日那条路去掉后，这是唯一的口径）
+    assert digest.deadline_supported(ts_26, "9月26号开学")
+    assert digest.deadline_supported(ts_3, "9月3日截止")
+
+
+def test_deadline_supported_rejects_numeric_form_inside_a_longer_number():
+    """⚠️ 审查 §2 / F2 实测：下面 4 行**全部返回 True**（短写法落在更长数字里）。
+
+    `9/3`、`9-3` 这类短数字写法上一版是**纯子串**比较，于是源文里只有 9 月 30 日
+    （「9/30截止」）时，一条 **9 月 3 日**的（可能同样是模型编的）截止日也会被判成
+    有依据——与裸日那条是同一个洞的另一支，同样是"月份/日号看错一位就放行"。
+    """
+    import datetime as dt
+
+    ts_3 = int(dt.datetime(2026, 9, 3).timestamp())
+    ts_16 = int(dt.datetime(2026, 9, 16).timestamp())
+
+    assert not digest.deadline_supported(ts_3, "9/30截止")
+    assert not digest.deadline_supported(ts_3, "9-30截止")
+    assert not digest.deadline_supported(ts_3, "2026/09/30")
+    assert not digest.deadline_supported(ts_16, "119-16")
+    # 短写法本身仍要认，且**不因为后面跟着时间就丢**（「9-16 12:00」里的空格不是数字）
+    assert digest.deadline_supported(ts_3, "9/3截止")
+    assert digest.deadline_supported(ts_3, "9-3 18:00截止")
+    assert digest.deadline_supported(ts_16, "2026-09-16 12:00开始报名")
+
+
+def test_deadline_supported_accepts_dotted_form():
+    """点号写法（修复轮次 1：审查 F3，真实源文 item 84「9.6上午」、item 258「9.11左右截止」）。
+
+    这两条**源文里确实有**那个日期，上一版判据不认（写法没覆盖）→ 被降级，
+    属**假阴性**（方向安全，但「别忘」的召回白打折）。点号与 `M-D`/`M/D` 同族，
+    都带月份，精度风险同级。
+    """
+    import datetime as dt
+
+    ts_6 = int(dt.datetime(2026, 9, 6).timestamp())
+    ts_11 = int(dt.datetime(2026, 9, 11).timestamp())
+    ts_1 = int(dt.datetime(2026, 9, 1).timestamp())
+
+    assert digest.deadline_supported(ts_6, "9.6上午")
+    assert digest.deadline_supported(ts_11, "9.11左右截止")
+    assert digest.deadline_supported(ts_6, "09.06 上午")
+    # 边界：小数点另一侧的日号不能顶替（「9.11」不是 9 月 1 日）
+    assert not digest.deadline_supported(ts_1, "9.11左右截止")
+
+
+def test_deadline_supported_does_not_bridge_messages():
+    """⚠️ 源文是**多条消息用 ``"\\n"`` 拼起来的**（``store.item_sources_text``）——
+    日期不能跨消息拼出来。
+
+    上一版把整个 haystack 的空白**全部**去掉（`\\s+` → ""），于是「……9月」
+    结尾的一条消息与「16日开始……」开头的另一条消息会被粘成「9月16日」，
+    凭空造出一个「源文里有」的日期。现在只在**横向**空白处放宽（`[^\\S\\n]`），
+    换行两侧不认。
+    """
+    import datetime as dt
+
+    ts = int(dt.datetime(2026, 9, 16).timestamp())
+
+    assert not digest.deadline_supported(ts, "报名从9月\n16日开始")
+    assert not digest.deadline_supported(ts, "截止9-\n16")
+    # 同一行内的空格照旧容忍（实测源文有「9 月 16 日」）
+    assert digest.deadline_supported(ts, "9 月 16 日 截 止")
 
 
 def test_verified_deadlines_returns_only_supported_ids():
@@ -1148,7 +1224,7 @@ def test_verified_deadlines_returns_only_supported_ids():
         _item(1, title="有依据", deadline_ts=ts),
         _item(2, title="没依据", deadline_ts=ts, event_ts=2000),
     ]
-    sources = {1: "16日12:00开始报名", 2: "周六下午4.00-8.00"}
+    sources = {1: "9月16日12:00开始报名", 2: "周六下午4.00-8.00"}
 
     assert digest.verified_deadlines(items, sources) == {1}
 
