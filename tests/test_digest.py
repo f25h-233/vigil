@@ -1501,14 +1501,22 @@ def test_render_empty_day_not_yet_refined_does_not_claim_nothing_happened():
 
 
 def test_render_empty_day_shows_screening_breakdown():
+    """⚠️ 数字取的是 8/8 的**真实**构成（修复轮次 1 的口径）。
+
+    旧 fixture 用的 812/247（用户举的形态）在真实管线下是不成立的形状：
+    247 条「送模型」意味着绝大多数消息都出网了，而实际出网的只有 45 条。
+    """
     out = digest.render_empty_day(
         day="2026-08-08", groups=1, messages=1059, refined=1059,
-        local_dropped=812, sent=247,
+        local_dropped=1014, sent=45, hard_dropped=81,
     )
 
     assert "没有值得一提的信息" in out
-    assert "812" in out and "247" in out
+    assert "1,014" in out and "45" in out
     assert "1,059" in out
+    # ⚠️ 硬丢弃是「本地筛掉」的**子集**，所以只能写「含」——写成并列项就是另一件事
+    assert "含 81 条硬丢弃" in out
+    assert "送到模型" in out
 
 
 def test_render_empty_day_partial_coverage_is_treated_as_not_refined():
@@ -1522,9 +1530,18 @@ def test_render_empty_day_partial_coverage_is_treated_as_not_refined():
 
 
 def test_screening_breakdown_splits_local_from_model(seeded):
-    """本地筛掉与送模型后无产出必须分得开（refine_runs 分不开，只能重算）。"""
-    from vigil import store
+    """本地筛掉与送模型后无产出必须分得开（refine_runs 分不开，只能重算）。
 
+    ⚠️ **修复轮次 1 起期望值变了**：`sent` 改成按 refine 的真实管线
+    （`expand_context` 之后）算，于是这个 3 条消息的小窗口里，
+    唯一的候选（msg 3）前后各 2 条邻居把 msg 1/2 **全拉进了 in_scope**
+    ——三条都出网，本地筛掉 0 条。旧期望 `(3, 2, 1)` 是「候选数当送模型数」
+    那版口径的产物。
+
+    真正演示「本地筛掉 vs 送模型」的拆分在
+    ``test_screening_breakdown_sent_counts_context_expansion_not_candidates``
+    （窗口里留了够远的消息，上下文拉不到它）。
+    """
     conn, since, until = seeded
     conn.execute("DELETE FROM messages")
     conn.executemany(
@@ -1537,11 +1554,52 @@ def test_screening_breakdown_splits_local_from_model(seeded):
     )
     conn.commit()
 
-    total, local, sent = digest.screening_breakdown(
+    total, local, sent, hard_dropped = digest.screening_breakdown(
         conn, _Config({100: "班级群"}), since=since, until=until
     )
 
-    assert (total, local, sent) == (3, 2, 1)
+    assert (total, local, sent, hard_dropped) == (3, 0, 3, 0)
+    assert local + sent == total       # ④ 文案里两个数字之和必须等于消息总数
+
+
+def test_screening_breakdown_sent_counts_context_expansion_not_candidates(seeded):
+    """⚠️ 「送模型」= `expand_context` 之后的条数，不是候选数（修复轮次 1）。
+
+    旧公式 `总数 - screen_stats.dropped` 把「没命中保留规则」的也算成送模型：
+    `screen_stats.dropped` **只算硬丢弃**，而 8/8 实测 1,059 条里硬丢弃只有 83，
+    于是 45 被报成了 976（夸大约 20 倍）——错话出在专门防假数字的那段文案里。
+
+    ⚠️ `expand_context` 拉的是**位置**上前后各 2 条邻居（`by_group` 的有序
+    下标），**不是时间窗口**——所以「离得远」必须按**下标**隔开 3 条以上，
+    光把时间拉开没用（第一版就写成 `since+300`，结果下标只差 1、照样被拉走，
+    实测红）。msg 6 与候选隔了 3 个下标，`context=2` 够不着它。
+
+    变异反证：
+    * `sent` 改回 `len(msgs) - screen_stats.dropped` → 本条红（`sent` = 4 ≠ 5）
+    * `sent` 改成候选数 `len(candidates)` → 本条红（`sent` = 1 ≠ 5）
+    """
+    conn, since, until = seeded
+    conn.execute("DELETE FROM messages")
+    conn.executemany(
+        "INSERT INTO messages VALUES (?,?,?,?,?)",
+        [
+            (1, 100, since + 10, "u_a", "收到"),                       # 硬丢弃，但被上下文拉走
+            (2, 100, since + 20, "u_b", "dd"),                         # 硬丢弃，但被上下文拉走
+            (3, 100, since + 30, "u_c", "明天记得带体检表到辅导员处"),   # 候选（下标 2）
+            (4, 100, since + 40, "u_d", "今天天气不错啊"),               # 软丢弃，但被上下文拉走
+            (5, 100, since + 50, "u_e", "食堂今天人真多"),               # 软丢弃，但被上下文拉走
+            (6, 100, since + 60, "u_f", "收到"),                        # 下标 5：够不着 → 没出网
+        ],
+    )
+    conn.commit()
+
+    total, local, sent, hard_dropped = digest.screening_breakdown(
+        conn, _Config({100: "班级群"}), since=since, until=until
+    )
+
+    assert (total, local, sent, hard_dropped) == (6, 1, 5, 1)
+    assert local + sent == total
+    assert sent < total            # 至少有一条真的没出网，否则这条测不出「本地筛掉」
 
 
 def test_digest_empty_window_reports_not_refined(seeded, monkeypatch, tmp_path):
@@ -1586,3 +1644,6 @@ def test_digest_empty_window_breakdown_end_to_end(seeded, monkeypatch, tmp_path)
     assert "没有值得一提的信息" in body
     assert "被本地规则筛掉" in body
     assert "3/3" not in body          # 覆盖信息只在未抽取分支里出现
+    # 三条都没命中保留规则 → 一条都没出网；其中 msg 1/2 是硬丢弃（子集）
+    assert "其中 3 条被本地规则筛掉（含 2 条硬丢弃" in body
+    assert "0 条送到模型后判为无价值" in body

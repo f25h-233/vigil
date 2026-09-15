@@ -533,3 +533,21 @@ def test_window_refine_coverage_empty_window(memdb):
     store.ensure_schema(memdb)
 
     assert store.window_refine_coverage(memdb, since=9000, until=9999) == (0, 0)
+
+
+def test_window_refine_coverage_ignores_error_rows(memdb):
+    """⚠️ ``status='error'`` 不算「已抽取」——与 refine 的重试口径对齐。
+
+    ``pending_messages(redo=False)`` 的语义是「试过但没成功 ≠ 已处理」，那批消息
+    下次还会被重新取出来跑。首版只查「有没有 refine_runs 行」，于是「一批失败了」
+    会被日报当成「抽取完了、确实没事」——又一个假话入口。
+
+    变异反证：把 `WHERE status != ?` 去掉 → 本条红（(3, 3) 而不是 (3, 2)）。
+    """
+    _seed_messages(memdb)          # 3 条消息
+    store.ensure_schema(memdb)
+    store.record_run(memdb, [1, 2], status=store.STATUS_DISCARDED, prompt_ver="v2")
+    store.record_run(memdb, [3], status=store.STATUS_ERROR, prompt_ver="v2",
+                     err="429")
+
+    assert store.window_refine_coverage(memdb, since=1000, until=4000) == (3, 2)
