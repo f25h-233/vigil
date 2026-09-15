@@ -678,76 +678,35 @@ def digest(
                     f"将调用 1 次模型，不写库、不落文件"
                 )
             else:
+                # ⚠️ **预览不许猜正文**（Task 11 修复轮次 2 / 审查 F1）：
+                # 空窗路径的正文不调模型、是免费的，所以直接**算出来再引用**。
+                # 曾经这里硬编码「将写一篇『没有值得一提的信息』的日报」——
+                # Task 11 改正文时没人改这一行，同一句「关于完整性的话」
+                # 就在预览里变成了假话（文件 / 进度行 / CLI 汇总行之后的第五个变体）。
+                # 现在预览引用 `_empty_day_case` 的产物，与真实路径**同一段代码**。
+                body, _ = _empty_day_case(
+                    conn, config, day_label=day_label, groups=groups,
+                    messages=messages, since=since, until=until,
+                )
                 on_progress(
                     f"[digest] --dry-run：{day_label} 窗口内没有条目，"
-                    f"将写一篇「没有值得一提的信息」的日报，不调用模型、不写库"
+                    f"不调用模型、不写库。\n"
+                    f"[digest] --dry-run：将写出的正文（不含标题）如下：\n"
+                    f"{_body_without_title(body)}"
                 )
             return stats
 
         # 空窗日**不调模型**：既不该花钱，也不该给模型机会编出点什么。
         # 但照样出文件——spec §4.6 要求「明确输出没有值得一提的信息，不假装有事」。
         #
-        # ⚠️ 空窗日还必须**自证抽取状态**（Task 9）：窗口内消息全有
-        # `refine_runs` 记账时才敢说「没有值得一提的信息」；覆盖不全时那句
-        # 可能是假话（这天压根没抽取过），改说「尚未抽取」——把一句可能为假
-        # 的话换成一句一定为真的话。
-        #
-        # ⚠️ 覆盖完整时才敢报筛除分布，而分布里的「送模型」必须按
-        # refine 的真实管线算（修复轮次 1）：`screening_breakdown` 见 docstring。
+        # ⚠️ 判定（哪一支、说什么）全在 `_empty_day_case` 里，与 `--dry-run`
+        # 预览共用同一段代码——**判据只有一份**，见它的 docstring。
         if not items:
-            total, refined = store.window_refine_coverage(
-                conn, since=since, until=until
+            body, progress = _empty_day_case(
+                conn, config, day_label=day_label, groups=groups,
+                messages=messages, since=since, until=until,
             )
-            if messages == 0:
-                # ⚠️ 退化输入 ①（Task 11）：窗口内一条消息都没有。
-                #
-                # 必须**排在 `refined < total` 前面**：那条判据在这里是
-                # `0 < 0`，为假——不先拦下的话，一个从没导出过的日子会走进
-                # 「已覆盖」分支说「没有值得一提的信息」，还附上「0 条被本地
-                # 规则筛掉…0 条送到模型…」两行退化句子。
-                #
-                # 此时**也不该调 `screening_breakdown`**：它只会返回 (0,0,0)，
-                # 而那句进度行「本地筛掉 0 条，送到模型 0 条」正是同一个退化
-                # 句子换了块屏幕。判据与正文共用 `_window_outside_span`。
-                span = store.message_span(conn)
-                outside = _window_outside_span((since, until), span)
-                body = render_empty_day(
-                    day=day_label, groups=groups, messages=messages,
-                    refined=refined, local_dropped=0, sent=0,
-                    span=span, window=(since, until),
-                )
-                on_progress(
-                    f"[digest] {day_label}：窗口内一条消息记录也没有——"
-                    + (
-                        "数据库里也没有覆盖这一天的数据，日报照实说「先跑 vigil export」"
-                        if outside
-                        else "但前后都有数据，日报照实说「这天真的没人说话」"
-                    )
-                    + "，不调用模型"
-                )
-            elif refined < total:
-                body = render_empty_day(
-                    day=day_label, groups=groups, messages=messages,
-                    refined=refined, local_dropped=0, sent=0,
-                )
-                on_progress(
-                    f"[digest] {day_label}：窗口内 {refined:,}/{total:,} 条已抽取，"
-                    f"**尚未抽取完**——日报只说明这个，不下「没事」的结论"
-                )
-            else:
-                _, local, sent = screening_breakdown(
-                    conn, config, since=since, until=until
-                )
-                body = render_empty_day(
-                    day=day_label, groups=groups, messages=messages,
-                    refined=refined, local_dropped=local, sent=sent,
-                )
-                # ⚠️ `sent == 0` 时进度行同样不许说「送到模型 0 条」（退化输入 ②）：
-                # 这里是 `local == messages > 0`，所以「本地筛掉 N 条」本身不退化。
-                on_progress(
-                    f"[digest] {day_label}：窗口内没有条目（本地筛掉 {local:,} 条，"
-                    + ("一条也没送模型）" if sent == 0 else f"送到模型 {sent:,} 条）")
-                )
+            on_progress(progress)
             return _persist(stats, conn, body, model, prompt_ver, [], write_file,
                             out_dir, day_label)
 
@@ -929,6 +888,89 @@ def render_empty_day(
             f"\n{sent:,} 条送到模型后判为无价值。\n"
         )
     return head + "\n" + tail + "\n没有值得一提的信息。\n"
+
+
+def _body_without_title(body: str) -> str:
+    """正文去掉第一行的 ``# 守夜人日报 · 日期`` 标题（预览里不复述标题，只引正文行）。"""
+    lines = body.split("\n")
+    if lines and lines[0].startswith("# "):
+        lines = lines[1:]
+    return "\n".join(lines).strip("\n")
+
+
+def _empty_day_case(
+    conn: sqlite3.Connection,
+    config: Config,
+    *,
+    day_label: str,
+    groups: int,
+    messages: int,
+    since: int,
+    until: int,
+) -> tuple[str, str]:
+    """空窗日：算出 ``(正文, 进度行)``。**真实路径与 ``--dry-run`` 预览共用这一段。**
+
+    ⚠️ **为什么必须共用**（Task 11 修复轮次 2 / 审查 F1）：``--dry-run`` 的预览是
+    「关于日报会说什么的一句话」——**它和日报正文一样要核资格**。原先预览是硬编码的
+    「将写一篇『没有值得一提的信息』的日报」：Task 11 之前那是真话，Task 11 把正文
+    改成「先跑 ``vigil export``」之后**同一行没人改，于是变成了假话**
+    ——同一个结构的第五个变体（文件 / 进度行 / CLI 汇总行 / 预览行…）。
+
+    修法是**结构性的，不是再改一次文案**：空窗路径的正文不需要调模型、是免费的，
+    那就**直接算出来再引用**。判据没有第二份，**预览说会写什么**与**实际写了什么**
+    是同一段代码的产物，结构上不可能漂移。非空日的预览（「将调用 1 次模型」）
+    是结构性陈述、不涉及正文内容，不在本函数的职责内。
+
+    三个分支的**判据与顺序**与真实路径完全一致，进度行文案逐字保留：
+
+    1. ``messages == 0`` → 再分「范围之外（没数据）」/「范围之内（真没人说话）」。
+       ⚠️ 必须排在最前：``refined < total`` 在这里是 ``0 < 0``，**为假**，
+       不先拦下就会走进「已覆盖」说「没有值得一提的信息」（F1 本体）。
+       此时也不该调 ``screening_breakdown``（只会返回 ``(0,0,0)``，
+       那句「本地筛掉 0 条，送到模型 0 条」是同一个退化句子换了块屏幕）。
+    2. ``refined < total`` → 覆盖不全，说「尚未抽取」，不下「没事」的结论（Task 9）。
+    3. 其余 → 覆盖完整，出筛除分布；``sent == 0`` 时说「没有送模型」而非「0 条送到模型」。
+    """
+    total, refined = store.window_refine_coverage(conn, since=since, until=until)
+    if messages == 0:
+        span = store.message_span(conn)
+        outside = _window_outside_span((since, until), span)
+        body = render_empty_day(
+            day=day_label, groups=groups, messages=messages,
+            refined=refined, local_dropped=0, sent=0,
+            span=span, window=(since, until),
+        )
+        progress = (
+            f"[digest] {day_label}：窗口内一条消息记录也没有——"
+            + (
+                "数据库里也没有覆盖这一天的数据，日报照实说「先跑 vigil export」"
+                if outside
+                else "但前后都有数据，日报照实说「这天真的没人说话」"
+            )
+            + "，不调用模型"
+        )
+        return body, progress
+    if refined < total:
+        body = render_empty_day(
+            day=day_label, groups=groups, messages=messages,
+            refined=refined, local_dropped=0, sent=0,
+        )
+        return body, (
+            f"[digest] {day_label}：窗口内 {refined:,}/{total:,} 条已抽取，"
+            f"**尚未抽取完**——日报只说明这个，不下「没事」的结论"
+        )
+    _, local, sent = screening_breakdown(conn, config, since=since, until=until)
+    body = render_empty_day(
+        day=day_label, groups=groups, messages=messages,
+        refined=refined, local_dropped=local, sent=sent,
+    )
+    # ⚠️ `sent == 0` 时进度行同样不许说「送到模型 0 条」（退化输入 ②）：
+    # 这里是 `local == messages > 0`，所以「本地筛掉 N 条」本身不退化。
+    progress = (
+        f"[digest] {day_label}：窗口内没有条目（本地筛掉 {local:,} 条，"
+        + ("一条也没送模型）" if sent == 0 else f"送到模型 {sent:,} 条）")
+    )
+    return body, progress
 
 
 def _persist(

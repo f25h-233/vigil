@@ -1895,3 +1895,158 @@ def test_digest_nonempty_window_flags_partial_coverage(seeded, monkeypatch, tmp_
 
     body = (tmp_path / "2026-09-13.md").read_text(encoding="utf-8")
     assert "仅抽取了 2/3" in body
+
+
+# ── `--dry-run` 预览不许猜正文（Task 11 修复轮次 2 / 审查 F1）──────────
+#
+# 预览是「关于日报会说什么的一句话」——**它和正文一样要核资格**。
+# 这六条测试钉住「预览引用实际会写的正文」这个结构性保证。
+
+
+def _all_dropped_window(conn, since, until):
+    """造一个「有消息、全抽取过、一条都没出网」的窗口（覆盖完整 + sent==0）。"""
+    from vigil import store
+
+    conn.execute("DELETE FROM items")
+    conn.execute("DELETE FROM messages")
+    conn.executemany(
+        "INSERT INTO messages VALUES (?,?,?,?,?)",
+        [(1, 100, since + 10, "u_a", "收到"), (2, 100, since + 20, "u_b", "dd"),
+         (3, 100, since + 30, "u_c", "随便聊聊天气不错啊今天挺热的")],
+    )
+    store.record_run(conn, [1, 2, 3], status=store.STATUS_DISCARDED, prompt_ver="v2")
+    conn.commit()
+
+
+def test_dry_run_preview_on_no_data_day_says_export(seeded, monkeypatch, capsys,
+                                                    tmp_path):
+    """⚠️ F1：无数据日的预览不许说「没有值得一提的信息」。
+
+    Task 11 之前预览说「将写一篇『没有值得一提的信息』的日报」**是真话**
+    （旧正文确实含该句）；Task 11 把正文改成「先跑 `vigil export`」之后
+    同一行没人改，**预览就变成了假话**——同一个结构的第五个变体。
+    """
+    conn, since, until = seeded
+    monkeypatch.setattr("vigil.digest.chat_json", _FakeLLM([]))
+
+    out_since, out_until = digest.day_window("2026-09-20")      # 库里没有这一天
+    digest.digest(_Config({100: "班级群"}), api_key="k", conn=conn,
+                  since=out_since, until=out_until, day_label="2026-09-20",
+                  output_dir=tmp_path, dry_run=True)
+
+    out = capsys.readouterr().out
+    assert "先跑 `vigil export`" in out
+    assert "没有值得一提的信息" not in out
+    assert "# 守夜人日报" not in out            # 只引正文行，不复述标题
+
+
+def test_dry_run_preview_on_really_quiet_day_says_nobody_talked(seeded, monkeypatch,
+                                                                capsys, tmp_path):
+    """窗口在数据范围**之内**却 0 条 → 预览说「真的没人说话」。"""
+    conn, since, until = seeded
+    conn.execute("DELETE FROM items")
+    conn.execute("DELETE FROM messages")
+    conn.executemany(
+        "INSERT INTO messages VALUES (?,?,?,?,?)",
+        [(1, 100, since - 1000, "u_a", "前一天在聊"),
+         (2, 100, until + 1000, "u_b", "后一天在聊")],
+    )
+    conn.commit()
+    monkeypatch.setattr("vigil.digest.chat_json", _FakeLLM([]))
+
+    digest.digest(_Config({100: "班级群"}), api_key="k", conn=conn,
+                  since=since, until=until, day_label="2026-09-13",
+                  output_dir=tmp_path, dry_run=True)
+
+    out = capsys.readouterr().out
+    assert "真的没人说话" in out
+    assert "vigil export" not in out
+
+
+def test_dry_run_preview_on_not_yet_refined_window_says_refine(seeded, monkeypatch,
+                                                              capsys, tmp_path):
+    """覆盖不全的空窗 → 预览说「尚未抽取」，不说「没有值得一提的信息」。
+
+    ⚠️ 这一句是 **Task 9 遗留**的同因假话：Task 9 把正文改成「尚未抽取」时，
+    预览那行同样没人改（F1 报告里点名的「同一行的第二个假话」）。
+    """
+    conn, since, until = seeded
+    conn.execute("DELETE FROM items")
+    conn.commit()
+    monkeypatch.setattr("vigil.digest.chat_json", _FakeLLM([]))
+
+    digest.digest(_Config({100: "班级群"}), api_key="k", conn=conn,
+                  since=since, until=until, day_label="2026-09-13",
+                  output_dir=tmp_path, dry_run=True)
+
+    out = capsys.readouterr().out
+    assert "尚未抽取" in out
+    assert "vigil refine" in out
+    assert "没有值得一提的信息" not in out
+
+
+def test_dry_run_preview_matches_render_empty_day_verbatim(seeded, monkeypatch,
+                                                           capsys, tmp_path):
+    """覆盖完整的空窗：预览引用的正文与 `render_empty_day` 的输出**逐字一致**。"""
+    conn, since, until = seeded
+    _all_dropped_window(conn, since, until)
+    monkeypatch.setattr("vigil.digest.chat_json", _FakeLLM([]))
+
+    digest.digest(_Config({100: "班级群"}), api_key="k", conn=conn,
+                  since=since, until=until, day_label="2026-09-13",
+                  output_dir=tmp_path, dry_run=True)
+
+    out = capsys.readouterr().out
+    expected = digest.render_empty_day(
+        day="2026-09-13", groups=1, messages=3, refined=3,
+        local_dropped=3, sent=0,
+    )
+    title, _, rest = expected.partition("\n")
+    assert title.startswith("# 守夜人日报")
+    assert rest.strip("\n") in out            # 正文行逐字被引用
+    assert title not in out                   # 标题不重复出现
+
+
+def test_dry_run_preview_equals_body_actually_written(seeded, monkeypatch, capsys,
+                                                      tmp_path):
+    """⚠️ 端到端钉死「不漂移」：预览引用的正文 == **真跑写出来的**正文（去标题）。
+
+    这条不依赖 `render_empty_day` 的参数（不硬编码 `local_dropped` / `sent`），
+    也就不用 `_body_without_title`——期望值直接从产物文件里切出来。
+    预览若用错了参数（比如漏传 `span`）或写死了文案，这条就红。
+    """
+    conn, since, until = seeded
+    _all_dropped_window(conn, since, until)
+    monkeypatch.setattr("vigil.digest.chat_json", _FakeLLM([]))
+
+    digest.digest(_Config({100: "班级群"}), api_key="k", conn=conn,
+                  since=since, until=until, day_label="2026-09-13",
+                  output_dir=tmp_path, dry_run=True)
+    preview = capsys.readouterr().out
+
+    digest.digest(_Config({100: "班级群"}), api_key="k", conn=conn,
+                  since=since, until=until, day_label="2026-09-13",
+                  output_dir=tmp_path, dry_run=False)
+    written = (tmp_path / "2026-09-13.md").read_text(encoding="utf-8")
+
+    assert written.split("\n", 1)[1].strip("\n") in preview
+
+
+def test_dry_run_preview_equals_written_body_on_no_data_day(seeded, monkeypatch,
+                                                            capsys, tmp_path):
+    """同上，但走 F1 的那个入口（无数据日）——两个分支都要钉。"""
+    conn, since, until = seeded
+    monkeypatch.setattr("vigil.digest.chat_json", _FakeLLM([]))
+    out_since, out_until = digest.day_window("2026-09-20")
+
+    digest.digest(_Config({100: "班级群"}), api_key="k", conn=conn,
+                  since=out_since, until=out_until, day_label="2026-09-20",
+                  output_dir=tmp_path, dry_run=True)
+    preview = capsys.readouterr().out
+
+    digest.digest(_Config({100: "班级群"}), api_key="k", conn=conn,
+                  since=out_since, until=out_until, day_label="2026-09-20",
+                  output_dir=tmp_path, dry_run=False)
+    written = (tmp_path / "2026-09-20.md").read_text(encoding="utf-8")
+
+    assert written.split("\n", 1)[1].strip("\n") in preview
