@@ -2786,6 +2786,7 @@ export default defineConfig({
   "scripts": {
     "dev": "vite",
     "build": "tsc -b && vite build",
+    "test": "vitest run",
     "icons": "python tools/make_icons.py"
   },
   "dependencies": {
@@ -2801,10 +2802,17 @@ export default defineConfig({
     "tailwindcss": "4.3.3",
     "typescript": "5.9.3",
     "vite": "8.3.0",
-    "vite-plugin-pwa": "1.3.0"
+    "vite-plugin-pwa": "1.3.0",
+    "vitest": "5.0.1"
   }
 }
 ````
+
+> ⚠️ **2026-09-15 修订（T4 审查 M4）**：本附录由 `_gen_frontend_section.py` 从**探针目录**生成，
+> 而探针的 `package.json` 写在我决定引入 vitest **之前**——于是这里曾缺 `"test": "vitest run"`
+> 与 `"vitest": "5.0.1"`，与正文 Step 1 冲突。实测版（T4 落地的 `web/package.json`）**两者都有**，
+> 以本条为准。**教训**：从「永不提交的探针目录」生成的产物清单，会漏掉只在真仓库才暴露的问题
+> （同一来源还漏了 A.13 的 `*.tsbuildinfo`）。
 
 ### A.13 `web/.gitignore`（T4）
 
@@ -2813,7 +2821,13 @@ node_modules/
 dist/
 dev-dist/
 *.local
+*.tsbuildinfo
 ````
+
+> ⚠️ **2026-09-15 修订（T4 审查 M4）**：`*.tsbuildinfo` 是 T4 落地时补的。`tsc -b` 会写出
+> `web/tsconfig.tsbuildinfo`（实测存在于磁盘，337 B），而正文 Step 13 的 `git add web/` 会把它
+> 扫进提交——与全局约束 7「`*.tsbuildinfo` 不许入库」直接冲突。规划期发现不了：探针在 `_smoke/`
+> 下**永不被提交**，缓存文件落在那里无所谓。
 
 ### A.14 `web/tools/make_icons.py`（T4）
 
