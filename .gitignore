@@ -27,3 +27,8 @@ node_modules/
 
 # 冒烟运行的原始日志（每次重跑都会重建；归纳后的证据在 M2-验收材料.md）
 _smoke/
+
+# M3 前端产物（不入库）
+web/node_modules/
+web/dist/
+web/dev-dist/
