@@ -90,10 +90,62 @@ def test_payload_formats_time_and_deadline():
 
     ts = int(dt.datetime(2026, 9, 13, 14, 20).timestamp())
     dl = int(dt.datetime(2026, 10, 8).timestamp())
-    payload = digest.build_items_payload([_item(event_ts=ts, deadline_ts=dl)], {}, Redactor())
+    # ⚠️ 修复轮次 2：这条的**三条断言一字未改**，只是夹具显式传了 ``trusted``——
+    # 自本次起 «截止日出网» 多了一个前提（它得先在源文里有字面依据），
+    # 不传就是「都不信任」，deadline 会是 None。这是夹具适配，不是放宽。
+    payload = digest.build_items_payload(
+        [_item(event_ts=ts, deadline_ts=dl)], {}, Redactor(), trusted={1}
+    )
 
     assert payload[0]["time"] == "14:20"
     assert payload[0]["deadline"] == "2026-10-08"
+
+
+def test_payload_withholds_deadline_from_untrusted_item():
+    """⚠️ 未通过核验的截止日**不许发给模型**——它本来就没有依据（修复轮次 2）。
+
+    Task 7 重跑抓到 Task 6 只堵了一半：程序那个「· 截止 09-15 ·」戳被挡住了，
+    可 ``deadline`` 字段照旧出网，模型于是**自己在正文里写了出来**。实测
+    9/12 那篇（item 250 已被正确降级、程序戳确实没加）::
+
+        - **西太湖新媒体补录** 针对今天未面试同学，地点待定，明天通知，
+          **截止 9 月 15 日**。 · 西太湖新媒体部门招新群
+
+    —— 读者看到的还是同一个无依据的日期。机械核验只堵了程序那个入口，
+    模型措辞那个入口是敞着的。模型拿不到这个日期，就不会写出来。
+    """
+    import datetime as dt
+
+    dl = int(dt.datetime(2026, 10, 8).timestamp())
+    items = [
+        _item(1, title="没依据", deadline_ts=dl),
+        _item(2, title="有依据", deadline_ts=dl, event_ts=2000),
+    ]
+
+    payload = digest.build_items_payload(items, {}, Redactor(), trusted={2})
+
+    assert payload[0]["deadline"] is None           # 未受信 → 不发
+    assert payload[1]["deadline"] == "2026-10-08"   # 受信 → 照发
+    # 字段形状保持稳定：键必须在、值是 None，不是省略键（省略会让模型
+    # 在「哪些条目本来有截止日」上失去可比信号）
+    assert "deadline" in payload[0]
+    assert list(payload[0]) == list(payload[1])
+
+
+def test_payload_withholds_every_deadline_by_default():
+    """⚠️ 默认必须是「都不信任」——与 `build_rows` 的 `trusted=None` 同款理由：
+    默认全信任的话，任何忘记传参的调用方都会静默退回危险行为（把模型编的
+    日期发出去，再由模型写进正文）。
+
+    变异反证：默认值改成全集，或去掉 `digest()` 里的 `trusted=trusted` → 红。
+    """
+    import datetime as dt
+
+    dl = int(dt.datetime(2026, 10, 8).timestamp())
+
+    payload = digest.build_items_payload([_item(1, deadline_ts=dl)], {}, Redactor())
+
+    assert payload[0]["deadline"] is None
 
 
 def test_payload_null_dashes_stay_null():
@@ -689,12 +741,14 @@ class _FakeLLM:
         self.lines = lines
         self.calls = 0
         self.configs = []
+        self.users = []          # 每次调用收到的 user prompt（Task 6 修复轮次 2 起）
 
     def __call__(self, cfg, *, system, user, sleep=None):
         from vigil.llm import LLMResult
 
         self.calls += 1
         self.configs.append(cfg)
+        self.users.append(user)
         return LLMResult(payload={"lines": self.lines}, input_tokens=100,
                          output_tokens=50)
 
@@ -1312,6 +1366,9 @@ def test_digest_wires_deadline_verification(seeded, monkeypatch, tmp_path):
     conn.execute("DELETE FROM items")
     conn.execute("DELETE FROM messages")
     ts_ok = int(dt.datetime(2026, 9, 16, 12, 0).timestamp())
+    # 两条的截止日**取不同的值**（修复轮次 2）——同值的话「item 2 的日期有没有
+    # 出网」这条断言恒真（item 1 的同一个日期会照样出现在 payload 里），什么也守不住。
+    ts_nobasis = int(dt.datetime(2026, 9, 20).timestamp())
     conn.execute(
         "INSERT INTO messages VALUES (1, 100, ?, 'u_a', '9月16日12:00开始报名缴费')",
         (since + 60,),
@@ -1327,7 +1384,7 @@ def test_digest_wires_deadline_verification(seeded, monkeypatch, tmp_path):
         [
             (1, "academic", "四六级报名", None, since + 60, ts_ok, 100, None,
              None, "[]", None, 0.9, "m", "v2", 1),
-            (2, "activity", "补录面试", None, since + 120, ts_ok, 100, None,
+            (2, "activity", "补录面试", None, since + 120, ts_nobasis, 100, None,
              None, "[]", None, 0.9, "m", "v2", 1),
         ],
     )
@@ -1347,6 +1404,12 @@ def test_digest_wires_deadline_verification(seeded, monkeypatch, tmp_path):
     body = (tmp_path / "2026-09-13.md").read_text(encoding="utf-8")
     # 合并行的截止日不可信 → 不该进「别忘」
     assert "## ⏰ 别忘" not in body
+
+    # ⚠️ 修复轮次 2：未核验的截止日**也不许出网**——这是「模型措辞」那条漏路的入口。
+    # 变异反证：去掉 `digest()` 里的 `trusted=trusted` → 本条红。
+    sent = fake.users[0]
+    assert "2026-09-16" in sent       # item 1 的源文里有「9月16日」→ 照发
+    assert "2026-09-20" not in sent   # item 2 的源文里没有 → 扣住（模型写不出来）
 
 
 def test_cli_digest_reports_dropped_deadlines(cli_env, monkeypatch, capsys):

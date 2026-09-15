@@ -106,10 +106,12 @@ def build_items_payload(
     items: list[store.WindowItem],
     names: dict[int, str],
     redactor: Redactor,
+    *,
+    trusted: set[int] | None = None,
 ) -> list[dict]:
     """把窗口内的 items 整理成发给模型的 JSON。
 
-    ⚠️ 三条硬规则，每条都有实测支撑，少一条都出过事：
+    ⚠️ 四条硬规则，每条都有实测支撑，少一条都出过事：
 
     * **只发群名，不发群号**（spec §4.5）。规划期间的探针第一版就是把
       ``group_id`` 明文发了出去——全库 15 个群号本来就不该出网。
@@ -123,6 +125,19 @@ def build_items_payload(
       ``XX交流群421632774`` 这种写法。群名只作**合并信号**用、不直接展示，
       抹了也无害。
     * **过 sanitize_for_llm**：全角引号会让模型退化成无限空格循环。
+    * **没通过核验的 ``deadline`` 不发**（``trusted``，Task 6 修复轮次 2）。
+      ``trusted`` 是**截止日在源文里有字面依据**的 item_id 集合；不在集合里的
+      item，``deadline`` 一律给 ``None``（键照留，字段形状不变）。
+      为什么必须卡在这里：Task 6 只挡住了**程序打的戳**（``· 截止 09-15 ·``），
+      ``deadline`` 字段照旧出网，于是模型**自己在正文里把它写了出来**——实测
+      9/12 的 item 250 已被正确降级、程序戳确实没加，正文里却仍有
+      「截止 9 月 15 日」，而「9月15日」在那条源文里毫无依据（源文只说
+      「明天下午5点到6点」）。读者看到的还是同一个日期：**机械核验只堵了
+      程序那个入口，模型措辞那个入口是敞着的。模型拿不到它，才写不出来。**
+
+    ⚠️ ``trusted`` 默认必须是 ``None`` → 空集 → **全部截止日都不发**。
+    默认成全信任的话，任何忘记传参的调用方都会静默退回危险行为
+    （与 ``build_rows`` 的 ``trusted=None`` 同款理由）。
     """
 
     def clean(value: str | None) -> str | None:
@@ -130,6 +145,7 @@ def build_items_payload(
             return None
         return sanitize_for_llm(redactor.text(value)) or None
 
+    trusted = set() if trusted is None else trusted
     payload = []
     for item in items:
         payload.append(
@@ -142,7 +158,7 @@ def build_items_payload(
                 "amount": clean(item.amount),
                 "deadline": (
                     dt.datetime.fromtimestamp(item.deadline_ts).strftime("%Y-%m-%d")
-                    if item.deadline_ts
+                    if item.deadline_ts and item.item_id in trusted
                     else None
                 ),
                 "group": clean(names.get(item.group_id)) or "",
@@ -655,7 +671,11 @@ def digest(
             return _persist(stats, conn, body, model, prompt_ver, [], write_file,
                             out_dir, day_label)
 
-        payload = build_items_payload(items, names, Redactor())
+        # ⚠️ 必须把 `trusted` 传进去（修复轮次 2）：没通过核验的截止日**不出网**。
+        # 否则模型会在正文里自己写出那个日期，把程序戳那条漏路原样搬到散文里
+        # ——实测 9/12 就是这么漏的。`trusted` 在上面（`window_items` 之后）
+        # 就算好了，这里只是接线；本函数的调用方只有这一处。
+        payload = build_items_payload(items, names, Redactor(), trusted=trusted)
         try:
             result = chat_json(
                 LLMConfig(
