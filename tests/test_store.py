@@ -10,28 +10,39 @@ from vigil import store
 from vigil.store import ExtractedItem, PendingMessage
 
 
+# messages + sender_names 的形状，与 export.py 产出的完全一致。
+# 这两张表**不由 store.ensure_schema 建**（它们是 export.py 的产物、真库里一直在），
+# 但查询层会 JOIN 它们——所以测试里凡是要跑查询层的插桩，都得先把它们立起来。
+# ⚠️ 用 IF NOT EXISTS：M3 Task 2 的 `_insert_item` 会在 `_seed_messages` 之前
+# 先立一次表，两者叠加时不能炸。
+_MESSAGE_TABLES_DDL = """
+CREATE TABLE IF NOT EXISTS messages (
+    msg_id     INTEGER PRIMARY KEY,
+    group_id   INTEGER NOT NULL,
+    ts         INTEGER NOT NULL,
+    sender_uid TEXT,
+    content    TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS sender_names (
+    group_id   INTEGER NOT NULL,
+    uid        TEXT    NOT NULL,
+    group_nick TEXT,
+    qq_nick    TEXT,
+    uin        INTEGER,
+    in_group   INTEGER,
+    PRIMARY KEY (group_id, uid)
+);
+"""
+
+
+def _ensure_message_tables(conn: sqlite3.Connection) -> None:
+    """让查询层 JOIN 得起来。幂等。"""
+    conn.executescript(_MESSAGE_TABLES_DDL)
+
+
 def _seed_messages(conn: sqlite3.Connection) -> None:
     """造一张最小的 messages + sender_names，形状与 export.py 产出的完全一致。"""
-    conn.executescript(
-        """
-        CREATE TABLE messages (
-            msg_id     INTEGER PRIMARY KEY,
-            group_id   INTEGER NOT NULL,
-            ts         INTEGER NOT NULL,
-            sender_uid TEXT,
-            content    TEXT NOT NULL
-        );
-        CREATE TABLE sender_names (
-            group_id   INTEGER NOT NULL,
-            uid        TEXT    NOT NULL,
-            group_nick TEXT,
-            qq_nick    TEXT,
-            uin        INTEGER,
-            in_group   INTEGER,
-            PRIMARY KEY (group_id, uid)
-        );
-        """
-    )
+    _ensure_message_tables(conn)
     conn.executemany(
         "INSERT INTO messages VALUES (?,?,?,?,?)",
         [
@@ -612,20 +623,56 @@ def test_message_span_none_when_only_dirty_rows(memdb):
 
 
 def _insert_item(
-    conn: sqlite3.Connection, item_id: int, *, deadline_ts: int | None = None
+    conn: sqlite3.Connection,
+    item_id: int,
+    *,
+    kind: str = "notice",
+    title: str | None = None,
+    event_ts: int = 1000,
+    deadline_ts: int | None = None,
 ) -> None:
     """造一条最小 item（只为截止日回填用例服务）。
 
     ⚠️ 本文件既有的插桩是 `_seed_items`（固定三行）与 `_insert_items(conn, rows)`
     （元组列表），**没有** brief 里写的 `_insert_item`。这里按 `_seed_items` 的
     列清单照补一个单行版本——**列名一个不差**，不自己发明形状。
+
+    M3 Task 2 扩展：加了 `kind` / `title` / `event_ts` 三个关键字参数，供搜索用例
+    构造不同类目与时间的行。三个默认值与 T1 原版**逐字相同**（`"notice"` /
+    `f"条目{item_id}"` / `1000`），所以 T1 既有的三处调用产出的行一个字节都没变。
+
+    顺带立起 messages / sender_names：查询层（`search_items` / `get_item` /
+    `digest_items`）LEFT JOIN 后者取署名，而 `store.ensure_schema` 不建它们
+    （真库里由 export.py 产出）。不立的话测试会炸 `no such table: sender_names`。
     """
+    _ensure_message_tables(conn)
     conn.execute(
         "INSERT INTO items (item_id, kind, title, detail, event_ts, deadline_ts,"
         " group_id, actor_uid, place, links, amount, confidence, model,"
         " prompt_ver, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-        (item_id, "notice", f"条目{item_id}", None, 1000, deadline_ts, 100, None,
-         None, "[]", None, 0.9, "m", "v1", 1),
+        (item_id, kind, title if title is not None else f"条目{item_id}", None,
+         event_ts, deadline_ts, 100, None, None, "[]", None, 0.9, "m", "v1", 1),
+    )
+    conn.commit()
+
+
+def _insert_message(
+    conn: sqlite3.Connection,
+    msg_id: int,
+    *,
+    content: str = "",
+    ts: int = 1000,
+    group_id: int = 100,
+    sender_uid: str | None = None,
+) -> None:
+    """造一条源消息（`source_messages` 的「点回原文」用例服务）。
+
+    形状照 `_seed_messages` 的列清单，只是单行、可指定内容。
+    """
+    _ensure_message_tables(conn)
+    conn.execute(
+        "INSERT INTO messages VALUES (?,?,?,?,?)",
+        (msg_id, group_id, ts, sender_uid, content),
     )
     conn.commit()
 
@@ -680,3 +727,243 @@ def test_clear_deadlines_with_empty_list_is_a_noop():
     conn = sqlite3.connect(":memory:")
     store.ensure_schema(conn)
     assert store.clear_deadlines(conn, []) == 0
+
+
+# ── FTS5 搜索索引 + 只读查询层（M3 Task 2）──────────────────────
+
+
+def test_search_finds_two_chinese_chars_via_like_fallback():
+    """⭐ 双字词必须搜得到——这是本任务的头号陷阱。
+
+    FTS5 trigram 对**短于 3 字符**的查询静默返回 0 条（不报错），
+    而中文双字词（「选课」「讲座」）恰恰是最常见的查询。
+    没有 LIKE 兜底的话，「搜不到」会被读成「库里没有」。
+    """
+    conn = sqlite3.connect(":memory:")
+    store.ensure_schema(conn)
+    _insert_item(conn, 1, title="选课通知", kind="academic")
+    _insert_item(conn, 2, title="失物招领", kind="lostfound")
+    items, total = store.search_items(conn, q="选课")
+    assert total == 1 and items[0].item_id == 1
+
+
+def test_search_finds_three_chinese_chars_via_trigram():
+    conn = sqlite3.connect(":memory:")
+    store.ensure_schema(conn)
+    _insert_item(conn, 1, title="校园卡补办", kind="life")
+    items, total = store.search_items(conn, q="校园卡")
+    assert total == 1 and items[0].item_id == 1
+
+
+def test_search_survives_fts5_syntax_characters():
+    """用户输入直接喂 MATCH 会抛 OperationalError——必须被包成短语。
+
+    ⚠️ **必须带断言 + 阳性对照**。「调用一下不抛异常」是空守卫：
+    搜索整个坏掉（永远返回 0）时，它照样绿。
+    """
+    conn = sqlite3.connect(":memory:")
+    store.ensure_schema(conn)
+    _insert_item(conn, 1, title="选课通知", kind="academic")
+    for q in ["NOT", 'a"b', "(", "补退选 -卡", "a OR b"]:
+        _, total = store.search_items(conn, q=q)
+        assert total == 0, f"{q!r} 应 0 条，实际 {total}"
+    # 阳性对照：这些字符**确实能被搜到**——否则上面那组 0 分不清
+    # 「搜索坏了」与「确实没有」。
+    _insert_item(conn, 2, title="通知（补）", kind="notice")
+    _, total = store.search_items(conn, q="（补）")
+    assert total == 1
+
+
+def test_search_escapes_like_wildcards():
+    """`%` 不转义就会匹配一切——那是个假数字。"""
+    conn = sqlite3.connect(":memory:")
+    store.ensure_schema(conn)
+    _insert_item(conn, 1, title="选课通知", kind="academic")
+    _, total = store.search_items(conn, q="%")
+    assert total == 0
+
+
+def test_search_filters_by_kind_and_window():
+    conn = sqlite3.connect(":memory:")
+    store.ensure_schema(conn)
+    _insert_item(conn, 1, kind="academic", event_ts=100)
+    _insert_item(conn, 2, kind="job", event_ts=200)
+    assert store.search_items(conn, kind="job")[1] == 1
+    assert store.search_items(conn, since=150)[1] == 1
+    assert store.search_items(conn, until=150)[1] == 1
+
+
+def test_search_is_newest_first():
+    """信息流按时间倒着看。⚠️ 与 window_items 的 ASC 不同是**故意的**。"""
+    conn = sqlite3.connect(":memory:")
+    store.ensure_schema(conn)
+    _insert_item(conn, 1, event_ts=100)
+    _insert_item(conn, 2, event_ts=200)
+    items, _ = store.search_items(conn)
+    assert [i.item_id for i in items] == [2, 1]
+
+
+def test_source_messages_returns_the_linked_messages():
+    conn = sqlite3.connect(":memory:")
+    store.ensure_schema(conn)
+    _insert_item(conn, 1)
+    _insert_message(conn, 11, content="原文在这里")
+    conn.execute("INSERT INTO item_sources (item_id, msg_id) VALUES (1, 11)")
+    srcs = store.source_messages(conn, 1)
+    assert len(srcs) == 1 and srcs[0].content == "原文在这里"
+
+
+def test_source_messages_of_unknown_item_is_empty():
+    conn = sqlite3.connect(":memory:")
+    store.ensure_schema(conn)
+    # ⚠️ 偏差（逃逸舱）：brief 原版没有这一行。`source_messages` JOIN `messages`，
+    # 而 SQLite **在 prepare 阶段**就报 `no such table: messages`——哪怕 WHERE
+    # 匹配不到任何行、结果本来就是空。必须先把表立起来，这条守的才是
+    # 「未知 item 返回空」而不是「表不存在会炸」。
+    _ensure_message_tables(conn)
+    assert store.source_messages(conn, 999) == []
+
+
+def test_digest_items_are_in_ascending_order_like_the_digest_body():
+    conn = sqlite3.connect(":memory:")
+    store.ensure_schema(conn)
+    _insert_item(conn, 1, event_ts=200)
+    _insert_item(conn, 2, event_ts=100)
+    conn.execute(
+        "INSERT INTO digests (digest_id, window_from, window_to, body_md, model,"
+        " prompt_ver, created_at) VALUES (1, 100, 300, '正文', 'm', 'v1', 1)"
+    )
+    conn.execute("INSERT INTO digest_items (digest_id, item_id) VALUES (1, 1), (1, 2)")
+    assert [i.item_id for i in store.digest_items(conn, 1)] == [2, 1]
+
+
+def test_kind_counts_groups_by_kind():
+    conn = sqlite3.connect(":memory:")
+    store.ensure_schema(conn)
+    _insert_item(conn, 1, kind="academic")
+    _insert_item(conn, 2, kind="academic")
+    _insert_item(conn, 3, kind="job")
+    assert store.kind_counts(conn) == {"academic": 2, "job": 1}
+
+
+# ── 查询层的补充守卫（brief 未覆盖的三个函数）────────────────────
+#
+# brief 的 10 个测试覆盖了 search_items / source_messages / kind_counts /
+# digest_items，但 get_item / list_digests / **get_digest 一个测试都没有**——
+# 而 get_digest 的 `DigestRow(*row)` 列序错位正是 brief 自己点名的
+# 「本任务最容易犯的错」（SELECT 多加一列就静默错位，不抛任何异常）。
+# T3 的 FastAPI 要直接把这几个函数的返回值序列化出去，所以补上最小守卫：
+# 用**整个 dataclass 相等**断言，六个字段一个不抽查。
+
+
+def test_get_item_maps_every_column_or_none():
+    conn = sqlite3.connect(":memory:")
+    store.ensure_schema(conn)
+    _ensure_message_tables(conn)
+    conn.execute(
+        "INSERT INTO sender_names VALUES (?,?,?,?,?,?)",
+        (100, "u_a", "张三", "三三", 111, 0),
+    )
+    conn.execute(
+        "INSERT INTO items (item_id, kind, title, detail, event_ts, deadline_ts,"
+        " group_id, actor_uid, place, links, amount, confidence, model,"
+        " prompt_ver, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (1, "job", "招兼职", "周末两小时", 1700, 1800, 100, "u_a", "三教",
+         '["http://a"]', "200/天", 0.9, "m", "v1", 1),
+    )
+    _insert_message(conn, 11, content="招兼职，周末两小时")
+    conn.execute("INSERT INTO item_sources (item_id, msg_id) VALUES (1, 11)")
+    conn.commit()
+
+    assert store.get_item(conn, 1) == store.ApiItem(
+        item_id=1, kind="job", title="招兼职", detail="周末两小时", event_ts=1700,
+        deadline_ts=1800, group_id=100, actor="张三", place="三教",
+        amount="200/天", links=("http://a",), source_count=1,
+    )
+    assert store.get_item(conn, 999) is None
+
+
+def test_get_digest_matches_the_row_field_by_field():
+    """⚠️ brief 点名的头号实现陷阱：``DigestRow(*row)`` 靠**位置**对齐。
+
+    ``SELECT`` 里多加一列（或用错顺序）不会抛异常，只会让六个字段整体串位——
+    正文跑到窗口起点、时间戳跑到条数上，读起来还像正常 JSON。
+    所以这里断言**整个 dataclass 相等**，而不是抽查一两个字段。
+    变异反证：把 `get_digest` 的 SELECT 里任意两列对调，这条立刻变红。
+    """
+    conn = sqlite3.connect(":memory:")
+    store.ensure_schema(conn)
+    conn.execute(
+        "INSERT INTO digests (digest_id, window_from, window_to, body_md, model,"
+        " prompt_ver, created_at) VALUES (7, 111, 222, '正文九号', 'm', 'v1', 333)"
+    )
+    _insert_item(conn, 1)
+    _insert_item(conn, 2)
+    conn.execute("INSERT INTO digest_items (digest_id, item_id) VALUES (7, 1), (7, 2)")
+    conn.commit()
+
+    assert store.get_digest(conn, 7) == store.DigestRow(
+        digest_id=7, window_from=111, window_to=222, body_md="正文九号",
+        created_at=333, item_count=2,
+    )
+    assert store.get_digest(conn, 999) is None
+
+
+def test_search_total_is_independent_of_limit_and_offset():
+    """⚠️ 契约（计划 §「契约空洞」，波 1 窄审查定的）：`total` = **符合筛选条件的
+    总数**，与 `limit`/`offset` **无关**——不是当页条数。
+
+    前端重度依赖它：`items.length < total` 决定「加载更多」按钮出不出来。
+    一旦把 total 实现成 `len(rows)`，按钮要么永远不出现、要么空转永远点不完，
+    而且**接口不报错**（数字看着还很像样）。
+    """
+    conn = sqlite3.connect(":memory:")
+    store.ensure_schema(conn)
+    for i in (1, 2, 3):
+        _insert_item(conn, i, event_ts=1000 + i)
+
+    page1, total1 = store.search_items(conn, limit=2)
+    assert total1 == 3 and [i.item_id for i in page1] == [3, 2]
+
+    page2, total2 = store.search_items(conn, limit=2, offset=2)
+    assert total2 == 3 and [i.item_id for i in page2] == [1]
+
+
+def test_ensure_schema_rebuilds_the_index_for_rows_that_predate_it():
+    """⚠️ **存量行**：触发器只管「索引建好之后」的新数据。
+
+    这里模拟一个「索引还不存在」的老库（只建 items、直接塞一行），再跑
+    ``ensure_schema``——那一行**不会**经过任何触发器，全靠 ``rebuild`` 捞进索引。
+    变异反证：把 ``ensure_schema`` 里的 ``rebuild_search_index(conn)`` 删掉，
+    这条立刻变红（而其余 12 个搜索用例**照样全绿**——它们都在 ensure_schema
+    之后才插数据，触发器兜住了，这正是本条存在的理由）。
+    """
+    conn = sqlite3.connect(":memory:")
+    conn.executescript(store._ITEMS_DDL)   # 只有 items：索引尚不存在的状态
+    _insert_item(conn, 1, title="校园卡补办")
+
+    store.ensure_schema(conn)
+
+    items, total = store.search_items(conn, q="校园卡")
+    assert total == 1 and items[0].item_id == 1
+
+
+def test_list_digests_is_newest_window_first():
+    """日报列表按窗口倒序（最近的在前），且带上每条引用了多少条目。"""
+    conn = sqlite3.connect(":memory:")
+    store.ensure_schema(conn)
+    for did, wf in ((1, 100), (2, 200)):
+        conn.execute(
+            "INSERT INTO digests (digest_id, window_from, window_to, body_md, model,"
+            " prompt_ver, created_at) VALUES (?,?,?,'正文','m','v1',1)",
+            (did, wf, wf + 50),
+        )
+    _insert_item(conn, 1)
+    conn.execute("INSERT INTO digest_items (digest_id, item_id) VALUES (2, 1)")
+    conn.commit()
+
+    got = store.list_digests(conn)
+    assert [d.digest_id for d in got] == [2, 1]
+    assert got[0] == store.DigestSummaryRow(
+        digest_id=2, window_from=200, window_to=250, created_at=1, item_count=1
+    )

@@ -91,8 +91,42 @@ CREATE TABLE IF NOT EXISTS digest_items (
 CREATE INDEX IF NOT EXISTS digest_items_item ON digest_items(item_id);
 """
 
+# items_fts：搜索索引。**外部内容表**（content='items'）而不是另存一份正文——
+# 正文只存 items 一处，索引只存分词位置，省空间也不会两份数据说了不一样的话。
+#
+# ⚠️ tokenize='trigram' 的理由：中文没有词边界，trigram 按 3 字符滑窗建索引，
+# 于是「子串匹配」天然可用，不需要分词器。但它有两条实测出来的脾气：
+#   1. **短于 3 字符的查询静默返回 0 条**（不报错）→ 见 search_items 的兜底分支
+#   2. 裸查询串会被当 FTS5 语法解析，`NOT`/`(`/`a"b` 直接抛错 → 见 _fts_phrase
+_SEARCH_DDL = """
+CREATE VIRTUAL TABLE IF NOT EXISTS items_fts USING fts5(
+    title, detail,
+    content='items', content_rowid='item_id',
+    tokenize='trigram'
+);
+CREATE TRIGGER IF NOT EXISTS items_fts_ai AFTER INSERT ON items BEGIN
+  INSERT INTO items_fts(rowid, title, detail)
+  VALUES (new.item_id, new.title, new.detail);
+END;
+CREATE TRIGGER IF NOT EXISTS items_fts_ad AFTER DELETE ON items BEGIN
+  INSERT INTO items_fts(items_fts, rowid, title, detail)
+  VALUES ('delete', old.item_id, old.title, old.detail);
+END;
+CREATE TRIGGER IF NOT EXISTS items_fts_au AFTER UPDATE ON items BEGIN
+  INSERT INTO items_fts(items_fts, rowid, title, detail)
+  VALUES ('delete', old.item_id, old.title, old.detail);
+  INSERT INTO items_fts(rowid, title, detail)
+  VALUES (new.item_id, new.title, new.detail);
+END;
+"""
+
 SCHEMA_DDL = (
-    _ITEMS_DDL + _SOURCES_DDL + _RUNS_DDL + _DIGESTS_DDL + _DIGEST_ITEMS_DDL
+    _ITEMS_DDL
+    + _SOURCES_DDL
+    + _RUNS_DDL
+    + _DIGESTS_DDL
+    + _DIGEST_ITEMS_DDL
+    + _SEARCH_DDL
 )
 
 
@@ -143,8 +177,14 @@ class WindowItem:
 
 
 def ensure_schema(conn: sqlite3.Connection) -> None:
-    """建表。幂等——每次 refine 都调，不靠外部迁移工具。"""
+    """建表。幂等——每次 refine 都调，不靠外部迁移工具。
+
+    顺带重建搜索索引：触发器只管建好之后的新数据，**存量行**得靠 rebuild。
+    跑在写路径上（refine / digest），代价是 O(条目数)，换来「索引不会
+    长期停在过期状态」——搜索返回空结果时，那个空结果才真是「库里没有」。
+    """
     conn.executescript(SCHEMA_DDL)
+    rebuild_search_index(conn)
     conn.commit()
 
 
@@ -465,3 +505,289 @@ def clear_deadlines(conn: sqlite3.Connection, item_ids: list[int]) -> int:
     )
     conn.commit()
     return int(cur.rowcount)
+
+
+# ── 只读查询层：Web 的读侧（M3 Task 2）────────────────────────
+#
+# 全是只读的 SELECT（`rebuild_search_index` 是唯一例外，它写索引）。
+# 列名与 API 契约逐字对应，`:mod:`vigil.api`（T3）直接把它序列化出去。
+
+# FTS5 trigram 的最小可查长度。短于它的查询**不会报错，只会返回空**。
+MIN_TRIGRAM = 3
+
+
+def rebuild_search_index(conn: sqlite3.Connection) -> None:
+    """把搜索索引与 items 重建一致。
+
+    触发器建好之后新数据会自动同步；这个函数管的是**存量行**与
+    「索引曾经与 items 脱节」的情况。
+    """
+    conn.execute("INSERT INTO items_fts(items_fts) VALUES ('rebuild')")
+    conn.commit()
+
+
+def _fts_phrase(q: str) -> str:
+    """把用户输入包成 FTS5 **短语**查询。
+
+    ⚠️ 不包就会炸（实测）：`NOT`、`a"b`、`(`、`补退选 -卡` 全都让 MATCH 抛
+    ``OperationalError``——用户在搜索框里打个引号就是 500。包成短语后，
+    这些输入退化成「按字面找这个短语」，语义仍然正确。
+    """
+    return '"' + q.replace('"', '""') + '"'
+
+
+def _escape_like(q: str) -> str:
+    """LIKE 的通配符转义。不转义的话用户输入的 % 会变成「匹配一切」。"""
+    return q.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+@dataclass(frozen=True)
+class ApiItem:
+    """喂给 Web 的一条条目。列名与 API 契约逐字对应。
+
+    ``actor`` 已在 SQL 里解析成姓名（同 ``pending_messages`` 的口径）；
+    ``group_name`` 不在这里解析——群名来自 ``config/groups.toml`` 而不是库，
+    由 API 层补上。库返回 id、配置层补名字，这个分工与既有代码一致。
+    """
+
+    item_id: int
+    kind: str
+    title: str
+    detail: str | None
+    event_ts: int
+    deadline_ts: int | None
+    group_id: int
+    actor: str | None
+    place: str | None
+    amount: str | None
+    links: tuple[str, ...]
+    source_count: int
+
+
+@dataclass(frozen=True)
+class SourceRow:
+    """一条源消息的原文。Web 的「点回原文」靠它。"""
+
+    msg_id: int
+    ts: int
+    sender: str
+    group_id: int
+    content: str
+
+
+@dataclass(frozen=True)
+class DigestSummaryRow:
+    digest_id: int
+    window_from: int
+    window_to: int
+    created_at: int
+    item_count: int
+
+
+@dataclass(frozen=True)
+class DigestRow:
+    digest_id: int
+    window_from: int
+    window_to: int
+    body_md: str
+    created_at: int
+    item_count: int
+
+
+_ITEM_COLS = (
+    "i.item_id, i.kind, i.title, i.detail, i.event_ts, i.deadline_ts, i.group_id,"
+    " COALESCE(NULLIF(sn.group_nick, ''), NULLIF(sn.qq_nick, ''), '') AS actor,"
+    " i.place, i.amount, i.links,"
+    " (SELECT COUNT(*) FROM item_sources src WHERE src.item_id = i.item_id)"
+    "   AS source_count"
+)
+
+_ITEM_JOINS = (
+    " FROM items i"
+    " LEFT JOIN sender_names sn ON sn.group_id = i.group_id AND sn.uid = i.actor_uid"
+)
+
+
+def _parse_links(raw: object) -> tuple[str, ...]:
+    """``items.links`` 存的是 JSON 数组文本。
+
+    ⚠️ 解析失败**不抛异常**：这一列是 M1 写的，坏一条不该让整页 500。
+    解析不出来就当没有链接（视图少一栏，不是白屏）。
+    """
+    if not raw:
+        return ()
+    try:
+        data = json.loads(raw)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return ()
+    if not isinstance(data, list):
+        return ()
+    return tuple(str(x) for x in data)
+
+
+def _to_api_item(row: tuple) -> ApiItem:
+    (item_id, kind, title, detail, event_ts, deadline_ts, group_id,
+     actor, place, amount, links, source_count) = row
+    return ApiItem(
+        item_id=item_id,
+        kind=kind,
+        title=title,
+        detail=detail,
+        event_ts=event_ts,
+        deadline_ts=deadline_ts,
+        group_id=group_id,
+        actor=actor or None,
+        place=place,
+        amount=amount,
+        links=_parse_links(links),
+        source_count=int(source_count),
+    )
+
+
+def _item_filters(
+    *,
+    kind: str | None,
+    since: int | None,
+    until: int | None,
+    group: int | None,
+    q: str | None,
+) -> tuple[list[str], list[object]]:
+    """拼 WHERE 片段。**关键词的两条路径在这里分岔**（trigram / LIKE）。"""
+    where: list[str] = []
+    params: list[object] = []
+    if kind:
+        where.append("i.kind = ?")
+        params.append(kind)
+    if since is not None:
+        where.append("i.event_ts >= ?")
+        params.append(since)
+    if until is not None:
+        where.append("i.event_ts < ?")
+        params.append(until)
+    if group is not None:
+        where.append("i.group_id = ?")
+        params.append(group)
+    if q:
+        if len(q) >= MIN_TRIGRAM:
+            where.append(
+                "i.item_id IN (SELECT rowid FROM items_fts WHERE items_fts MATCH ?)"
+            )
+            params.append(_fts_phrase(q))
+        else:
+            # ⚠️ trigram tokenizer **对短于 3 字符的查询静默返回 0 条**（实测，
+            # 不报错）——而中文双字词（「选课」「讲座」）恰恰是最常见的查询。
+            # 没有这一支的话，「搜不到」会被读成「库里没有」，是句假话。
+            # items 目前 270 行、年增约两千行，LIKE 全表扫的代价可以忽略。
+            like = f"%{_escape_like(q)}%"
+            where.append(
+                "(i.title LIKE ? ESCAPE '\\'"
+                " OR IFNULL(i.detail, '') LIKE ? ESCAPE '\\')"
+            )
+            params += [like, like]
+    return where, params
+
+
+def search_items(
+    conn: sqlite3.Connection,
+    *,
+    kind: str | None = None,
+    since: int | None = None,
+    until: int | None = None,
+    group: int | None = None,
+    q: str | None = None,
+    limit: int = 50,
+    offset: int = 0,
+) -> tuple[list[ApiItem], int]:
+    """查条目，返回 ``(当页, 符合条件的总数)``。
+
+    排序是 ``event_ts DESC, item_id DESC``（新的在前）——信息流的默认读法。
+    ⚠️ 与 ``window_items`` 的 ASC 不同是**故意的**：日报按时间顺着读，
+    信息流按时间倒着看。两处都不许「顺手改成一致」。
+    """
+    where, params = _item_filters(
+        kind=kind, since=since, until=until, group=group, q=q
+    )
+    clause = (" WHERE " + " AND ".join(where)) if where else ""
+    total = int(
+        conn.execute(f"SELECT COUNT(*) FROM items i{clause}", params).fetchone()[0]
+    )
+    rows = conn.execute(
+        f"SELECT {_ITEM_COLS}{_ITEM_JOINS}{clause}"
+        " ORDER BY i.event_ts DESC, i.item_id DESC LIMIT ? OFFSET ?",
+        [*params, limit, offset],
+    ).fetchall()
+    return [_to_api_item(r) for r in rows], total
+
+
+def get_item(conn: sqlite3.Connection, item_id: int) -> ApiItem | None:
+    """单条条目；不存在返回 None（由调用方决定 404 的形状）。"""
+    row = conn.execute(
+        f"SELECT {_ITEM_COLS}{_ITEM_JOINS} WHERE i.item_id = ?", (item_id,)
+    ).fetchone()
+    return _to_api_item(row) if row else None
+
+
+def source_messages(conn: sqlite3.Connection, item_id: int) -> list[SourceRow]:
+    """这条 item 来源消息的**原文**，按 ``(ts, msg_id)`` 升序。
+
+    顺序是当初喂给模型的顺序——回溯时读起来才顺。
+
+    名字不叫 ``item_sources``——那会与**表名**撞车，读代码时分不清
+    说的是表还是函数（这里返回的是「消息」，不是「来源行」）。
+    """
+    rows = conn.execute(
+        "SELECT m.msg_id, m.ts,"
+        " COALESCE(NULLIF(sn.group_nick, ''), NULLIF(sn.qq_nick, ''), '') AS sender,"
+        " m.group_id, IFNULL(m.content, '')"
+        " FROM item_sources src"
+        " JOIN messages m ON m.msg_id = src.msg_id"
+        " LEFT JOIN sender_names sn"
+        "        ON sn.group_id = m.group_id AND sn.uid = m.sender_uid"
+        " WHERE src.item_id = ?"
+        " ORDER BY m.ts ASC, m.msg_id ASC",
+        (item_id,),
+    ).fetchall()
+    return [SourceRow(*r) for r in rows]
+
+
+def kind_counts(conn: sqlite3.Connection) -> dict[str, int]:
+    """每个类目有多少条。类目视图的角标用它。"""
+    return {
+        str(k): int(n)
+        for k, n in conn.execute("SELECT kind, COUNT(*) FROM items GROUP BY kind")
+    }
+
+
+def list_digests(
+    conn: sqlite3.Connection, *, limit: int = 30
+) -> list[DigestSummaryRow]:
+    """日报列表，最近的窗口在前。**不带正文**——列表页用不上，白白撑大响应。"""
+    rows = conn.execute(
+        "SELECT d.digest_id, d.window_from, d.window_to, d.created_at,"
+        " (SELECT COUNT(*) FROM digest_items di WHERE di.digest_id = d.digest_id)"
+        " FROM digests d ORDER BY d.window_from DESC LIMIT ?",
+        (limit,),
+    ).fetchall()
+    return [DigestSummaryRow(*r) for r in rows]
+
+
+def get_digest(conn: sqlite3.Connection, digest_id: int) -> DigestRow | None:
+    row = conn.execute(
+        "SELECT d.digest_id, d.window_from, d.window_to, d.body_md, d.created_at,"
+        " (SELECT COUNT(*) FROM digest_items di WHERE di.digest_id = d.digest_id)"
+        " FROM digests d WHERE d.digest_id = ?",
+        (digest_id,),
+    ).fetchone()
+    return DigestRow(*row) if row else None
+
+
+def digest_items(conn: sqlite3.Connection, digest_id: int) -> list[ApiItem]:
+    """一篇日报引用的条目，按 ``(event_ts, item_id)`` 升序——与日报正文同序。"""
+    rows = conn.execute(
+        f"SELECT {_ITEM_COLS}{_ITEM_JOINS}"
+        " JOIN digest_items di ON di.item_id = i.item_id"
+        " WHERE di.digest_id = ?"
+        " ORDER BY i.event_ts ASC, i.item_id ASC",
+        (digest_id,),
+    ).fetchall()
+    return [_to_api_item(r) for r in rows]
