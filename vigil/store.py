@@ -437,3 +437,31 @@ def item_sources_text(
     for item_id, content in rows:
         grouped.setdefault(item_id, []).append(content or "")
     return {k: "\n".join(v) for k, v in grouped.items()}
+
+
+def items_with_deadline(conn: sqlite3.Connection) -> list[tuple[int, int]]:
+    """所有**带截止日**的 ``(item_id, deadline_ts)``。回填核验用。"""
+    return [
+        (int(a), int(b))
+        for a, b in conn.execute(
+            "SELECT item_id, deadline_ts FROM items"
+            " WHERE deadline_ts IS NOT NULL ORDER BY item_id"
+        )
+    ]
+
+
+def clear_deadlines(conn: sqlite3.Connection, item_ids: list[int]) -> int:
+    """把给定条目的 ``deadline_ts`` 置 NULL，返回实际改动行数。
+
+    只动这一列：条目的标题、正文、来源一概不碰——**降级的是那一个字段，
+    不是整条信息**。用户仍然看得到这条，只是不再被告知一个编出来的日期。
+    """
+    if not item_ids:
+        return 0
+    marks = ",".join("?" * len(item_ids))
+    cur = conn.execute(
+        f"UPDATE items SET deadline_ts = NULL WHERE item_id IN ({marks})",
+        list(item_ids),
+    )
+    conn.commit()
+    return int(cur.rowcount)

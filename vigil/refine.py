@@ -16,12 +16,13 @@ from __future__ import annotations
 import datetime as dt
 import re
 import sqlite3
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from . import prefilter, store
 from .categories import Category, prompt_block
 from .config import Config
+from .deadline import deadline_supported
 from .llm import DEFAULT_MODEL, LLMConfig, LLMError, chat_json
 from .redact import Redactor
 from .store import PendingMessage
@@ -42,6 +43,7 @@ class RefineStats:
     batches_planned: int = 0  # 计划要跑多少批
     batches: int = 0  # **实际**跑了几批——预算 break 之后会小于 planned
     items_saved: int = 0
+    deadlines_dropped: int = 0   # 源文里找不到依据、被降级的截止日条数
     input_tokens: int = 0
     output_tokens: int = 0
     budget_hit: bool = False
@@ -227,6 +229,31 @@ def _to_item(
     )
 
 
+def _drop_unsupported_deadlines(
+    produced: list[store.ExtractedItem], batch: list[store.PendingMessage]
+) -> tuple[list[store.ExtractedItem], int]:
+    """写入前核验：源文里找不到字面依据的截止日一律置 None。
+
+    ⚠️ 核验放在**写入边界**而不是渲染层：数据一旦入库就到处流，每个读取方
+    各挡一次，迟早有人忘——M2 就只在日报挡过，M3 的 Web 差一点把那 13 条
+    幻觉日期原样复活（「今天下午16点之前」被填成 9-14、「明早7:20」被填成 9-15）。
+
+    ⚠️ 只降级 deadline_ts 这一个字段：条目的标题、正文、来源一概不动。
+    用户仍然看得到这条信息，只是不再被告知一个编出来的日期。
+    """
+    texts = {m.msg_id: (m.content or "") for m in batch}
+    out: list[store.ExtractedItem] = []
+    dropped = 0
+    for it in produced:
+        if it.deadline_ts and not deadline_supported(
+            it.deadline_ts, "\n".join(texts.get(mid, "") for mid in it.src_msg_ids)
+        ):
+            dropped += 1
+            it = replace(it, deadline_ts=None)
+        out.append(it)
+    return out, dropped
+
+
 def refine(
     config: Config,
     *,
@@ -367,6 +394,8 @@ def refine(
                 hit_ids.update(item.src_msg_ids)
 
             if produced:
+                produced, dropped = _drop_unsupported_deadlines(produced, batch)
+                stats.deadlines_dropped += dropped
                 stats.items_saved += store.save_items(
                     conn, produced, model=model, prompt_ver=prompt_ver
                 )

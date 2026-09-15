@@ -2050,3 +2050,18 @@ def test_dry_run_preview_equals_written_body_on_no_data_day(seeded, monkeypatch,
     written = (tmp_path / "2026-09-20.md").read_text(encoding="utf-8")
 
     assert written.split("\n", 1)[1].strip("\n") in preview
+
+
+# ── 截止日判据只有一份（M3 Task 1 平移）────────────────────────
+
+
+def test_deadline_supported_is_the_shared_module_not_a_local_copy():
+    """守住「判据只有一份」。
+
+    若有人日后又在 digest.py 里写回一个本地 `deadline_supported`，
+    Web 侧（读 deadline.py）与日报侧（读本地副本）就会各判各的——
+    同一条截止日可能在日报里被隐去、在 Web 上照常显示。
+    """
+    from vigil import deadline
+
+    assert digest.deadline_supported is deadline.deadline_supported

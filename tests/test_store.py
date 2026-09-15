@@ -606,3 +606,50 @@ def test_message_span_none_when_only_dirty_rows(memdb):
     )
 
     assert store.message_span(memdb) is None
+
+
+# ── 截止日回填：读哪些 / 清哪些（M3 Task 1）────────────────────
+
+
+def _insert_item(
+    conn: sqlite3.Connection, item_id: int, *, deadline_ts: int | None = None
+) -> None:
+    """造一条最小 item（只为截止日回填用例服务）。
+
+    ⚠️ 本文件既有的插桩是 `_seed_items`（固定三行）与 `_insert_items(conn, rows)`
+    （元组列表），**没有** brief 里写的 `_insert_item`。这里按 `_seed_items` 的
+    列清单照补一个单行版本——**列名一个不差**，不自己发明形状。
+    """
+    conn.execute(
+        "INSERT INTO items (item_id, kind, title, detail, event_ts, deadline_ts,"
+        " group_id, actor_uid, place, links, amount, confidence, model,"
+        " prompt_ver, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (item_id, "notice", f"条目{item_id}", None, 1000, deadline_ts, 100, None,
+         None, "[]", None, 0.9, "m", "v1", 1),
+    )
+    conn.commit()
+
+
+def test_items_with_deadline_only_returns_rows_that_have_one():
+    conn = sqlite3.connect(":memory:")
+    store.ensure_schema(conn)
+    _insert_item(conn, 1, deadline_ts=1000)
+    _insert_item(conn, 2, deadline_ts=None)
+    assert store.items_with_deadline(conn) == [(1, 1000)]
+
+
+def test_clear_deadlines_only_touches_that_column():
+    """降级的必须是**那一个字段**，不是整条信息。"""
+    conn = sqlite3.connect(":memory:")
+    store.ensure_schema(conn)
+    _insert_item(conn, 1, deadline_ts=1000)
+    before = conn.execute("SELECT item_id, title, kind FROM items").fetchall()
+    assert store.clear_deadlines(conn, [1]) == 1
+    assert conn.execute("SELECT item_id, title, kind FROM items").fetchall() == before
+    assert conn.execute("SELECT deadline_ts FROM items").fetchone()[0] is None
+
+
+def test_clear_deadlines_with_empty_list_is_a_noop():
+    conn = sqlite3.connect(":memory:")
+    store.ensure_schema(conn)
+    assert store.clear_deadlines(conn, []) == 0

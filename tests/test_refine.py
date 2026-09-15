@@ -468,3 +468,90 @@ def test_dry_run_makes_no_calls(seeded, monkeypatch):
     assert fake.calls == []
     assert stats.items_saved == 0
     assert seeded.execute("SELECT count(*) FROM refine_runs").fetchone()[0] == 0
+
+
+# ── 截止日写入前核验（M3 Task 1）────────────────────────────
+#
+# ⚠️ 本文件原本**没有** `_msg` / `_extracted`。brief 已预告这一点，按本文件既有风格补：
+# 造 `PendingMessage` 的既有做法是**就地构造**（见 test_match_source_tolerates_...），
+# 这里只是把同一形状收成一个函数；conftest 里另有一个 `msg_factory` fixture，
+# 但它造的是「任意内容」的通用消息，而这两条用例关心的是**正文本身**
+# （核验就是拿正文去比日期），所以留了局部版本、签名也保持 brief 的 `_msg` 形状。
+
+
+def _msg(msg_id: int, *, content: str) -> store.PendingMessage:
+    """造一条源消息。核验只关心 msg_id 与正文，其余字段取固定值。"""
+    return store.PendingMessage(
+        msg_id=msg_id, group_id=100, ts=1000, sender_uid="u_a",
+        sender="班长小王", content=content,
+    )
+
+
+def _extracted(
+    *, deadline_ts: int | None, title: str = "数学作业截止"
+) -> store.ExtractedItem:
+    """造一条 ExtractedItem，字段形状与 `_to_item` 的产出一致，来源挂在 msg 1。"""
+    return store.ExtractedItem(
+        kind="academic", title=title, detail=None, event_ts=1000,
+        deadline_ts=deadline_ts, group_id=100, actor_uid="u_a", place=None,
+        links=(), amount=None, confidence=0.9, src_msg_ids=(1,),
+    )
+
+
+def test_refine_drops_deadline_without_literal_evidence():
+    """源文写「明早」，模型却填了具体日期——这个截止日不许落库。
+
+    真实数据里的原样：「明早7：20各班在宿舍楼下集合」被填成 09-15。
+    """
+    import datetime as dt
+
+    ts = int(dt.datetime(2026, 9, 15, 12, 0).timestamp())
+    batch = [_msg(1, content="各位小班：明早7：20各班在宿舍楼下集合")]
+    item = _extracted(deadline_ts=ts)
+    out, dropped = refine._drop_unsupported_deadlines([item], batch)
+    assert dropped == 1
+    assert out[0].deadline_ts is None
+    assert out[0].title == item.title       # 其余字段一个都不许动
+
+
+def test_refine_keeps_deadline_with_literal_evidence():
+    import datetime as dt
+
+    ts = int(dt.datetime(2026, 9, 16, 12, 0).timestamp())
+    batch = [_msg(1, content="9月16日12:00开始报名缴费")]
+    out, dropped = refine._drop_unsupported_deadlines([_extracted(deadline_ts=ts)], batch)
+    assert dropped == 0
+    assert out[0].deadline_ts == ts
+
+
+def test_refine_wires_the_deadline_drop_end_to_end(seeded, monkeypatch):
+    """接线也要守——**brief 的两条用例直接调私有函数，一条都没经过 `refine()`**。
+
+    那正是「空守卫」的形状：函数本身对，但批次循环里没人调它、或调了却忘了把计数
+    累加进 stats，上面两条照样全绿，而库里仍然躺着模型编出来的日期。所以这条从模型
+    输出一路走到 items 表。
+    """
+    fake = FakeLLM(
+        lambda user: {
+            "items": [
+                {"quote": "数学作业截止到9月7号", "kind": "academic",
+                 "title": "数学作业截止",
+                 "detail": None, "deadline": "2026-09-10", "place": None,
+                 "amount": None, "confidence": 0.9}
+            ]
+        }
+    )
+    monkeypatch.setattr(refine, "chat_json", fake)
+
+    stats = refine.refine(StubConfig(), api_key="k", conn=seeded,
+                          on_progress=lambda *a, **k: None)
+
+    # 源文只有「9月7号」，模型填的 09-10 在源文里没有依据 → 只降级那一个字段
+    assert stats.deadlines_dropped == 1, "降级计数必须流到 stats（CLI 靠它报警）"
+    assert stats.items_saved == 1, "条目本身照常落库，降级的只是日期"
+    assert seeded.execute(
+        "SELECT title, deadline_ts FROM items"
+    ).fetchone() == ("数学作业截止", None)
+    assert seeded.execute(
+        "SELECT count(*) FROM item_sources"
+    ).fetchone()[0] == 1, "来源行不受影响"
