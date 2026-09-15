@@ -13,6 +13,10 @@
      （实测猜成了 2023）。所以 user 消息里必须注入当前日期。
   3. 模型倾向只处理第一条消息就停下（实测输出仅 88 token）。
      所以提示词必须明确「无价值的消息直接不出现在结果里」。
+  4. **全角引号会让模型退化成无限空格循环。** 2026-09-15 实测：同一份 10 条
+     item 的日报请求，某条 detail 含 ``“ ”`` 时 85s 未收尾、已吐 8,896 字且
+     仍在继续；把该处换成 ``「」`` 后 6.2s 正常返回。发往模型前请过
+     ``sanitize_for_llm``。
 """
 
 from __future__ import annotations
@@ -38,6 +42,25 @@ DEFAULT_BASE = "https://api.siliconflow.cn/v1/chat/completions"
 # 样本上被实测抓出纯幻觉（标题与来源完全无关），该结论已作废。
 DEFAULT_MODEL = "Qwen/Qwen3.5-35B-A3B"
 
+# 模型在 chat 模板里遇到全角引号会退化成**无限空格循环**——2026-09-15 实测：
+#
+#   原样发出（detail 含 “风之海310”）  → 85s 未收尾，已吐 8,896 字且仍在继续
+#   把该处 “ ” 换成 「」              → 6.2s 正常返回
+#   全部条目的 “ ” 都换掉            → 5.8s 正常返回
+#
+# 实测分布：items 270 条里 4 条命中（1.5%）、messages 47,719 条里 25 条命中。
+# 频率不高，但第一次拿真实数据试就撞上了。
+#
+# ⚠️ **只修有证据的这一处。** 【】『』… 没有实测过会退化，不要顺手加进来——
+# 加了没有依据，日后也没法追溯为什么这么写。真要加，先做实验。
+_LLM_UNSAFE = str.maketrans({"“": "「", "”": "」"})
+
+
+def sanitize_for_llm(text: str) -> str:
+    """把会让模型退化的字符换成安全等价物。发往模型的文本都要过这一道。"""
+    return text.translate(_LLM_UNSAFE)
+
+
 _FENCE = re.compile(r"^```[a-zA-Z]*\s*|\s*```$")
 
 
@@ -60,6 +83,12 @@ class LLMConfig:
     # 留 None 而不是 False 做默认：老模型（Qwen2.5）不一定认这个字段，
     # 「不发」才是对它们最安全的形状。
     enable_thinking: bool | None = None
+    # 输出 token 上限。None = **不发这个字段**（老模型不一定认）。
+    # 默认 None 是为了让 M1 的 refine 行为一字不变；日报显式传 2000。
+    # 为什么必须有：模型一旦退化成上面的空格循环，唯一能拦住它的就是超时
+    # ——180s × 3 次重试 ≈ 9 分钟空转。实测加 max_tokens=1200 后同样的失控
+    # 请求 23s 就停（虽被截断，但兜住了）。
+    max_tokens: int | None = None
 
 
 @dataclass(frozen=True)
@@ -120,6 +149,8 @@ def chat_json(
     }
     if cfg.enable_thinking is not None:
         request_body["enable_thinking"] = cfg.enable_thinking
+    if cfg.max_tokens is not None:
+        request_body["max_tokens"] = cfg.max_tokens
     body = json.dumps(request_body).encode("utf-8")
 
     last_error: Exception | None = None

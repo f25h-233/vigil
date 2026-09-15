@@ -8,7 +8,7 @@ import urllib.error
 
 import pytest
 
-from vigil.llm import LLMConfig, LLMError, chat_json
+from vigil.llm import LLMConfig, LLMError, chat_json, sanitize_for_llm
 
 
 class FakeResponse(io.BytesIO):
@@ -207,3 +207,46 @@ def test_backoff_is_exponential(monkeypatch, cfg):
     with pytest.raises(LLMError):
         chat_json(cfg, system="s", user="u", sleep=delays.append)
     assert delays == [1, 2]
+
+
+# ── max_tokens 与字符归一化（M2 Task 2）────────────────────
+
+
+def test_max_tokens_omitted_by_default(monkeypatch, cfg):
+    """默认不发 max_tokens——M1 的 refine 行为必须一字不变。"""
+    captured = {}
+
+    def fake_urlopen(req, timeout=None):
+        captured["body"] = json.loads(req.data.decode("utf-8"))
+        return FakeResponse(_envelope("{}"))
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    chat_json(cfg, system="s", user="u", sleep=lambda _: None)
+
+    assert "max_tokens" not in captured["body"]
+
+
+def test_max_tokens_sent_when_set(monkeypatch):
+    captured = {}
+
+    def fake_urlopen(req, timeout=None):
+        captured["body"] = json.loads(req.data.decode("utf-8"))
+        return FakeResponse(_envelope("{}"))
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    chat_json(
+        LLMConfig(api_key="k", max_tokens=2000),
+        system="s", user="u", sleep=lambda _: None,
+    )
+
+    assert captured["body"]["max_tokens"] == 2000
+
+
+def test_sanitize_replaces_fullwidth_quotes():
+    """实测：全角引号会让模型退化成无限空格循环（85s 未收尾）。"""
+    assert sanitize_for_llm("昵称“风之海310”") == "昵称「风之海310」"
+
+
+def test_sanitize_leaves_other_text_alone():
+    """只修有证据的那一处，别的标点不许顺手改。"""
+    assert sanitize_for_llm("【通知】9月14日…") == "【通知】9月14日…"
