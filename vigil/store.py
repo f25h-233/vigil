@@ -3,7 +3,7 @@
 表建在 data/vigil.db（与 messages 同库），这样「条目 → 源消息」
 可以纯 SQL JOIN，不需要跨库。
 
-`digests` / `digest_items` 属于 M2，本模块不建——M1 建了也没有写入方。
+`digests` / `digest_items` 由 M2 建立——M1 建了也没有写入方。
 """
 
 from __future__ import annotations
@@ -65,7 +65,35 @@ CREATE TABLE IF NOT EXISTS refine_runs (
 );
 """
 
-SCHEMA_DDL = _ITEMS_DDL + _SOURCES_DDL + _RUNS_DDL
+# digests：日报成品。日报是 items 在时间窗内的叙述性渲染，不是第二套抽取管线。
+# 唯一索引保证「同一天跑两次」是替换——否则会在库里堆出两篇同日日报。
+_DIGESTS_DDL = """
+CREATE TABLE IF NOT EXISTS digests (
+    digest_id   INTEGER PRIMARY KEY,
+    window_from INTEGER NOT NULL,
+    window_to   INTEGER NOT NULL,
+    body_md     TEXT    NOT NULL,
+    model       TEXT    NOT NULL,
+    prompt_ver  TEXT    NOT NULL,
+    created_at  INTEGER NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS digests_window ON digests(window_from, window_to);
+"""
+
+# digest_items：日报 ↔ 条目的互跳。M3 的「点回原文」靠它，
+# 也是「日报里说的每一条都能在 Web 里找到」这句承诺的落地。
+_DIGEST_ITEMS_DDL = """
+CREATE TABLE IF NOT EXISTS digest_items (
+    digest_id INTEGER NOT NULL,
+    item_id   INTEGER NOT NULL,
+    PRIMARY KEY (digest_id, item_id)
+);
+CREATE INDEX IF NOT EXISTS digest_items_item ON digest_items(item_id);
+"""
+
+SCHEMA_DDL = (
+    _ITEMS_DDL + _SOURCES_DDL + _RUNS_DDL + _DIGESTS_DDL + _DIGEST_ITEMS_DDL
+)
 
 
 @dataclass(frozen=True)
@@ -96,6 +124,22 @@ class ExtractedItem:
     amount: str | None
     confidence: float
     src_msg_ids: tuple[int, ...]
+
+
+@dataclass(frozen=True)
+class WindowItem:
+    """日报要用到的一条条目。只含渲染与匹配需要的列。"""
+
+    item_id: int
+    kind: str
+    title: str
+    detail: str | None
+    event_ts: int
+    deadline_ts: int | None
+    group_id: int
+    place: str | None
+    amount: str | None
+    confidence: float
 
 
 def ensure_schema(conn: sqlite3.Connection) -> None:
@@ -217,3 +261,87 @@ def record_run(
         [(mid, stamp, status, item_count, prompt_ver, err) for mid in msg_ids],
     )
     conn.commit()
+
+
+def window_items(
+    conn: sqlite3.Connection, *, since: int, until: int
+) -> list[WindowItem]:
+    """取时间窗内的条目，按事件时间升序。
+
+    ⚠️ 顺序不能改：``build_rows`` 拿「第一个匹配到的 item」当锚点
+    （决定这一行属于哪个类目、署哪个群），隐式依赖这个顺序。
+    """
+    rows = conn.execute(
+        "SELECT item_id, kind, title, detail, event_ts, deadline_ts,"
+        " group_id, place, amount, confidence"
+        " FROM items WHERE event_ts >= ? AND event_ts < ?"
+        " ORDER BY event_ts ASC, item_id ASC",
+        (since, until),
+    ).fetchall()
+    return [WindowItem(*row) for row in rows]
+
+
+def window_stats(
+    conn: sqlite3.Connection, *, since: int, until: int
+) -> tuple[int, int]:
+    """窗口内的 (消息数, 群数)。日报开头那句「N 个群 M 条消息」用它。
+
+    按 ts 区间取，1970-01-01 那批脏数据天然落在窗口外——不需要额外过滤，
+    也就不会误把它们算进消息数。
+    """
+    return conn.execute(
+        "SELECT COUNT(*), COUNT(DISTINCT group_id) FROM messages"
+        " WHERE ts >= ? AND ts < ?",
+        (since, until),
+    ).fetchone()
+
+
+def save_digest(
+    conn: sqlite3.Connection,
+    *,
+    window_from: int,
+    window_to: int,
+    body_md: str,
+    model: str,
+    prompt_ver: str,
+    item_ids: list[int],
+    now: int | None = None,
+) -> int:
+    """写一篇日报，返回 digest_id。同一个窗口**替换**而不是追加。
+
+    先删旧的 digest_items 再删 digests：不删关联行的话，重跑一次就会在
+    digest_items 里留下指向前一版日报的孤儿行。
+    """
+    stamp = int(time.time()) if now is None else now
+    conn.execute(
+        "DELETE FROM digest_items WHERE digest_id IN"
+        " (SELECT digest_id FROM digests WHERE window_from=? AND window_to=?)",
+        (window_from, window_to),
+    )
+    conn.execute(
+        "DELETE FROM digests WHERE window_from=? AND window_to=?",
+        (window_from, window_to),
+    )
+    cur = conn.execute(
+        "INSERT INTO digests (window_from, window_to, body_md, model,"
+        " prompt_ver, created_at) VALUES (?,?,?,?,?,?)",
+        (window_from, window_to, body_md, model, prompt_ver, stamp),
+    )
+    digest_id = int(cur.lastrowid or 0)
+    conn.executemany(
+        "INSERT OR IGNORE INTO digest_items (digest_id, item_id) VALUES (?,?)",
+        [(digest_id, iid) for iid in item_ids],
+    )
+    conn.commit()
+    return digest_id
+
+
+def find_digest(
+    conn: sqlite3.Connection, *, window_from: int, window_to: int
+) -> tuple[int, str] | None:
+    """按窗口找已存的日报，返回 ``(digest_id, body_md)``。没有就是 None。"""
+    row = conn.execute(
+        "SELECT digest_id, body_md FROM digests WHERE window_from=? AND window_to=?",
+        (window_from, window_to),
+    ).fetchone()
+    return (row[0], row[1]) if row else None
