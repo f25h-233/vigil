@@ -32,8 +32,32 @@ from .llm import DEFAULT_MODEL, LLMConfig, LLMError, chat_json, sanitize_for_llm
 from .redact import Redactor
 
 # 日报有自己的提示词版本，与 refine.PROMPT_VERSION 各记各的。
-# 改了 build_system_prompt 就要升这里，否则 digests 表里新老产出分不清。
+#
+# ⚠️ 升版范围是「**发往模型的任何文本**」，不只是 build_system_prompt：
+# 模型看到的输入 = `build_system_prompt()`（system）**加上**
+# `build_user_prompt()` 包裹的 `build_items_payload()`（user）。
+# 这三处任何一处的**字段集或措辞**变了，产出就与前版不可比，而
+# `digests.prompt_ver` 正是 M3 判断「哪些日报该重跑」的依据——漏升一次，
+# 两版产出会被当成一版。**改 payload 字段的人也在范围内。**
 PROMPT_VERSION = "v1"
+
+# 系统提示词指纹：`(版本号, sha256(build_system_prompt())[:12])`。
+#
+# 改成指纹而不是「7 条规则各一个短语」式断言，是因为那种写法**开火方向反了**：
+# 它对措辞微调过敏（规则 5「说清」→「讲清」也红），却抓不住真正改行为的
+# 三类编辑（前言、末尾的 JSON 形状行、增删规则）。而且它制造反向激励——
+# 改措辞必红 → 人养成「顺手改测试里的字符串」的肌肉记忆 → 同一个动作
+# 正好绕开 PROMPT_VERSION。
+#
+# 指纹把两件事绑在一次编辑里：**测试变红时，提示词与版本号两件都要动**。
+# ⚠️ 元组里的版本号与 PROMPT_VERSION 是**刻意重复**的，不是笔误：
+# 若写成 `(PROMPT_VERSION, sha)`，改版本号时两边一起变、断言恒真，
+# 这个守卫就废了（这正是它替换掉的那条断言的老毛病）。
+#
+# 已知覆盖边界（别把这条当万能）：它只覆盖 `build_system_prompt` 的正文。
+# `build_user_prompt` / `build_items_payload` 的改动**没有自动守卫**，
+# 只有上面那段注释提醒——改那里时靠人记住升版本。
+_PROMPT_FINGERPRINT = ("v1", "a8179068830a")
 
 # 低于这个置信度的行不混进正文，单列到末尾的「🤔 拿不准的」区块。
 # 实测全库只有 1 条落在这个区间（M1 误抽的「咨询：四六级报名时间」，0.10），
@@ -89,8 +113,15 @@ def build_items_payload(
 
     * **只发群名，不发群号**（spec §4.5）。规划期间的探针第一版就是把
       ``group_id`` 明文发了出去——全库 15 个群号本来就不该出网。
-    * **过 Redactor**：item 是模型从已脱敏文本里抽的，但它会「补出原文
-      没有的实体」，所以出网前再抹一遍号码。
+    * **出网的每个文本字段都过同一套 ``clean()``，不留例外**——``title`` /
+      ``detail`` / ``place`` / ``amount`` / **``group``** 一视同仁。两层理由：
+      ① item 是模型从已脱敏文本里抽的，但它会「补出原文没有的实体」，
+      所以出网前再抹一遍号码；② 群名来自人工维护的 ``config/groups.toml``，
+      出号码的概率极低，但**例外需要人记住，而「记住」正是最容易失效的
+      东西**（``group`` 原先只过 ``sanitize_for_llm``，就是这种例外）。
+      而 ``Redactor.IDENTITY_NUM`` 的 ``群`` 分支天生就认识
+      ``XX交流群421632774`` 这种写法。群名只作**合并信号**用、不直接展示，
+      抹了也无害。
     * **过 sanitize_for_llm**：全角引号会让模型退化成无限空格循环。
     """
 
@@ -114,7 +145,7 @@ def build_items_payload(
                     if item.deadline_ts
                     else None
                 ),
-                "group": sanitize_for_llm(names.get(item.group_id, "")),
+                "group": clean(names.get(item.group_id)) or "",
             }
         )
     return payload
@@ -130,9 +161,19 @@ def build_user_prompt(payload: list[dict], *, day: str) -> str:
     return f"今天的日期是 {day}。\n\n以下是 {day} 这一天提炼出的条目：\n{body}"
 
 
-# 归一化时剥掉的字符：空白与常见中英文标点。与 refine.py 同款取值。
+# 归一化时剥掉的字符：空白与常见中英文标点。
 # 目的是容忍「（640）」vs「(640)」这类**格式**差异，不是容忍改写。
-_PUNCT = re.compile(r"[\s，。！？、：；「」『』【】（）()\[\]…~～\-—]+")
+#
+# ⚠️ 取值比 refine.py 的 `_PUNCT` **多一组引号**（`“”` 与 `"`），这是刻意的：
+# 本模块的匹配是拿「**出网后的**引号」去对「**库内原文的**引号」。
+# `build_items_payload` 出网前用 `sanitize_for_llm` 把 `“”` 换成 `「」`，
+# 而这里的 blob 是 `items` 表里的原文（仍是 `“”`）；模型照规则 3 逐字回抄
+# 它**看到的** `「」`。只剥 `「」` 不剥 `“”` 的话两侧对不齐——引号夹在
+# 中间时（如 title「“风之海310”卖笔记」）整行匹配不上、被丢弃，退化成
+# 机械补行，而 CLI 退出码仍是 0（静默）。反过来（库里是 `「」`、模型回抄成
+# `“”`）同样靠这一条兜住。refine 不需要这组：它的引号两侧都是库内原文，
+# 没有「出网时换过一次字符」这层。
+_PUNCT = re.compile(r'[\s，。！？、：；「」『』【】（）()\[\]…~～\-—“”"]+')
 
 
 def _norm(text: str) -> str:

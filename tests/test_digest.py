@@ -63,6 +63,28 @@ def test_payload_redacts_phone_numbers():
     assert "13812345678" not in payload[0]["detail"]
 
 
+def test_payload_redacts_numbers_inside_group_name():
+    """⚠️ 群名同样是**出网文本**，也要过 ``Redactor``——口径统一，不留例外。
+
+    ``group`` 原先只过 ``sanitize_for_llm``，是「出网字段」里**唯一**的例外，
+    而它的 docstring 自称「每个文本字段都过 Redactor」。
+
+    触发路径很短：``config/groups.toml`` 是人工维护的，写一个
+    ``XX交流群421632774`` 就明文出网——而 ``Redactor.IDENTITY_NUM`` 的
+    ``群`` 分支恰好就是为这种写法设计的。群名只作**合并信号**用（不直接
+    展示），抹了号码也无害；「例外需要人记住」才是真正的风险。
+
+    变异反证：把 ``group`` 换回 ``sanitize_for_llm(names.get(...))`` → 本条红。
+    """
+    payload = digest.build_items_payload(
+        [_item(group_id=421632774)], {421632774: "XX交流群421632774"}, Redactor()
+    )
+
+    assert "421632774" not in payload[0]["group"]
+    # 抹号码不等于把合并信号整段抹掉——群名本身必须还在
+    assert "XX交流群" in payload[0]["group"]
+
+
 def test_payload_formats_time_and_deadline():
     import datetime as dt
 
@@ -159,30 +181,64 @@ def test_payload_unknown_group_id_does_not_leak_the_id():
     assert "643375490" not in json.dumps(payload, ensure_ascii=False)
 
 
-@pytest.mark.parametrize(
-    "rule_phrase",
-    [
-        "每一条 item 都必须出现在日报里",  # 规则 1：不许省略
-        "合并成一行",                    # 规则 2：合并同类项，漏了日报退化成流水账
-        "逐字摘录",                      # 规则 3：quote 回连契约
-        "12 个字",                       # 规则 4：label 要短
-        "一句话说清细节",                 # 规则 5：text 的职责
-        "不要把它写进 label 或 text",     # 规则 6：群名不进输出（实测逼出来的）
-        "不要编造",                      # 规则 7：不许补原文没有的实体
-    ],
-)
-def test_system_prompt_carries_each_rule(rule_phrase):
-    """7 条规则各有一个**只在该规则里出现**的特征短语。
+def test_system_prompt_fingerprint_matches_version():
+    """改了系统提示词就必须同时更新指纹 + 升 ``PROMPT_VERSION``。
 
-    变异反证：原先只断言 ``"quotes"`` / ``"label"``，而这两个词在末尾的
-    JSON 形状说明行里**也出现**——把规则 2（合并）、规则 4（label 短）、
-    规则 6（不许写群名）整段删掉，原先全绿。而 docstring 明说规则 2 与 6
-    是「实测逼出来的」：删了规则 6 模型会把群名当主语写进 text，与程序在
-    行尾追加的群名重复。
+    这条**替换**了原先的 ``test_system_prompt_carries_each_rule``（7 条规则
+    各一个特征短语，逐条 ``in`` 断言）。换掉的理由是**开火方向反了**，
+    实测（隔离副本 + 阳性对照）：
+
+    * 「加一条规则 8」「改前言」这类**真改行为**的编辑 → 216 全绿，抓不住；
+    * 规则 5「说清」→「讲清」（**语义不变**）→ 1 failed。
+
+    也就是说它只对最无害的改动类别开火，而最可能改变行为的三类（前言 /
+    末尾的 JSON 形状行 / 增删规则）全无守卫；更糟的是它训练人「红灯了就
+    改测试里的字符串」，同一个动作正好绕开 ``PROMPT_VERSION``。
+
+    指纹替过来之后：任何提示词正文改动（含前言、形状行）都会红，红的时候
+    逼人做一次「升不升版本」的显式决定——这正是 Constraint 11 想要的摩擦。
+    代价是措辞微调也会红，而那正是刻意的（见 ``_PROMPT_FINGERPRINT`` 的注释）。
+
+    ⚠️ 断言的两边**必须一个来自运行时代码、一个来自字面量**：
+    ``_PROMPT_FINGERPRINT`` 里的版本号是**重复写的字面量**，不是
+    ``PROMPT_VERSION`` 的引用。写成 ``(PROMPT_VERSION, sha)`` 的话，
+    改版本号时两边一起变、断言恒真——那正是原先
+    ``assert cfg.max_tokens == digest.MAX_TOKENS`` 那种「自指」的老毛病。
     """
-    prompt = digest.build_system_prompt()
+    import hashlib
 
-    assert rule_phrase in prompt
+    sha = hashlib.sha256(digest.build_system_prompt().encode("utf-8")).hexdigest()[:12]
+
+    assert (digest.PROMPT_VERSION, sha) == digest._PROMPT_FINGERPRINT, (
+        "提示词指纹对不上：改了 build_system_prompt 就必须**同时**更新 "
+        "_PROMPT_FINGERPRINT 里的 sha 与 PROMPT_VERSION——两件事绑在一次编辑里，"
+        "别漏掉任一件（digests.prompt_ver 是 M3 判断「哪些日报该重跑」的依据）"
+    )
+
+
+# ── 常量量级守卫（审查轮次 2：F6）───────────────────────────
+#
+# 上面那条指纹守住了 PROMPT_VERSION 与提示词的绑定，但常量里还有一个
+# **没有取值守卫**的：MAX_TOKENS。原先唯一提到它的断言是
+# `test_digest_sends_max_tokens_and_thinking_off` 里的
+# `configs[0].max_tokens == digest.MAX_TOKENS`——两边同一个全局，**自指**：
+# 审查实测把 `MAX_TOKENS` 改成 `1000000`，216 全绿（SURVIVED）。
+# 那条测试守的是「接线」（常量有没有被传下去），守不了「取值」。下面这条补取值。
+
+
+def test_max_tokens_stays_in_a_sane_range():
+    """``MAX_TOKENS`` 的量级要钉住——它的用途是**模型退化时及时掐断**。
+
+    背景（见 ``vigil/llm.py`` 与 ``digest.MAX_TOKENS`` 的注释）：模型遇到
+    全角引号会退化成无限空格循环，此时唯一能拦住它的是超时
+    ——180s × 3 次重试 ≈ 9 分钟空转；带上 max_tokens 后同样的失控请求
+    23s 就停。把上限抬到一百万，等于把这个阀拆了。
+
+    边界：实测正常一天的日报约 550 输出 token（10 条 item 的日子实测
+    534），所以下限 500 保证正常日子不会被误截断；上限 8000 保证退化时
+    能远早于超时掐断。**不是「越精确越好」**——它守的是量级，不是数字。
+    """
+    assert 500 <= digest.MAX_TOKENS <= 8000
 
 
 def test_user_prompt_embeds_every_item():
@@ -231,6 +287,40 @@ def test_match_lines_tolerates_inserted_spaces():
 
     lines, unmatched = digest.match_lines(
         [{"quotes": ["风之海 310"], "label": "卖笔记", "text": ""}], items
+    )
+
+    assert unmatched == []
+    assert lines[0].item_ids == (1,)
+
+
+@pytest.mark.parametrize(
+    "db_title, quoted",
+    [
+        # 库内原文是弯引号，模型照规则 3 回抄它**看到的**「」（sanitize 换过）
+        ("“风之海310”卖笔记", "「风之海310」卖笔记"),
+        # 反向：库内原文本就是「」（中文语料里会出现），模型回抄成弯引号
+        ("「风之海310」卖笔记", "“风之海310”卖笔记"),
+    ],
+)
+def test_match_lines_tolerates_quote_style_swapped_by_sanitize(db_title, quoted):
+    """⚠️ 引号**不能夹在中间**——夹了就整行匹配不上，静默退化成机械补行。
+
+    出网前 ``sanitize_for_llm`` 把 ``“”`` 换成 ``「」``（防模型退化成无限空格
+    循环），而匹配用的 blob 是**库内原文**。若 ``_norm`` 只剥 ``「」`` 不剥
+    ``“”``，两侧的引号字符就对不齐：模型逐字回抄它看到的 ``「风之海310」卖笔记``，
+    归一化后是 ``风之海310卖笔记``，而库内原文归一化后仍是
+    ``“风之海310”卖笔记``——**引号把中间那段切断了**，子串匹配失败。
+
+    后果不是「少一条」，是**整行被丢 → 退化成机械补行**，而 CLI 退出码仍是 0
+    （同 F-A/F-E 的静默形状）。原先的 ``_PUNCT`` 里没有引号，这个 case 就是红的。
+
+    变异反证：把 ``“”`` 从 ``_PUNCT`` 里去掉 → **两条都红**（实测 2 failed）——
+    上面那两个方向都要靠它兜住。
+    """
+    items = [_item(1, title=db_title, detail=None)]
+
+    lines, unmatched = digest.match_lines(
+        [{"quotes": [quoted], "label": "卖笔记", "text": ""}], items
     )
 
     assert unmatched == []
@@ -692,6 +782,9 @@ def test_digest_sends_max_tokens_and_thinking_off(seeded, monkeypatch, tmp_path)
     digest.digest(_Config({100: "班级群"}), api_key="k", conn=conn, since=since,
                   until=until, day_label="2026-09-13", output_dir=tmp_path)
 
+    # ⚠️ 这条守的是**接线**（常量有没有被传下去：把 `max_tokens=MAX_TOKENS`
+    # 删掉它就会变 None → 红），守不了**取值**——两边引用的是同一个全局，
+    # 一起改就全绿。取值由 `test_max_tokens_stays_in_a_sane_range` 守。
     assert fake.configs[0].max_tokens == digest.MAX_TOKENS
     assert fake.configs[0].enable_thinking is False
 
