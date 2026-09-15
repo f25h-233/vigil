@@ -283,6 +283,73 @@ def cmd_refine(args) -> int:
     return 0
 
 
+def cmd_digest(args) -> int:
+    """日报：把 items 写成一天一页 Markdown。"""
+    from . import digest as digest_mod
+    from .config import load_llm_key
+
+    config = _load_config_only()
+    db = _require_export_db(config)
+
+    api_key = load_llm_key()
+    if not api_key and not args.dry_run:
+        sys.exit(
+            "[配置错误] 没有 LLM 密钥。\n"
+            "  请在仓库根目录的 .env 里写入：SILICONFLOW_API_KEY=sk-...\n"
+            "  （--dry-run 不需要密钥）"
+        )
+
+    day = args.date or digest_mod.yesterday()
+    try:
+        since, until = digest_mod.day_window(day)
+    except ValueError as exc:
+        sys.exit(f"[参数错误] {exc}")
+
+    stats = digest_mod.digest(
+        config,
+        api_key=api_key,
+        db_path=db,
+        since=since,
+        until=until,
+        day_label=day,
+        # --model 不给时是 None，而 None 会绕过 digest() 的默认值，所以这里兜底
+        model=args.model or digest_mod.DEFAULT_MODEL,
+        enable_thinking=args.think,
+        write_file=not args.no_write,
+        dry_run=args.dry_run,
+    )
+
+    print("-" * 60)
+    if stats.errors:
+        # 非零退出码是 M4 自动化的报警信号——别吞掉
+        for err in stats.errors:
+            print(f"[失败] {err}")
+        return 1
+
+    print(
+        f"完成：{stats.day} 窗口内 {stats.groups} 个群 {stats.messages:,} 条消息"
+        f" → {stats.items} 条 item → 日报 {stats.lines} 行"
+    )
+    if stats.mechanical:
+        # 不为 0 就说明模型漏写了条目，是提示词该改的信号——必须显眼
+        print(
+            f"[注意] 其中 {stats.mechanical} 行是程序补的（模型没写到），"
+            f"读起来会生硬——这通常意味着提示词该调了"
+        )
+    if stats.unmatched_quotes:
+        print(f"[注意] 有 {stats.unmatched_quotes} 处摘录没匹配上条目，已丢弃")
+    if args.dry_run:
+        print("（--dry-run：未调用模型、未写库、未落文件）")
+        return 0
+
+    print(f"token 用量：输入 {stats.input_tokens:,} / 输出 {stats.output_tokens:,}")
+    if stats.output_path:
+        print(f"日报文件：{stats.output_path}")
+    else:
+        print("（--no-write：只入库，未落文件）")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="vigil", description="VIGIL 守夜人")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -338,6 +405,20 @@ def main(argv: list[str] | None = None) -> int:
     )
     p_refine.add_argument("--dry-run", action="store_true", help="只报告不调用模型")
     p_refine.set_defaults(func=cmd_refine)
+
+    p_digest = sub.add_parser("digest", help="日报：把 items 合成一天一页 Markdown")
+    p_digest.add_argument("--date", help="日报日期 YYYY-MM-DD（默认昨天）")
+    p_digest.add_argument("--model", default=None, help="覆盖默认模型")
+    p_digest.add_argument(
+        "--think",
+        action="store_true",
+        help="打开模型的思考模式（默认关闭，与 refine 一致）",
+    )
+    p_digest.add_argument(
+        "--no-write", action="store_true", help="只入库，不写 docs/digests/ 文件"
+    )
+    p_digest.add_argument("--dry-run", action="store_true", help="只报告不调用模型")
+    p_digest.set_defaults(func=cmd_digest)
 
     args = parser.parse_args(argv)
     return args.func(args)

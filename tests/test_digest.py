@@ -524,3 +524,257 @@ def test_yesterday_defaults_to_the_day_before_today():
     import datetime as dt
 
     assert digest.yesterday(dt.date(2026, 9, 15)) == "2026-09-14"
+
+
+# ── 编排 ────────────────────────────────────────────────────
+
+
+class _FakeLLM:
+    """假 LLM：记录调用次数，返回预设载荷。绝不联网。"""
+
+    def __init__(self, lines):
+        self.lines = lines
+        self.calls = 0
+        self.configs = []
+
+    def __call__(self, cfg, *, system, user, sleep=None):
+        from vigil.llm import LLMResult
+
+        self.calls += 1
+        self.configs.append(cfg)
+        return LLMResult(payload={"lines": self.lines}, input_tokens=100,
+                         output_tokens=50)
+
+
+@pytest.fixture
+def seeded(memdb):
+    """两条 item + 一条窗口外 + 完整 messages。"""
+    from vigil import store
+
+    memdb.executescript(
+        """
+        CREATE TABLE messages (
+            msg_id INTEGER PRIMARY KEY, group_id INTEGER NOT NULL,
+            ts INTEGER NOT NULL, sender_uid TEXT, content TEXT NOT NULL
+        );
+        """
+    )
+    since, until = digest.day_window("2026-09-13")
+    memdb.executemany(
+        "INSERT INTO messages VALUES (?,?,?,?,?)",
+        [
+            (1, 100, since + 60, "u_a", "通知：明天交体检表"),
+            (2, 100, since + 120, "u_b", "收到"),
+            (3, 200, since + 180, "u_c", "有讲座"),
+        ],
+    )
+    store.ensure_schema(memdb)
+    memdb.executemany(
+        "INSERT INTO items (item_id, kind, title, detail, event_ts, deadline_ts,"
+        " group_id, actor_uid, place, links, amount, confidence, model,"
+        " prompt_ver, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        [
+            (1, "notice", "体检表", "10月8日前交", since + 60, None, 100, None,
+             None, "[]", None, 0.9, "m", "v2", 1),
+            (2, "activity", "讲座", None, since + 180, None, 200, None,
+             None, "[]", None, 0.9, "m", "v2", 1),
+        ],
+    )
+    memdb.commit()
+    return memdb, since, until
+
+
+class _Config:
+    """最小 Config 替身——只用到 groups。"""
+
+    def __init__(self, groups):
+        from vigil.config import Group
+
+        self.groups = tuple(Group(id=g, name=n) for g, n in groups.items())
+
+
+def test_digest_writes_body_and_links_every_item(seeded, monkeypatch, tmp_path):
+    from vigil import store
+
+    conn, since, until = seeded
+    fake = _FakeLLM([
+        {"quotes": ["体检表"], "label": "体检", "text": "10月8日前交"},
+        {"quotes": ["讲座"], "label": "讲座", "text": "周五晚"},
+    ])
+    monkeypatch.setattr("vigil.digest.chat_json", fake)
+
+    stats = digest.digest(
+        _Config({100: "班级群", 200: "新生群"}), api_key="k", conn=conn,
+        since=since, until=until, day_label="2026-09-13", output_dir=tmp_path,
+    )
+
+    assert fake.calls == 1
+    assert stats.items == 2
+    assert stats.mechanical == 0
+    assert stats.errors == []
+    body = (tmp_path / "2026-09-13.md").read_text(encoding="utf-8")
+    assert "- **体检** 10月8日前交 · 班级群" in body
+    # 窗口内**每条** item 都必须挂上——这是「日报里的每一条都能在 Web 找到」的前提
+    linked = conn.execute(
+        "SELECT item_id FROM digest_items WHERE digest_id=? ORDER BY item_id",
+        (stats.digest_id,),
+    ).fetchall()
+    assert [r[0] for r in linked] == [1, 2]
+
+
+def test_digest_sends_max_tokens_and_thinking_off(seeded, monkeypatch, tmp_path):
+    conn, since, until = seeded
+    fake = _FakeLLM([{"quotes": ["体检表"], "label": "a", "text": ""}])
+    monkeypatch.setattr("vigil.digest.chat_json", fake)
+
+    digest.digest(_Config({100: "班级群"}), api_key="k", conn=conn, since=since,
+                  until=until, day_label="2026-09-13", output_dir=tmp_path)
+
+    assert fake.configs[0].max_tokens == digest.MAX_TOKENS
+    assert fake.configs[0].enable_thinking is False
+
+
+def test_digest_never_sends_group_ids(seeded, monkeypatch, tmp_path):
+    """⚠️ 守着「群号不出网」这条硬约束——探针第一版就是在这里翻车的。"""
+    conn, since, until = seeded
+    seen = {}
+
+    def spy(cfg, *, system, user, sleep=None):
+        from vigil.llm import LLMResult
+
+        seen["user"] = user
+        seen["system"] = system
+        return LLMResult(payload={"lines": []}, input_tokens=1, output_tokens=1)
+
+    monkeypatch.setattr("vigil.digest.chat_json", spy)
+
+    digest.digest(_Config({100: "班级群", 200: "新生群"}), api_key="k", conn=conn,
+                  since=since, until=until, day_label="2026-09-13", output_dir=tmp_path)
+
+    assert "班级群" in seen["user"]
+    assert "100" not in seen["user"].replace("2026-09-13", "").replace("10月8日", "")
+
+
+def test_digest_uncovered_item_gets_mechanical_row(seeded, monkeypatch, tmp_path):
+    conn, since, until = seeded
+    fake = _FakeLLM([{"quotes": ["体检表"], "label": "体检", "text": ""}])
+    monkeypatch.setattr("vigil.digest.chat_json", fake)
+
+    stats = digest.digest(_Config({100: "班级群", 200: "新生群"}), api_key="k",
+                          conn=conn, since=since, until=until,
+                          day_label="2026-09-13", output_dir=tmp_path)
+
+    assert stats.mechanical == 1
+    body = (tmp_path / "2026-09-13.md").read_text(encoding="utf-8")
+    assert "- **讲座**" in body
+
+
+def test_digest_empty_window_does_not_call_model(seeded, monkeypatch, tmp_path):
+    """空窗日：不花 token、不留空白文件，但**明确说没有信息**（spec §4.6）。"""
+    conn, since, until = seeded
+    conn.execute("DELETE FROM items")
+    conn.commit()
+    fake = _FakeLLM([])
+    monkeypatch.setattr("vigil.digest.chat_json", fake)
+
+    stats = digest.digest(_Config({100: "班级群"}), api_key="k", conn=conn,
+                          since=since, until=until, day_label="2026-09-13",
+                          output_dir=tmp_path)
+
+    assert fake.calls == 0
+    assert stats.items == 0
+    body = (tmp_path / "2026-09-13.md").read_text(encoding="utf-8")
+    assert "没有值得一提的信息" in body
+
+
+def test_digest_llm_failure_writes_nothing_and_reports(seeded, monkeypatch, tmp_path):
+    """失败不许降级成「机械拼盘」——那种文件看起来和正常日报一样。"""
+    from vigil.llm import LLMError
+
+    conn, since, until = seeded
+
+    def boom(cfg, *, system, user, sleep=None):
+        raise LLMError("HTTP 503")
+
+    monkeypatch.setattr("vigil.digest.chat_json", boom)
+
+    stats = digest.digest(_Config({100: "班级群"}), api_key="k", conn=conn,
+                          since=since, until=until, day_label="2026-09-13",
+                          output_dir=tmp_path)
+
+    assert stats.errors and "503" in stats.errors[0]
+    assert stats.digest_id is None
+    assert not (tmp_path / "2026-09-13.md").exists()
+    assert conn.execute("SELECT COUNT(*) FROM digests").fetchone()[0] == 0
+
+
+def test_digest_rerun_replaces_instead_of_stacking(seeded, monkeypatch, tmp_path):
+    conn, since, until = seeded
+    fake = _FakeLLM([{"quotes": ["体检表", "讲座"], "label": "全部", "text": ""}])
+    monkeypatch.setattr("vigil.digest.chat_json", fake)
+    cfg = _Config({100: "班级群", 200: "新生群"})
+
+    digest.digest(cfg, api_key="k", conn=conn, since=since, until=until,
+                  day_label="2026-09-13", output_dir=tmp_path)
+    digest.digest(cfg, api_key="k", conn=conn, since=since, until=until,
+                  day_label="2026-09-13", output_dir=tmp_path)
+
+    assert conn.execute("SELECT COUNT(*) FROM digests").fetchone()[0] == 1
+    assert fake.calls == 2
+
+
+def test_digest_dry_run_does_not_call_model_or_write(seeded, monkeypatch, tmp_path):
+    conn, since, until = seeded
+    fake = _FakeLLM([])
+    monkeypatch.setattr("vigil.digest.chat_json", fake)
+
+    stats = digest.digest(_Config({100: "班级群"}), api_key="k", conn=conn,
+                          since=since, until=until, day_label="2026-09-13",
+                          output_dir=tmp_path, dry_run=True)
+
+    assert fake.calls == 0
+    assert stats.items == 2
+    assert not (tmp_path / "2026-09-13.md").exists()
+
+
+def test_digest_dry_run_on_empty_window_still_writes_nothing(seeded, monkeypatch, tmp_path):
+    """⚠️ 空窗 + dry-run 的组合——端到端实测抓到过：当时空窗分支排在 dry_run
+    检查前面且无条件落库，于是 `--dry-run` 照样写了库、落了文件。
+    单测原本用的样本有 item，走的是另一条分支，所以没守住这个组合。"""
+    conn, since, until = seeded
+    conn.execute("DELETE FROM items")
+    conn.commit()
+    fake = _FakeLLM([])
+    monkeypatch.setattr("vigil.digest.chat_json", fake)
+
+    stats = digest.digest(_Config({100: "班级群"}), api_key="k", conn=conn,
+                          since=since, until=until, day_label="2026-09-13",
+                          output_dir=tmp_path, dry_run=True)
+
+    assert fake.calls == 0
+    assert stats.digest_id is None
+    assert not (tmp_path / "2026-09-13.md").exists()
+    assert conn.execute("SELECT COUNT(*) FROM digests").fetchone()[0] == 0
+
+
+def test_digest_no_write_skips_file_but_still_saves(seeded, monkeypatch, tmp_path):
+    conn, since, until = seeded
+    fake = _FakeLLM([{"quotes": ["体检表", "讲座"], "label": "全部", "text": ""}])
+    monkeypatch.setattr("vigil.digest.chat_json", fake)
+
+    stats = digest.digest(_Config({100: "班级群", 200: "新生群"}), api_key="k",
+                          conn=conn, since=since, until=until,
+                          day_label="2026-09-13", output_dir=tmp_path,
+                          write_file=False)
+
+    assert stats.digest_id is not None
+    assert stats.output_path == ""
+    assert not (tmp_path / "2026-09-13.md").exists()
+
+
+def test_digest_rejects_reversed_window(seeded):
+    conn, _, _ = seeded
+
+    with pytest.raises(ValueError):
+        digest.digest(_Config({100: "班级群"}), api_key="k", conn=conn,
+                      since=5000, until=1000, day_label="2026-09-13")
