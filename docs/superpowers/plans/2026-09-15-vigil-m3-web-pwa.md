@@ -3154,6 +3154,13 @@ function Chip({
 
 ### A.16 `web/src/views/Categories.tsx`（T6）
 
+> ⚠️⚠️ **本段已作废。以仓库里的 `web/src/views/Categories.tsx` 为准。**
+>
+> T6 的审查在 A.16/A.17 里查出**与 A.15 同源**的状态机缺陷（我在给 A.15 加作废批注时**漏了这两段**，于是 T6 的「逐字照抄」把同一族缺陷原样装进了两个新视图）。已由统一修复轮处理：
+> ① **失败后无可见重试**（只能靠切 tab 逃生）；② `Digests.tsx` 的**打开失败会连列表一起吞掉**（`err` 永久无法清除）；③ Markdown 的 `h1` 未映射 → 日报标题读两遍 + 双 H1（**100% 的日报命中**）；④ Markdown 的 `ul` 未恢复 `list-style` → **列表符号全部消失**（Tailwind v4 preflight 把它们重置了）。
+>
+> **保留原文只为让「附录源码会连同缺陷被忠实复制」这件事有据可查——这是本里程碑出现三次的模式。**
+
 ````tsx
 import { useEffect, useState } from 'react'
 import { fetchCategories } from '../api.ts'
@@ -3210,6 +3217,11 @@ export default function Categories({
 ````
 
 ### A.17 `web/src/views/Digests.tsx`（T6）
+
+> ⚠️⚠️ **本段已作废。以仓库里的 `web/src/views/Digests.tsx` 为准。**
+> 作废理由见 A.16 的批注（同一次修复轮）。
+>
+> ⚠️ **修 `open()` 失败路径时有一条地雷**（审查者 M-2 点名）：`setList([])` 的 catch 把「**不知道**」记成了「**读到 0 篇**」。今天它被 `err !== null && cur === null` 挡住，说不出假话；但**修「失败后无重试」时必须真的重发请求，不能只清 `err`**——只清 err 会立刻渲染出「还没有日报。生成：`vigil digest`」，正是本项目最忌的那类无依据陈述。（已修版本用 `list: DigestSummary[] | null` 的 null 区分未知。）
 
 ````tsx
 import { useEffect, useState } from 'react'
