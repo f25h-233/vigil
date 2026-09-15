@@ -266,10 +266,19 @@ def record_run(
 def window_items(
     conn: sqlite3.Connection, *, since: int, until: int
 ) -> list[WindowItem]:
-    """取时间窗内的条目，按事件时间升序。
+    """取时间窗内的条目，按 ``(event_ts, item_id)`` 升序。窗口是 ``[since, until)``。
 
-    ⚠️ 顺序不能改：``build_rows`` 拿「第一个匹配到的 item」当锚点
-    （决定这一行属于哪个类目、署哪个群），隐式依赖这个顺序。
+    排序必须**确定**：未命中条目的机械补行按本函数返回序追加，出网 payload
+    也按它排列——顺序变了，用户看到的行序就会变。
+
+    ⚠️ 但**分区与署名群不依赖这个顺序**：``build_rows`` 的锚点是 ``picked[0]``，
+    而 ``picked`` 的顺序由 ``line.item_ids`` 决定，``line.item_ids`` 来自
+    ``digest.match_lines``——后者自己做了
+    ``hits.sort(key=lambda it: (it.event_ts, it.item_id))``。锚点顺序由那个
+    排序独立保证，与本函数的 ORDER BY 无关。
+
+    （旧注释曾称锚点「隐式依赖」本函数顺序，那是**错的因果**：结论「顺序不能改」
+    成立，但理由不是锚点，而是机械补行序与出网 payload 序。已修正。）
     """
     rows = conn.execute(
         "SELECT item_id, kind, title, detail, event_ts, deadline_ts,"
@@ -334,14 +343,3 @@ def save_digest(
     )
     conn.commit()
     return digest_id
-
-
-def find_digest(
-    conn: sqlite3.Connection, *, window_from: int, window_to: int
-) -> tuple[int, str] | None:
-    """按窗口找已存的日报，返回 ``(digest_id, body_md)``。没有就是 None。"""
-    row = conn.execute(
-        "SELECT digest_id, body_md FROM digests WHERE window_from=? AND window_to=?",
-        (window_from, window_to),
-    ).fetchone()
-    return (row[0], row[1]) if row else None

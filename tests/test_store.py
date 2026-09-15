@@ -239,9 +239,11 @@ def test_save_digest_returns_id_and_links_items(memdb):
     )
 
     assert digest_id > 0
-    assert store.find_digest(memdb, window_from=1000, window_to=5000) == (
-        digest_id, "# 日报",
-    )
+    # find_digest 已按审查裁决删除（零生产调用方，见修复轮次 1）——直接查表。
+    assert memdb.execute(
+        "SELECT digest_id, body_md FROM digests WHERE window_from=? AND window_to=?",
+        (1000, 5000),
+    ).fetchone() == (digest_id, "# 日报")
     linked = memdb.execute(
         "SELECT item_id FROM digest_items WHERE digest_id=? ORDER BY item_id",
         (digest_id,),
@@ -283,13 +285,10 @@ def test_save_digest_replaces_same_window(memdb):
         " WHERE digest_id NOT IN (SELECT digest_id FROM digests)"
     ).fetchone()[0]
     assert orphan == 0
-    assert store.find_digest(memdb, window_from=1000, window_to=5000)[1] == "# 第二版"
-
-
-def test_find_digest_absent_returns_none(memdb):
-    store.ensure_schema(memdb)
-
-    assert store.find_digest(memdb, window_from=1, window_to=2) is None
+    assert memdb.execute(
+        "SELECT body_md FROM digests WHERE window_from=? AND window_to=?",
+        (1000, 5000),
+    ).fetchone()[0] == "# 第二版"
 
 
 def test_ensure_schema_is_idempotent_for_digests(memdb):
@@ -303,3 +302,179 @@ def test_ensure_schema_is_idempotent_for_digests(memdb):
         )
     }
     assert {"digests", "digest_items"} <= names
+
+
+# ── 修复轮次 1：补守卫（F1/F2/F4/F5）─────────────────────────
+
+
+def _insert_items(conn: sqlite3.Connection, rows: list[tuple]) -> None:
+    """按 (item_id, kind, title, detail, event_ts, deadline_ts, group_id,
+    place, amount, confidence) 造条目。只给边界/映射用例用。"""
+    conn.executemany(
+        "INSERT INTO items (item_id, kind, title, detail, event_ts, deadline_ts,"
+        " group_id, actor_uid, place, links, amount, confidence, model,"
+        " prompt_ver, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        [
+            (iid, kind, title, detail, ts, dl, gid, None, place, "[]", amount,
+             conf, "m", "v1", 1)
+            for (iid, kind, title, detail, ts, dl, gid, place, amount, conf)
+            in rows
+        ],
+    )
+    conn.commit()
+
+
+def test_window_items_bounds_are_half_open(memdb):
+    """窗口是半开区间 [since, until)：下界**含**、上界**不含**。
+
+    ⚠️ 这条守的是「跨日不重复计数」。``day_window`` 是 ``[今日00:00, 明日00:00)``，
+    今天的 ``until`` 正好是明天的 ``since``——上界一旦写成闭区间，边界那条
+    条目会在昨天和今天的日报里**各出现一次**：数字对不上、条目重复，
+    而且是静默的，没有任何报错。
+    """
+    store.ensure_schema(memdb)
+    _insert_items(memdb, [
+        (11, "notice", "下界外", None, 999, None, 100, None, None, 0.9),
+        (12, "notice", "恰在下界", None, 1000, None, 100, None, None, 0.9),
+        (13, "notice", "窗口内", None, 4999, None, 100, None, None, 0.9),
+        (14, "notice", "恰在上界", None, 5000, None, 100, None, None, 0.9),
+        (15, "notice", "上界外", None, 5001, None, 100, None, None, 0.9),
+    ])
+
+    got = store.window_items(memdb, since=1000, until=5000)
+
+    # 边界两条的决定性：12 含（>= 不是 >）、14 不含（< 不是 <=）
+    assert [it.item_id for it in got] == [12, 13]
+
+
+def test_window_stats_bounds_are_half_open(memdb):
+    """``window_stats`` 的窗口同样必须半开——否则当日消息数会跨日重复计。
+
+    种子故意放在 ts=9999..20001，与 ``_seed_messages`` 的 1000/2000/3000
+    完全错开，所以不需要删任何既有行。
+    """
+    _seed_messages(memdb)
+    memdb.executemany(
+        "INSERT INTO messages VALUES (?,?,?,?,?)",
+        [
+            (901, 100, 9999, "u_a", "下界外"),
+            (902, 100, 10000, "u_a", "恰在下界"),
+            (903, 100, 19999, "u_a", "窗口内"),
+            (904, 200, 20000, "u_a", "恰在上界"),
+            (905, 200, 20001, "u_a", "上界外"),
+        ],
+    )
+    memdb.commit()
+
+    # 2 条消息、同属群 100 → (2, 1)：上界闭区间会变 (3, 2)、下界开区间会变 (1, 1)
+    assert store.window_stats(memdb, since=10000, until=20000) == (2, 1)
+
+
+def test_window_items_orders_by_event_ts_ascending(memdb):
+    """按 ``event_ts`` 升序——即使 ``item_id`` 顺序与之相同也不能退化成 id 序。
+
+    ⚠️ brief 原来的种子（id 1→ts 3000、id 2→ts 2000）里 **id 序与 ts 序恰好相反**，
+    于是 ``ORDER BY item_id DESC`` 与正确实现返回同一个 ``[2, 1]``，变异抓不住。
+    本条刻意让 **id 序与 ts 序相同**，把这条路堵上。
+    """
+    store.ensure_schema(memdb)
+    _insert_items(memdb, [
+        (21, "notice", "最早", None, 1000, None, 100, None, None, 0.9),
+        (22, "notice", "居中", None, 2000, None, 100, None, None, 0.9),
+        (23, "notice", "最晚", None, 3000, None, 100, None, None, 0.9),
+    ])
+
+    got = store.window_items(memdb, since=0, until=9999)
+
+    assert [it.item_id for it in got] == [21, 22, 23]
+
+
+def test_window_items_tie_break_is_item_id(memdb):
+    """并列 ``event_ts`` 的条目按 ``item_id`` 升序——守 ``(event_ts, item_id)`` 契约。
+
+    种子两条 ``event_ts`` 相同、``group_id`` 不同、``item_id`` 与群号顺序相反，
+    对齐真实库的形状（审查实测：53 个有 item 的本地日里约 8 天存在 ``event_ts`` 撞车）。
+
+    ⚠️ **诚实标注（实测，非推断）：只删掉 ORDER BY 里 ``item_id ASC`` 这一个子句，
+    本测试抓不住，而且没有任何种子能抓住。**
+
+    原因是 ``item_id`` 就是 rowid，而本函数的 SELECT 取全部 10 列、用不上覆盖索引
+    （实测 plan = ``SCAN items`` + ``USE TEMP B-TREE``），并列键在临时 B 树里保持
+    rowid 序，结果与显式 tie-break 完全相同。
+    反例才是陷阱：若把 SELECT 收窄成只取 ``item_id``，plan 变成
+    ``SCAN items USING COVERING INDEX items_group_ts``，并列序改由群号决定，
+    此时两者才会分道扬镳（实测 ``[9, 3]`` vs ``[3, 9]``）——但那是另一种查询形状，
+    不是 ``window_items``。
+
+    所以保留 ``item_id ASC`` 是**纵深防御**：一旦将来 SELECT 收窄到能被
+    ``items_group_ts`` 覆盖，或 SQLite 的排序稳定性假设变化，它就是决定性的一行。
+    本测试真正守住的，是「排序键是 ``event_ts`` 而不是别的」这一层。
+    """
+    store.ensure_schema(memdb)
+    _insert_items(memdb, [
+        (9, "notice", "群 100 的", None, 2000, None, 100, None, None, 0.9),
+        (3, "notice", "群 300 的", None, 2000, None, 300, None, None, 0.9),
+    ])
+
+    got = store.window_items(memdb, since=0, until=9999)
+
+    assert [it.item_id for it in got] == [3, 9]
+    # 契约形式：返回序必须已按 (event_ts, item_id) 排好
+    assert got == sorted(got, key=lambda it: (it.event_ts, it.item_id))
+
+
+def test_window_items_maps_every_field(memdb):
+    """逐字段核对 ``WindowItem(*row)`` 的 10 个位置映射。
+
+    ⚠️ 这是本模块**真正会静默错配**的那条路：``kind`` 与 ``group_id`` 是
+    ``build_rows`` 锚点（分区与署名群）的来源，``place`` / ``amount`` 直接进渲染。
+    原来只断言了 4/10 个字段（item_id/title/deadline_ts/confidence），
+    所以把 SELECT 里的 ``place, amount`` 对调、或将来 ``items`` 加列后顺序没对齐，
+    测试会全绿，而日报的分区、群名、地点、金额会静默错乱。
+
+    种子的每个字段都取**互不相同**的值，任何两列对调都会撞红。
+    """
+    store.ensure_schema(memdb)
+    _insert_items(memdb, [
+        (7, "activity", "讲座", "10月8日前交", 2000, 4000, 200, "报告厅",
+         "免费", 0.75),
+    ])
+
+    got = store.window_items(memdb, since=0, until=9999)
+
+    assert len(got) == 1
+    it = got[0]
+    assert it.item_id == 7
+    assert it.kind == "activity"
+    assert it.title == "讲座"
+    assert it.detail == "10月8日前交"
+    assert it.event_ts == 2000
+    assert it.deadline_ts == 4000
+    assert it.group_id == 200
+    assert it.place == "报告厅"
+    assert it.amount == "免费"
+    assert it.confidence == 0.75
+
+
+def test_save_digest_records_provenance_columns(memdb):
+    """``model`` / ``prompt_ver`` / ``created_at`` 必须真的按位写进去。
+
+    ⚠️ 顶到 Global Constraint 11：改了提示词要能说清哪批产出是哪一版。
+    原来 ``now=12345`` 传了却**从没断言过**，且三列无一被读回——
+    ``model`` 与 ``prompt_ver`` 对调、``created_at`` 写死成 0，全都不会报警，
+    溯源能力形同虚设。
+
+    model 与 prompt_ver 取**类型不同、值不相似**的字符串，对调必撞红。
+    """
+    _seed_items(memdb)
+
+    digest_id = store.save_digest(
+        memdb, window_from=1000, window_to=5000, body_md="# 日报",
+        model="qwen3.5-test", prompt_ver="digest-v9", item_ids=[1], now=12345,
+    )
+
+    row = memdb.execute(
+        "SELECT model, prompt_ver, created_at FROM digests WHERE digest_id=?",
+        (digest_id,),
+    ).fetchone()
+    assert row == ("qwen3.5-test", "digest-v9", 12345)
