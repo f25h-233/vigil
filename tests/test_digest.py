@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from pathlib import Path
 
 import pytest
 
@@ -755,7 +756,15 @@ class _FakeLLM:
 
 @pytest.fixture
 def seeded(memdb):
-    """两条 item + 一条窗口外 + 完整 messages。"""
+    """两条 item + 一条窗口外 + 完整 messages。
+
+    ⚠️ `sender_names` 是 Task 9 补的（形状与 `vigil/export.py` 的
+    ``_SENDER_TABLE_DDL``、`tests/test_store.py::_seed_messages` 一致）：
+    空窗日的筛除分布要**把本地预筛重跑一遍**，而它走的是
+    ``store.pending_messages``——那条 SQL 会 LEFT JOIN `sender_names`
+    （预筛的「角色昵称」保留规则要用发信人）。缺这张表时该 SQL 直接
+    ``no such table: sender_names``。造真库里本来就有的表，不是放宽断言。
+    """
     from vigil import store
 
     memdb.executescript(
@@ -763,6 +772,15 @@ def seeded(memdb):
         CREATE TABLE messages (
             msg_id INTEGER PRIMARY KEY, group_id INTEGER NOT NULL,
             ts INTEGER NOT NULL, sender_uid TEXT, content TEXT NOT NULL
+        );
+        CREATE TABLE sender_names (
+            group_id   INTEGER NOT NULL,
+            uid        TEXT    NOT NULL,
+            group_nick TEXT,
+            qq_nick    TEXT,
+            uin        INTEGER,
+            in_group   INTEGER,
+            PRIMARY KEY (group_id, uid)
         );
         """
     )
@@ -792,12 +810,24 @@ def seeded(memdb):
 
 
 class _Config:
-    """最小 Config 替身——只用到 groups。"""
+    """最小 Config 替身——只用到 groups 与 tier_of。
+
+    ``tier_of`` 是 Task 9 补的：空窗日的筛除分布要把本地预筛重跑一遍
+    （``digest.screening_breakdown``），而预筛的保留规则要按群档位判定。
+    **刻意转调真 ``Config.tier_of``**，不在这里重抄一遍遍历——替身抄一份
+    实现就会与真身漂移，而漂移方向恰好是「测试以为的口径 ≠ 运行时的口径」。
+    """
 
     def __init__(self, groups):
-        from vigil.config import Group
+        from vigil.config import Config, Group
 
         self.groups = tuple(Group(id=g, name=n) for g, n in groups.items())
+        self._real = Config(
+            qq_db_dir=Path(), output_db=Path(), groups=self.groups
+        )
+
+    def tier_of(self, gid: int) -> str:
+        return self._real.tier_of(gid)
 
 
 def test_digest_writes_body_and_links_every_item(seeded, monkeypatch, tmp_path):
@@ -893,9 +923,22 @@ def test_digest_uncovered_item_gets_mechanical_row(seeded, monkeypatch, tmp_path
 
 
 def test_digest_empty_window_does_not_call_model(seeded, monkeypatch, tmp_path):
-    """空窗日：不花 token、不留空白文件，但**明确说没有信息**（spec §4.6）。"""
+    """空窗日：不花 token、不留空白文件，但**明确说没有信息**（spec §4.6）。
+
+    ⚠️ Task 9 起「说没有信息」多了一个**前提**：窗口内消息必须**全部有
+    ``refine_runs`` 记账**。所以这里补了那三行记账——**只动了 setup，
+    断言一字未改**。
+
+    不改 setup 的话，本条的断言恰好就是 Task 9 要消灭的那句**假话**：
+    窗口里 3 条消息一条都没抽取过，日报却说「没有值得一提的信息」。
+    补记账后本条的语义反而更强：它走的正是「已抽取 + 确实没事」那条
+    分支（会连带跑到 ``screening_breakdown``），而不只是「空窗口」。
+    """
+    from vigil import store
+
     conn, since, until = seeded
     conn.execute("DELETE FROM items")
+    store.record_run(conn, [1, 2, 3], status=store.STATUS_DISCARDED, prompt_ver="v2")
     conn.commit()
     fake = _FakeLLM([])
     monkeypatch.setattr("vigil.digest.chat_json", fake)
@@ -1436,3 +1479,110 @@ def test_cli_digest_reports_dropped_deadlines(cli_env, monkeypatch, capsys):
     assert rc == 0
     assert "1 条截止日在源消息里找不到字面依据" in out
     assert "已保留 0 条" in out
+
+
+# ── 空窗日的自证与筛除分布（Task 9，用户验收后追加）────────────
+
+
+def test_render_empty_day_not_yet_refined_does_not_claim_nothing_happened():
+    """⚠️ 覆盖不全时**不许**说「没有值得一提的信息」——那是句可能为假的话。
+
+    这条是 Task 9 真正的价值：把一句可能为假的话换成一句一定为真的话。
+    """
+    out = digest.render_empty_day(
+        day="2026-08-08", groups=1, messages=1059, refined=0,
+        local_dropped=0, sent=0,
+    )
+
+    assert "没有值得一提的信息" not in out
+    assert "尚未抽取" in out
+    assert "vigil refine" in out
+    assert "0/1,059" in out
+
+
+def test_render_empty_day_shows_screening_breakdown():
+    out = digest.render_empty_day(
+        day="2026-08-08", groups=1, messages=1059, refined=1059,
+        local_dropped=812, sent=247,
+    )
+
+    assert "没有值得一提的信息" in out
+    assert "812" in out and "247" in out
+    assert "1,059" in out
+
+
+def test_render_empty_day_partial_coverage_is_treated_as_not_refined():
+    out = digest.render_empty_day(
+        day="2026-08-08", groups=1, messages=1059, refined=1058,
+        local_dropped=812, sent=246,
+    )
+
+    assert "尚未抽取" in out
+    assert "1,058/1,059" in out
+
+
+def test_screening_breakdown_splits_local_from_model(seeded):
+    """本地筛掉与送模型后无产出必须分得开（refine_runs 分不开，只能重算）。"""
+    from vigil import store
+
+    conn, since, until = seeded
+    conn.execute("DELETE FROM messages")
+    conn.executemany(
+        "INSERT INTO messages VALUES (?,?,?,?,?)",
+        [
+            (1, 100, since + 10, "u_a", "收到"),                       # 纯应答 → 本地丢
+            (2, 100, since + 20, "u_b", "dd"),                         # 过短 → 本地丢
+            (3, 100, since + 30, "u_c", "明天记得带体检表到辅导员处"),   # 送模型
+        ],
+    )
+    conn.commit()
+
+    total, local, sent = digest.screening_breakdown(
+        conn, _Config({100: "班级群"}), since=since, until=until
+    )
+
+    assert (total, local, sent) == (3, 2, 1)
+
+
+def test_digest_empty_window_reports_not_refined(seeded, monkeypatch, tmp_path):
+    """端到端：窗口没抽取过时，日报里必须是「尚未抽取」而不是「没事」。"""
+    conn, since, until = seeded
+    conn.execute("DELETE FROM items")
+    conn.commit()
+    fake = _FakeLLM([])
+    monkeypatch.setattr("vigil.digest.chat_json", fake)
+
+    digest.digest(_Config({100: "班级群"}), api_key="k", conn=conn,
+                  since=since, until=until, day_label="2026-09-13",
+                  output_dir=tmp_path)
+
+    body = (tmp_path / "2026-09-13.md").read_text(encoding="utf-8")
+    assert "尚未抽取" in body
+    assert "没有值得一提的信息" not in body
+
+
+def test_digest_empty_window_breakdown_end_to_end(seeded, monkeypatch, tmp_path):
+    """端到端：抽取过且确实没事时，报出筛除分布。"""
+    from vigil import store
+
+    conn, since, until = seeded
+    conn.execute("DELETE FROM items")
+    conn.execute("DELETE FROM messages")
+    conn.executemany(
+        "INSERT INTO messages VALUES (?,?,?,?,?)",
+        [(1, 100, since + 10, "u_a", "收到"), (2, 100, since + 20, "u_b", "dd"),
+         (3, 100, since + 30, "u_c", "随便聊聊天气不错啊今天挺热的")],
+    )
+    store.record_run(conn, [1, 2, 3], status=store.STATUS_DISCARDED, prompt_ver="v2")
+    conn.commit()
+    fake = _FakeLLM([])
+    monkeypatch.setattr("vigil.digest.chat_json", fake)
+
+    digest.digest(_Config({100: "班级群"}), api_key="k", conn=conn,
+                  since=since, until=until, day_label="2026-09-13",
+                  output_dir=tmp_path)
+
+    body = (tmp_path / "2026-09-13.md").read_text(encoding="utf-8")
+    assert "没有值得一提的信息" in body
+    assert "被本地规则筛掉" in body
+    assert "3/3" not in body          # 覆盖信息只在未抽取分支里出现

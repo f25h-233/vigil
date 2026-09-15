@@ -305,6 +305,25 @@ def window_stats(
     ).fetchone()
 
 
+def window_refine_coverage(
+    conn: sqlite3.Connection, *, since: int, until: int
+) -> tuple[int, int]:
+    """窗口内的 (消息总数, 有 refine_runs 记账的条数)。
+
+    空窗日的日报靠它自证「**是安静，不是管线没跑**」——覆盖率不足时
+    绝不能说「没有值得一提的信息」，那是句可能为假的话。
+    """
+    total = conn.execute(
+        "SELECT COUNT(*) FROM messages WHERE ts >= ? AND ts < ?", (since, until)
+    ).fetchone()[0]
+    refined = conn.execute(
+        "SELECT COUNT(*) FROM messages m WHERE m.ts >= ? AND m.ts < ?"
+        " AND m.msg_id IN (SELECT msg_id FROM refine_runs)",
+        (since, until),
+    ).fetchone()[0]
+    return total, refined
+
+
 def save_digest(
     conn: sqlite3.Connection,
     *,

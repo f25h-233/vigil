@@ -25,7 +25,7 @@ import sqlite3
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import store
+from . import prefilter, store
 from .categories import load_categories
 from .config import Config, REPO_ROOT
 from .llm import DEFAULT_MODEL, LLMConfig, LLMError, chat_json, sanitize_for_llm
@@ -663,11 +663,33 @@ def digest(
 
         # 空窗日**不调模型**：既不该花钱，也不该给模型机会编出点什么。
         # 但照样出文件——spec §4.6 要求「明确输出没有值得一提的信息，不假装有事」。
+        #
+        # ⚠️ 空窗日还必须**自证抽取状态**（Task 9）：窗口内消息全有
+        # `refine_runs` 记账时才敢说「没有值得一提的信息」；覆盖不全时那句
+        # 可能是假话（这天压根没抽取过），改说「尚未抽取」——把一句可能为假
+        # 的话换成一句一定为真的话。
         if not items:
-            body = render_markdown(
-                day=day_label, stat_line=summary, rows=[], cats=cats, names=names,
+            total, refined = store.window_refine_coverage(
+                conn, since=since, until=until
             )
-            on_progress(f"[digest] {day_label}：窗口内没有条目")
+            if refined < total:
+                body = render_empty_day(
+                    day=day_label, groups=groups, messages=messages,
+                    refined=refined, local_dropped=0, sent=0,
+                )
+                on_progress(
+                    f"[digest] {day_label}：窗口内 {refined:,}/{total:,} 条已抽取，"
+                    f"**尚未抽取完**——日报只说明这个，不下「没事」的结论"
+                )
+            else:
+                _, local, sent = screening_breakdown(
+                    conn, config, since=since, until=until
+                )
+                body = render_empty_day(
+                    day=day_label, groups=groups, messages=messages,
+                    refined=refined, local_dropped=local, sent=sent,
+                )
+                on_progress(f"[digest] {day_label}：窗口内没有条目")
             return _persist(stats, conn, body, model, prompt_ver, [], write_file,
                             out_dir, day_label)
 
@@ -714,6 +736,60 @@ def digest(
     finally:
         if owns_conn and conn is not None:
             conn.close()
+
+
+def screening_breakdown(
+    conn: sqlite3.Connection, config: Config, *, since: int, until: int
+) -> tuple[int, int, int]:
+    """窗口内的 (消息总数, 本地规则筛掉的, 送模型后判无价值的)。
+
+    ⚠️ **为什么要重算而不是查 `refine_runs`**：那张表只记
+    ``discarded`` / ``ok``，而「本地规则筛掉」与「送模型后判无价值」
+    **都记 ``discarded``**——查不出来。所以把本地预筛再跑一遍（纯本地、零 API）。
+
+    ⚠️ **已知边界**：口径前提是 `config/groups.toml` 的 ``tier`` 与
+    ``prefilter`` 的规则**与 refine 当时一致**。改了任一者，这里的拆分就会
+    与当时的实际不一致。这是这条统计的固有代价，不是 bug。
+    """
+    msgs = store.pending_messages(conn, since=since, until=until, redo=True)
+    _, screen_stats = prefilter.screen(msgs, tier_of=config.tier_of)
+    local = screen_stats.dropped
+    return len(msgs), local, len(msgs) - local
+
+
+def render_empty_day(
+    *,
+    day: str,
+    groups: int,
+    messages: int,
+    refined: int,
+    local_dropped: int,
+    sent: int,
+) -> str:
+    """空窗日的日报正文。
+
+    **两条判据，缺一不可**：
+
+    1. 窗口内消息**全部有 refine_runs 记账** → 出筛除分布 +「没有值得一提的信息」
+    2. 覆盖不全 → **不许说「没有值得一提的信息」**，改说「尚未抽取」并提示先跑 refine
+
+    第 2 条是这条需求的真正价值：把一句**可能为假**的话，换成一句**一定为真**的话。
+    在此之前，「这天确实没事」与「这天压根没抽取过」在日报里长得一模一样。
+    """
+    head = f"# 守夜人日报 · {day}\n\n当天 {groups} 个群 {messages:,} 条消息。\n"
+    if refined < messages:
+        return (
+            f"# 守夜人日报 · {day}\n\n"
+            f"当天 {groups} 个群 {messages:,} 条消息，"
+            f"**本窗口尚未抽取**（{refined:,}/{messages:,}）。\n\n"
+            f"先跑 `vigil refine` 再生成日报。\n"
+        )
+    return (
+        head
+        + f"\n其中 {local_dropped:,} 条被本地规则筛掉（纯应答 / 过短 / 刷屏广告），"
+        + f"\n{sent:,} 条送模型后判为无价值。\n"
+        + "\n没有值得一提的信息。\n"
+    )
 
 
 def _persist(
