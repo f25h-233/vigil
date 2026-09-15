@@ -1508,15 +1508,18 @@ def test_render_empty_day_shows_screening_breakdown():
     """
     out = digest.render_empty_day(
         day="2026-08-08", groups=1, messages=1059, refined=1059,
-        local_dropped=1014, sent=45, hard_dropped=81,
+        local_dropped=1014, sent=45,
     )
 
     assert "没有值得一提的信息" in out
     assert "1,014" in out and "45" in out
     assert "1,059" in out
-    # ⚠️ 硬丢弃是「本地筛掉」的**子集**，所以只能写「含」——写成并列项就是另一件事
-    assert "含 81 条硬丢弃" in out
     assert "送到模型" in out
+    # ⚠️ 整句钉死（不是只查「1,014」在不在）：括注**只定性**，曾经带的
+    # 「含 N 条硬丢弃」已删（那个 N 没有唯一含义、读者无法验证）——
+    # 钉整句能抓住「顺手把计数加回来」这类回归（修复轮次 2）。
+    assert "其中 1,014 条被本地规则筛掉（纯应答 / 过短 / 刷屏广告一类）" in out
+    assert "硬丢弃" not in out
 
 
 def test_render_empty_day_partial_coverage_is_treated_as_not_refined():
@@ -1554,11 +1557,11 @@ def test_screening_breakdown_splits_local_from_model(seeded):
     )
     conn.commit()
 
-    total, local, sent, hard_dropped = digest.screening_breakdown(
+    total, local, sent = digest.screening_breakdown(
         conn, _Config({100: "班级群"}), since=since, until=until
     )
 
-    assert (total, local, sent, hard_dropped) == (3, 0, 3, 0)
+    assert (total, local, sent) == (3, 0, 3)
     assert local + sent == total       # ④ 文案里两个数字之和必须等于消息总数
 
 
@@ -1575,7 +1578,7 @@ def test_screening_breakdown_sent_counts_context_expansion_not_candidates(seeded
     实测红）。msg 6 与候选隔了 3 个下标，`context=2` 够不着它。
 
     变异反证：
-    * `sent` 改回 `len(msgs) - screen_stats.dropped` → 本条红（`sent` = 4 ≠ 5）
+    * `sent` 改回 `len(msgs) - screen_stats.dropped` → 本条红（`sent` = 3 ≠ 5）
     * `sent` 改成候选数 `len(candidates)` → 本条红（`sent` = 1 ≠ 5）
     """
     conn, since, until = seeded
@@ -1593,11 +1596,11 @@ def test_screening_breakdown_sent_counts_context_expansion_not_candidates(seeded
     )
     conn.commit()
 
-    total, local, sent, hard_dropped = digest.screening_breakdown(
+    total, local, sent = digest.screening_breakdown(
         conn, _Config({100: "班级群"}), since=since, until=until
     )
 
-    assert (total, local, sent, hard_dropped) == (6, 1, 5, 1)
+    assert (total, local, sent) == (6, 1, 5)
     assert local + sent == total
     assert sent < total            # 至少有一条真的没出网，否则这条测不出「本地筛掉」
 
@@ -1644,6 +1647,7 @@ def test_digest_empty_window_breakdown_end_to_end(seeded, monkeypatch, tmp_path)
     assert "没有值得一提的信息" in body
     assert "被本地规则筛掉" in body
     assert "3/3" not in body          # 覆盖信息只在未抽取分支里出现
-    # 三条都没命中保留规则 → 一条都没出网；其中 msg 1/2 是硬丢弃（子集）
-    assert "其中 3 条被本地规则筛掉（含 2 条硬丢弃" in body
+    # 三条都没命中保留规则 → 一条都没出网；括注只定性、不带任何计数
+    assert "其中 3 条被本地规则筛掉（纯应答 / 过短 / 刷屏广告一类）" in body
     assert "0 条送到模型后判为无价值" in body
+    assert "硬丢弃" not in body
