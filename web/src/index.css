@@ -1,0 +1,13 @@
+@import 'tailwindcss';
+
+/* Tailwind v4：主题在这里声明，**没有 tailwind.config.js**
+   （v4 是 CSS-first 配置；照 v3 的写法建 config 文件不会被读取）。 */
+@theme {
+  --color-vigil-bg: #0b0f14;
+  --color-vigil-fg: #e6edf3;
+}
+
+html {
+  /* 手机上禁掉横向滚动：源消息里偶有长链接，别把整页撑歪 */
+  overflow-x: hidden;
+}
