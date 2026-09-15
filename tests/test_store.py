@@ -567,3 +567,42 @@ def test_message_span_none_when_no_messages(memdb):
     memdb.execute("DELETE FROM messages")
 
     assert store.message_span(memdb) is None
+
+
+def test_message_span_ignores_zero_ts_rows(memdb):
+    """⚠️ ``ts=0`` 的脏行不许把 ``MIN(ts)`` 拉走（修复轮次 1）。
+
+    真库里有 14 条 1970 的脏数据。它们把 ``MIN(ts)`` 按在 0 时，
+    「窗口早于全部数据」那一侧就永远判不出来（``window[1] <= 0`` 为假）——
+    于是查一个**根本没数据**的日期，日报会说「这天真的没人说话」。
+    """
+    _seed_messages(memdb)                      # ts = 1000 / 2000 / 3000
+    memdb.execute(
+        "INSERT INTO messages VALUES (?,?,?,?,?)", (4, 100, 0, "u_x", "1970 脏行")
+    )
+
+    span = store.message_span(memdb)
+
+    assert span == (1000, 3000)                # 不是 (0, 3000)
+    assert span[0] != 0
+
+
+def test_message_span_ignores_negative_ts_rows(memdb):
+    """负数 ts 同样不该被当成「最早」——同一类脏数据、同一个过滤器管住。"""
+    _seed_messages(memdb)
+    memdb.execute(
+        "INSERT INTO messages VALUES (?,?,?,?,?)", (4, 100, -1, "u_x", "脏行")
+    )
+
+    assert store.message_span(memdb) == (1000, 3000)
+
+
+def test_message_span_none_when_only_dirty_rows(memdb):
+    """全是脏行 = 一条可用数据也没有 → None（说「没数据」而不是「没人说话」）。"""
+    _seed_messages(memdb)
+    memdb.execute("DELETE FROM messages")
+    memdb.execute(
+        "INSERT INTO messages VALUES (?,?,?,?,?)", (4, 100, 0, "u_x", "1970 脏行")
+    )
+
+    assert store.message_span(memdb) is None

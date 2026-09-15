@@ -1683,6 +1683,24 @@ def test_render_empty_day_no_messages_but_inside_span():
     assert "真的没人说话" in out
 
 
+def test_render_empty_day_window_before_all_data():
+    """⚠️ 窗口**早于全部数据** → 是「没数据」，不是「没人说话」（修复轮次 1）。
+
+    旧判据 `window[1] <= span[0] or window[0] > span[1]` 在 span 的下界被
+    `ts=0` 脏行拉到 0 时会**两边都判不出来**，于是这里会说出「真的没人说话」
+    ——一句关于「没人说话」的断言，而那天压根不在数据覆盖范围内。
+    """
+    out = digest.render_empty_day(
+        day="2026-06-01", groups=0, messages=0, refined=0,
+        local_dropped=0, sent=0, span=(1000, 3000),
+        window=(100, 999),                     # 整个窗口都在 span[0] 之前
+    )
+
+    assert "vigil export" in out
+    assert "真的没人说话" not in out
+    assert "没有值得一提的信息" not in out
+
+
 def test_render_empty_day_zero_sent_does_not_say_zero():
     """⚠️ sent == 0 时不许渲染「0 条送到模型后判为无价值」。"""
     out = digest.render_empty_day(
@@ -1744,6 +1762,32 @@ def test_digest_zero_message_window_inside_span_says_really_quiet(seeded, monkey
     assert "真的没人说话" in body
     assert "vigil export" not in body
     assert "没有值得一提的信息" in body
+
+
+def test_digest_window_before_all_data_with_zero_ts_dirty_row(seeded, monkeypatch,
+                                                              tmp_path):
+    """端到端：库里的 ``ts=0`` 脏行不许把「早于全部数据的一天」说成「没人说话」。
+
+    ⚠️ 这条是**真库形状的复现**：真库有 14 条 1970 脏行 + 数据只到 9/13。
+    不过滤 `ts > 0` 时 `span[0] = 0`，`outside` 两边都判不出来 → 日报说
+    「这天真的没人说话」——**同一句假话的第三个入口**。
+    """
+    conn, since, until = seeded
+    conn.execute("DELETE FROM items")
+    conn.execute(
+        "INSERT INTO messages VALUES (?,?,?,?,?)", (99, 100, 0, "u_x", "1970 脏行")
+    )
+    conn.commit()
+    monkeypatch.setattr("vigil.digest.chat_json", _FakeLLM([]))
+
+    early_since, early_until = digest.day_window("2026-06-01")
+    digest.digest(_Config({100: "班级群"}), api_key="k", conn=conn,
+                  since=early_since, until=early_until, day_label="2026-06-01",
+                  output_dir=tmp_path)
+
+    body = (tmp_path / "2026-06-01.md").read_text(encoding="utf-8")
+    assert "vigil export" in body
+    assert "真的没人说话" not in body
 
 
 def test_digest_no_data_progress_line_has_no_zero_counts(seeded, monkeypatch,
