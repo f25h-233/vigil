@@ -68,6 +68,11 @@ LOW_CONFIDENCE = 0.5
 # 但要小到能在模型退化时及时掐断（见 vigil/llm.py 的退化说明）。
 MAX_TOKENS = 2000
 
+# 上下文窗口宽度。**必须与 `vigil/refine.py` 的 `context: int = 2` 一致**：
+# 空窗日的筛除分布要复现「当时到底发出去了多少条」，而发出去的 = 候选 ±
+# 这个宽度的邻居（见 screening_breakdown 的口径边界②）。
+REFINE_CONTEXT = 2
+
 
 def build_system_prompt() -> str:
     """系统提示词。
@@ -668,6 +673,9 @@ def digest(
         # `refine_runs` 记账时才敢说「没有值得一提的信息」；覆盖不全时那句
         # 可能是假话（这天压根没抽取过），改说「尚未抽取」——把一句可能为假
         # 的话换成一句一定为真的话。
+        #
+        # ⚠️ 覆盖完整时才敢报筛除分布，而分布里的「送模型」必须按
+        # refine 的真实管线算（修复轮次 1）：`screening_breakdown` 见 docstring。
         if not items:
             total, refined = store.window_refine_coverage(
                 conn, since=since, until=until
@@ -682,14 +690,19 @@ def digest(
                     f"**尚未抽取完**——日报只说明这个，不下「没事」的结论"
                 )
             else:
-                _, local, sent = screening_breakdown(
+                _, local, sent, hard_dropped = screening_breakdown(
                     conn, config, since=since, until=until
                 )
                 body = render_empty_day(
                     day=day_label, groups=groups, messages=messages,
                     refined=refined, local_dropped=local, sent=sent,
+                    hard_dropped=hard_dropped,
                 )
-                on_progress(f"[digest] {day_label}：窗口内没有条目")
+                on_progress(
+                    f"[digest] {day_label}：窗口内没有条目"
+                    f"（本地筛掉 {local:,} 条，其中硬丢弃 {hard_dropped:,} 条；"
+                    f"送到模型 {sent:,} 条）"
+                )
             return _persist(stats, conn, body, model, prompt_ver, [], write_file,
                             out_dir, day_label)
 
@@ -740,21 +753,51 @@ def digest(
 
 def screening_breakdown(
     conn: sqlite3.Connection, config: Config, *, since: int, until: int
-) -> tuple[int, int, int]:
-    """窗口内的 (消息总数, 本地规则筛掉的, 送模型后判无价值的)。
+) -> tuple[int, int, int, int]:
+    """窗口内的 (消息总数, 本地筛掉, 送模型, 硬丢弃)。
 
     ⚠️ **为什么要重算而不是查 `refine_runs`**：那张表只记
     ``discarded`` / ``ok``，而「本地规则筛掉」与「送模型后判无价值」
-    **都记 ``discarded``**——查不出来。所以把本地预筛再跑一遍（纯本地、零 API）。
+    **都记 ``discarded``**——查不出来。所以按 refine 的管线形状重跑一遍
+    （``pending_messages`` → ``prefilter.screen`` → ``expand_context``，纯本地、零 API）。
 
-    ⚠️ **已知边界**：口径前提是 `config/groups.toml` 的 ``tier`` 与
-    ``prefilter`` 的规则**与 refine 当时一致**。改了任一者，这里的拆分就会
-    与当时的实际不一致。这是这条统计的固有代价，不是 bug。
+    ⚠️ **``sent`` 是 ``expand_context`` 之后的条数**——候选**加上前后各
+    ``REFINE_CONTEXT`` 条上下文邻居**才是真的会出网的那些，不是候选数。
+    首版写成 ``总数 - screen_stats.dropped``，把 967 条「没命中保留规则」
+    （同样一步都没出本机）算进了「送模型」：8/8 实测把 **45** 报成了 **976**
+    （夸大约 20 倍），而这句错话恰好出在「专门用来防止假数字」的那段文案里
+    （修复轮次 1）。**`screen_stats.dropped` 只是「硬丢弃」，不是「没出网」。**
+
+    ``hard_dropped`` 是**硬丢弃里确实没出网的那部分**（硬丢弃 ∩ 本地筛掉），
+    与 ``local`` 构成子集关系，文案才敢写「含 N 条硬丢弃」。
+    ⚠️ 它**不等于** ``screen_stats.dropped``：8/8 实测硬丢弃共 83 条，其中 **2 条
+    被 ``expand_context`` 当上下文邻居拉进了 ``in_scope``**——按硬规则判死、
+    却仍发给了模型，所以算在 ``sent`` 里、不算在 ``local`` 里。写成 83 的话
+    「1,014 条里含 83 条」就是**假话**（差 2 条）。
+
+    ⚠️ **已知边界（固有代价，不是 bug）**：
+    ① ``config/groups.toml`` 的 ``tier`` 与 ``prefilter`` 规则**与 refine 当时一致**；
+    ② refine 当时用的 ``context`` 也是默认值（有人 `--context N` 跑过就对不上）；
+    ③ ``refine_runs`` 的 ``error`` 行按「没抽取完」算（见 ``window_refine_coverage``）。
+    任一者变了，这里的拆分就会与当时的实际不一致。
     """
     msgs = store.pending_messages(conn, since=since, until=until, redo=True)
-    _, screen_stats = prefilter.screen(msgs, tier_of=config.tier_of)
-    local = screen_stats.dropped
-    return len(msgs), local, len(msgs) - local
+    candidates, _ = prefilter.screen(msgs, tier_of=config.tier_of)
+    in_scope = prefilter.expand_context(msgs, candidates, context=REFINE_CONTEXT)
+    sent = len(in_scope)
+    # 「硬丢弃 ∩ 没出网」不能拿 `screen_stats.dropped` 顶替（见 docstring）。
+    # 这里复用 prefilter 自己的判定函数而不是另写一套：**同一套规则只该有一份
+    # 实现**，两处各写一份必然漂移。⚠️ flood 集合必须按**全窗口**算
+    # （screen 内部就是这么算的）；在子集上重算会变小，分类就对不上了。
+    scope_ids = {m.msg_id for m in in_scope}
+    flood = prefilter._flood_ids(msgs)
+    hard_dropped = sum(
+        1
+        for m in msgs
+        if m.msg_id not in scope_ids
+        and prefilter._drop_reason(m, flood=flood) is not None
+    )
+    return len(msgs), len(msgs) - sent, sent, hard_dropped
 
 
 def render_empty_day(
@@ -765,6 +808,7 @@ def render_empty_day(
     refined: int,
     local_dropped: int,
     sent: int,
+    hard_dropped: int = 0,
 ) -> str:
     """空窗日的日报正文。
 
@@ -775,6 +819,11 @@ def render_empty_day(
 
     第 2 条是这条需求的真正价值：把一句**可能为假**的话，换成一句**一定为真**的话。
     在此之前，「这天确实没事」与「这天压根没抽取过」在日报里长得一模一样。
+
+    ``hard_dropped`` 只在「覆盖完整」那条分支里读（未抽取分支一个字都不许提，
+    那时连筛都没跑过），所以默认 0 是安全的——**默认值只在覆盖不全时被忽略**。
+    ⚠️ 它必须是 ``local_dropped`` 的**子集**（见 ``screening_breakdown``），
+    文案里也照实写「**含**」：并列项与子集项在读者眼里是两件事。
     """
     head = f"# 守夜人日报 · {day}\n\n当天 {groups} 个群 {messages:,} 条消息。\n"
     if refined < messages:
@@ -786,8 +835,9 @@ def render_empty_day(
         )
     return (
         head
-        + f"\n其中 {local_dropped:,} 条被本地规则筛掉（纯应答 / 过短 / 刷屏广告），"
-        + f"\n{sent:,} 条送模型后判为无价值。\n"
+        + f"\n其中 {local_dropped:,} 条被本地规则筛掉"
+        + f"（含 {hard_dropped:,} 条硬丢弃：纯应答 / 过短 / 刷屏广告），"
+        + f"\n{sent:,} 条送到模型后判为无价值。\n"
         + "\n没有值得一提的信息。\n"
     )
 

@@ -308,18 +308,24 @@ def window_stats(
 def window_refine_coverage(
     conn: sqlite3.Connection, *, since: int, until: int
 ) -> tuple[int, int]:
-    """窗口内的 (消息总数, 有 refine_runs 记账的条数)。
+    """窗口内的 (消息总数, **已抽取**的条数)。
 
     空窗日的日报靠它自证「**是安静，不是管线没跑**」——覆盖率不足时
     绝不能说「没有值得一提的信息」，那是句可能为假的话。
+
+    ⚠️ ``status='error'`` 的行**不算已抽取**（修复轮次 1）：批次失败时 refine
+    会写 error 行，而 ``pending_messages(redo=False)`` 的语义是「**试过但没成功
+    ≠ 已处理**」——那些消息下次还会被重新取出来跑。两边若不同调，日报就会
+    在「其实还有一批没抽」时说出「没有值得一提的信息」：又一个假话入口。
+    （首版只查「有没有 refine_runs 行」，与 refine 的重试口径不一致。）
     """
     total = conn.execute(
         "SELECT COUNT(*) FROM messages WHERE ts >= ? AND ts < ?", (since, until)
     ).fetchone()[0]
     refined = conn.execute(
         "SELECT COUNT(*) FROM messages m WHERE m.ts >= ? AND m.ts < ?"
-        " AND m.msg_id IN (SELECT msg_id FROM refine_runs)",
-        (since, until),
+        " AND m.msg_id IN (SELECT msg_id FROM refine_runs WHERE status != ?)",
+        (since, until, STATUS_ERROR),
     ).fetchone()[0]
     return total, refined
 
