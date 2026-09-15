@@ -670,6 +670,19 @@ def test_digest_writes_body_and_links_every_item(seeded, monkeypatch, tmp_path):
     ).fetchall()
     assert [r[0] for r in linked] == [1, 2]
 
+    # ⚠️ **「库副本 == 文件副本」**：同一篇日报有两个副本（`digests.body_md` 是
+    # M3 Web 与所有下游读到的那个，`.md` 是磁盘上那个），**必须逐字节相等**。
+    #
+    # 这条不变量原先在编排层**零断言**（`grep body_md tests/` 只命中 test_store.py）：
+    # 变异 N15「落库正文 = 文件正文 + 前缀」曾 211 全绿存活。
+    # 按**字节**比而不是按文本比：`read_text()` 会做 universal-newline 归一化，
+    # CRLF 的差异会被吃掉——那正是 `_persist` 里 `newline="\n"` 的守卫。
+    db_body = conn.execute(
+        "SELECT body_md FROM digests WHERE digest_id=?", (stats.digest_id,)
+    ).fetchone()[0]
+    assert db_body == body
+    assert (tmp_path / "2026-09-13.md").read_bytes() == db_body.encode("utf-8")
+
 
 def test_digest_sends_max_tokens_and_thinking_off(seeded, monkeypatch, tmp_path):
     conn, since, until = seeded
@@ -758,21 +771,51 @@ def test_digest_llm_failure_writes_nothing_and_reports(seeded, monkeypatch, tmp_
 
 
 def test_digest_rerun_replaces_instead_of_stacking(seeded, monkeypatch, tmp_path):
+    """⚠️ 「替换」是**两件事**：不堆叠（行数）+ 正文真的被换成新版。
+
+    原先只断言了 `COUNT(*)==1` 与 `calls==2`，把「替换正文」那半边丢了——
+    变异「窗口已有 digest 就跳过 save_digest、只刷新文件」曾 **211 全绿存活**。
+    后果是静默的：磁盘 `.md` 是新版、`digests.body_md`（Web/下游读的那个）
+    是旧版，两个副本分歧而没有任何报错。
+
+    ⚠️ 两次调用**必须喂不同的 lines**。用同一个 `fake` 时两版正文一模一样，
+    「库里是第二版」这条断言恒真、什么也守不住——这是补这条守卫的必要条件。
+    """
     conn, since, until = seeded
-    fake = _FakeLLM([{"quotes": ["体检表", "讲座"], "label": "全部", "text": ""}])
-    monkeypatch.setattr("vigil.digest.chat_json", fake)
     cfg = _Config({100: "班级群", 200: "新生群"})
+    first = _FakeLLM([{"quotes": ["体检表", "讲座"], "label": "第一版", "text": ""}])
+    monkeypatch.setattr("vigil.digest.chat_json", first)
 
     digest.digest(cfg, api_key="k", conn=conn, since=since, until=until,
                   day_label="2026-09-13", output_dir=tmp_path)
+
+    second = _FakeLLM([{"quotes": ["体检表", "讲座"], "label": "第二版", "text": ""}])
+    monkeypatch.setattr("vigil.digest.chat_json", second)
+
     digest.digest(cfg, api_key="k", conn=conn, since=since, until=until,
                   day_label="2026-09-13", output_dir=tmp_path)
 
     assert conn.execute("SELECT COUNT(*) FROM digests").fetchone()[0] == 1
-    assert fake.calls == 2
+    assert first.calls == 1 and second.calls == 1
+
+    db_body = conn.execute(
+        "SELECT body_md FROM digests WHERE window_from=? AND window_to=?",
+        (since, until),
+    ).fetchone()[0]
+    assert "第二版" in db_body, "库里的正文没有被换成第二版"
+    assert "第一版" not in db_body, "第一版正文残留在库里"
+    assert (tmp_path / "2026-09-13.md").read_bytes() == db_body.encode("utf-8")
 
 
 def test_digest_dry_run_does_not_call_model_or_write(seeded, monkeypatch, tmp_path):
+    """⚠️ 有 item 的 dry-run 分支也要守「不写库」。
+
+    原先这条只断言了「不落文件」，「不写库」只有**空窗**那条测试守着——
+    与 M6（空窗分支偷偷写库）是**同形镜像洞**。变异 N6b「只在有 item 的
+    dry-run 分支里插一句 store.save_digest」曾 211 全绿存活，后果是 dry-run
+    期间库里被塞进一篇日报，而用户以为什么都没动（M3 的 Web 会展示它）。
+    两个分支都要守。
+    """
     conn, since, until = seeded
     fake = _FakeLLM([])
     monkeypatch.setattr("vigil.digest.chat_json", fake)
@@ -783,7 +826,9 @@ def test_digest_dry_run_does_not_call_model_or_write(seeded, monkeypatch, tmp_pa
 
     assert fake.calls == 0
     assert stats.items == 2
+    assert stats.digest_id is None
     assert not (tmp_path / "2026-09-13.md").exists()
+    assert conn.execute("SELECT COUNT(*) FROM digests").fetchone()[0] == 0
 
 
 def test_digest_dry_run_on_empty_window_still_writes_nothing(seeded, monkeypatch, tmp_path):
@@ -827,3 +872,104 @@ def test_digest_rejects_reversed_window(seeded):
     with pytest.raises(ValueError):
         digest.digest(_Config({100: "班级群"}), api_key="k", conn=conn,
                       since=5000, until=1000, day_label="2026-09-13")
+
+
+# ── 编排：CLI 层 ────────────────────────────────────────────
+#
+# 这一段守的是 brief 正文点名承重、但出口自查里**一度没人守**的三件事：
+# 失败返回非零（「M4 自动化的报警信号——别吞掉」）、`--no-write` 真的不落文件、
+# 密钥真的接到了 LLMConfig 上。三者原先各有一个变异体全绿存活：
+# `return 1`→`return 0`、`write_file=not args.no_write`→`True`、`api_key=""`。
+#
+# 范式抄 `tests/test_refine.py::test_cli_refine_model_falls_back_to_default`：
+# 用 `cli.main([...])` 驱动，把 `_load_config_only` / `_require_export_db`
+# 换成替身。⚠️ 这里多一步——`DEFAULT_OUTPUT_DIR` 也**必须**换掉。
+
+
+@pytest.fixture
+def cli_env(seeded, monkeypatch, tmp_path):
+    """把 `cmd_digest` 的外部依赖全接上，一件都不许落到真实环境。
+
+    ⚠️ `DEFAULT_OUTPUT_DIR` 必须换成 tmp_path：`cmd_digest` **不传**
+    `output_dir`，不换的话这里每一次成功路径都会往仓库的 `docs/digests/`
+    里写文件——测试污染工作区。
+
+    ⚠️ `load_llm_key` 是在 `cmd_digest` **函数体内** import 的，所以只能打在
+    `vigil.config` 上，打在 `vigil.cli` 上不生效。
+    """
+    from vigil import cli
+
+    conn, _, _ = seeded
+    db = tmp_path / "export.db"
+    disk = sqlite3.connect(str(db))
+    conn.backup(disk)
+    disk.commit()
+    disk.close()
+
+    monkeypatch.setattr(
+        cli, "_load_config_only",
+        lambda: _Config({100: "班级群", 200: "新生群"}),
+    )
+    monkeypatch.setattr(cli, "_require_export_db", lambda config: db)
+    monkeypatch.setattr("vigil.config.load_llm_key", lambda *a, **k: "k-cli")
+    monkeypatch.setattr("vigil.digest.DEFAULT_OUTPUT_DIR", tmp_path / "digests")
+    return db
+
+
+def _count_digests(db) -> int:
+    conn = sqlite3.connect(str(db))
+    try:
+        return conn.execute("SELECT COUNT(*) FROM digests").fetchone()[0]
+    finally:
+        conn.close()
+
+
+def test_cli_digest_llm_failure_exits_nonzero(cli_env, monkeypatch, tmp_path):
+    """⚠️ **非零退出码是 M4 自动化的报警信号。**
+
+    变异「失败分支 `return 1` → `return 0`」曾 211 全绿存活：日报失败会静默，
+    自动化收不到任何信号——正是 brief 里点名的「别吞掉」。
+    """
+    from vigil import cli
+    from vigil.llm import LLMError
+
+    def boom(cfg, *, system, user, sleep=None):
+        raise LLMError("HTTP 503")
+
+    monkeypatch.setattr("vigil.digest.chat_json", boom)
+
+    rc = cli.main(["digest", "--date", "2026-09-13"])
+
+    assert rc == 1
+    assert _count_digests(cli_env) == 0
+    assert not (tmp_path / "digests" / "2026-09-13.md").exists()
+
+
+def test_cli_digest_no_write_skips_file_but_still_saves(cli_env, monkeypatch, tmp_path):
+    """`--no-write` 必须一路传到 `digest(write_file=False)`，不能被写死成 True。"""
+    from vigil import cli
+
+    fake = _FakeLLM([{"quotes": ["体检表", "讲座"], "label": "全部", "text": ""}])
+    monkeypatch.setattr("vigil.digest.chat_json", fake)
+
+    rc = cli.main(["digest", "--date", "2026-09-13", "--no-write"])
+
+    assert rc == 0
+    assert _count_digests(cli_env) == 1
+    # 目录整个都不该被建出来——不是「建了但没写这个文件」
+    assert not (tmp_path / "digests").exists()
+
+
+def test_cli_digest_passes_api_key_to_llm(cli_env, monkeypatch, tmp_path):
+    """密钥没接到 `LLMConfig` 上就会每次 401，而测试全绿。
+
+    变异 `api_key=""` 曾 211 全绿存活。
+    """
+    from vigil import cli
+
+    fake = _FakeLLM([{"quotes": ["体检表", "讲座"], "label": "全部", "text": ""}])
+    monkeypatch.setattr("vigil.digest.chat_json", fake)
+
+    assert cli.main(["digest", "--date", "2026-09-13"]) == 0
+
+    assert fake.configs[0].api_key == "k-cli"
