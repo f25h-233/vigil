@@ -65,6 +65,23 @@ if missing:
     raise SystemExit(f"探针里缺这些文件，先补齐再生成：{missing}")
 
 section = "\n".join(out)
+
+# ⚠️ 这是一次性播种工具，**不是幂等生成器**。终审（阶段③）点名过这个风险：
+# 它用 "a" 追加、编号从 A.1 重数（数的是本次输出的行，不是文件里已存在的），
+# 所以在同一个仓库里重跑一次会追加**第二份 A.1–A.17**；而计划里已经写着
+# 「A.15 作废并指向 cc6e2c0」这类批注——重复的旧版本会跟着复活，把修好的
+# 缺陷重新变成"可照抄的源码"。
+# 另一层：它的输入 `_smoke/m3-frontend-probe/` 在 gitignore 里，**干净 clone 下
+# 根本跑不起来**——所以它在本仓库里剩下的唯一作用就是"能搞坏计划"。
+existing = PLAN.read_text(encoding="utf-8")
+if "## 附录 A" in existing:
+    raise SystemExit(
+        "计划里已经有附录 A 了。本脚本是一次性播种工具，不是幂等生成器：\n"
+        "  再跑一次会追加第二份 A.1–A.17，把已作废的旧版本复活。\n"
+        "  要重新生成，请先把计划里现有的附录整段删掉。\n"
+        "  （T4/T5/T6 落地后，前端文件的权威来源已经是仓库里的 web/src/**，不是本脚本。）"
+    )
+
 with PLAN.open("a", encoding="utf-8") as f:
     f.write(section)
 print(f"已追加 {len(FILES)} 个文件的完整源码，计划现在 {len(PLAN.read_text(encoding='utf-8').splitlines())} 行")
