@@ -179,3 +179,127 @@ def test_item_sources_supports_reverse_lookup(memdb):
         "SELECT item_id FROM item_sources WHERE msg_id = ?", (2,)
     ).fetchall()
     assert by_msg == [(1,)]
+
+
+# ── 日报持久化（M2 Task 1）─────────────────────────────────
+
+
+def _seed_items(conn: sqlite3.Connection) -> None:
+    """造三条 item：两条在窗口内、一条在窗口外，含一条低置信度。"""
+    store.ensure_schema(conn)
+    conn.executemany(
+        "INSERT INTO items (item_id, kind, title, detail, event_ts, deadline_ts,"
+        " group_id, actor_uid, place, links, amount, confidence, model,"
+        " prompt_ver, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        [
+            (1, "notice", "体检表", "10月8日前交", 3000, 4000, 100, None,
+             None, "[]", None, 0.9, "m", "v2", 1),
+            (2, "activity", "讲座", None, 2000, None, 200, None,
+             "报告厅", "[]", None, 0.3, "m", "v2", 1),
+            (3, "notice", "窗口外的", None, 9999, None, 100, None,
+             None, "[]", None, 0.9, "m", "v2", 1),
+        ],
+    )
+    conn.commit()
+
+
+def test_window_items_filters_and_orders(memdb):
+    _seed_messages(memdb)
+    _seed_items(memdb)
+
+    got = store.window_items(memdb, since=1000, until=5000)
+
+    assert [it.item_id for it in got] == [2, 1]   # 按 event_ts 升序
+    assert got[0].title == "讲座"
+    assert got[1].deadline_ts == 4000
+    assert got[1].confidence == 0.9
+
+
+def test_window_items_empty_when_no_items(memdb):
+    _seed_messages(memdb)
+    store.ensure_schema(memdb)
+
+    assert store.window_items(memdb, since=1000, until=5000) == []
+
+
+def test_window_stats_counts_messages_and_groups(memdb):
+    _seed_messages(memdb)   # ts=1000(群100) / 2000(群100) / 3000(群200)
+
+    assert store.window_stats(memdb, since=1000, until=4000) == (3, 2)
+    assert store.window_stats(memdb, since=1000, until=2500) == (2, 1)
+    assert store.window_stats(memdb, since=5000, until=6000) == (0, 0)
+
+
+def test_save_digest_returns_id_and_links_items(memdb):
+    _seed_items(memdb)
+
+    digest_id = store.save_digest(
+        memdb, window_from=1000, window_to=5000, body_md="# 日报",
+        model="m", prompt_ver="v1", item_ids=[1, 2], now=12345,
+    )
+
+    assert digest_id > 0
+    assert store.find_digest(memdb, window_from=1000, window_to=5000) == (
+        digest_id, "# 日报",
+    )
+    linked = memdb.execute(
+        "SELECT item_id FROM digest_items WHERE digest_id=? ORDER BY item_id",
+        (digest_id,),
+    ).fetchall()
+    assert [r[0] for r in linked] == [1, 2]
+
+
+def test_save_digest_replaces_same_window(memdb):
+    """同一天跑两次必须是替换，不是堆叠——否则会出两篇同日日报。"""
+    _seed_items(memdb)
+
+    store.save_digest(
+        memdb, window_from=1000, window_to=5000, body_md="# 第一版",
+        model="m", prompt_ver="v1", item_ids=[1, 2],
+    )
+    store.save_digest(
+        memdb, window_from=1000, window_to=5000, body_md="# 第二版",
+        model="m", prompt_ver="v1", item_ids=[1],
+    )
+
+    # ⚠️ 不要断言「两次的 digest_id 不同」——SQLite 的 INTEGER PRIMARY KEY
+    # 在表被删空后会**复用 rowid**，这里两次都会拿到 1，那样断言会假红
+    # （规划期实测踩到过）。要守的是「只剩一篇、旧关联行清干净、内容是新的」。
+    rows = memdb.execute("SELECT COUNT(*) FROM digests").fetchone()[0]
+    assert rows == 1
+    # 第二次只挂了 item 1，所以 item 2 的关联必须已经被清掉。
+    # ⚠️ 也不能用「digest_items WHERE digest_id=? 的条数」判孤儿：id 被复用了，
+    # 那个查询会查到**新日报自己的**关联行，测不出任何东西。
+    linked = [
+        r[0]
+        for r in memdb.execute(
+            "SELECT item_id FROM digest_items ORDER BY item_id"
+        ).fetchall()
+    ]
+    assert linked == [1]
+    # 真正的孤儿判据：关联行指向一篇不存在的日报
+    orphan = memdb.execute(
+        "SELECT COUNT(*) FROM digest_items"
+        " WHERE digest_id NOT IN (SELECT digest_id FROM digests)"
+    ).fetchone()[0]
+    assert orphan == 0
+    assert store.find_digest(memdb, window_from=1000, window_to=5000)[1] == "# 第二版"
+
+
+def test_find_digest_absent_returns_none(memdb):
+    store.ensure_schema(memdb)
+
+    assert store.find_digest(memdb, window_from=1, window_to=2) is None
+
+
+def test_ensure_schema_is_idempotent_for_digests(memdb):
+    """ensure_schema 每次 refine/digest 都调，必须能重复执行。"""
+    store.ensure_schema(memdb)
+    store.ensure_schema(memdb)
+
+    names = {
+        r[0] for r in memdb.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        )
+    }
+    assert {"digests", "digest_items"} <= names
