@@ -2,8 +2,12 @@
 
 ⚠️ 本文件的用例是**从 tests/test_digest.py 的既有覆盖里长出来的**：
 核验函数原在 digest.py，M3 平移到 deadline.py。平移的正确性由
-「test_digest.py 的 72 条既有测试全绿」证明，本文件补的是**新增的那部分**：
+「test_digest.py 的 105 条既有测试全绿」证明，本文件补的是**新增的那部分**：
 「哪些该清掉」这个集合计算。
+
+⚠️ 数字是**实测值**（`pytest tests/test_digest.py --co -q`，2026-09-15），不是
+计划里的 72——那个数是更早的计数快照，已经过期（审查裁决：本项目对「没人能
+验证的数字」有纪律，写小的不如写准的）。
 """
 
 from __future__ import annotations
