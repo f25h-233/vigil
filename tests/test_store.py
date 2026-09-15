@@ -639,14 +639,41 @@ def test_items_with_deadline_only_returns_rows_that_have_one():
 
 
 def test_clear_deadlines_only_touches_that_column():
-    """降级的必须是**那一个字段**，不是整条信息。"""
+    """两个性质一起守：**只动那一列**，且**只动传入的那些行**。
+
+    ⚠️ 第二个性质是审查退回后补的（Task 1 修复轮次 1）。初版只插了**一条** item，
+    于是「把全表 deadline_ts 都置 NULL」（= 完全忽略 `item_ids` 参数）这种实现
+    照样全绿——**它守了列，没守行**。这不是假想：`clear_deadlines` 是本里程碑
+    唯一一处对真库的不可逆写操作（`vigil deadline-audit --apply` 直接改
+    `data/vigil.db`），忽略参数就等于**静默清掉全库的截止日**。
+    """
     conn = sqlite3.connect(":memory:")
     store.ensure_schema(conn)
     _insert_item(conn, 1, deadline_ts=1000)
-    before = conn.execute("SELECT item_id, title, kind FROM items").fetchall()
+    _insert_item(conn, 2, deadline_ts=2000)
+    # item 1 的 deadline_ts 会变；item 2 **一列都不许变**（除主键外全列快照）
+    other_cols = (
+        "kind, title, detail, event_ts, group_id, actor_uid, place, links,"
+        " amount, confidence, model, prompt_ver, created_at"
+    )
+    before2 = conn.execute(
+        f"SELECT {other_cols} FROM items WHERE item_id = 2"
+    ).fetchone()
+
     assert store.clear_deadlines(conn, [1]) == 1
-    assert conn.execute("SELECT item_id, title, kind FROM items").fetchall() == before
-    assert conn.execute("SELECT deadline_ts FROM items").fetchone()[0] is None
+
+    assert conn.execute(
+        "SELECT deadline_ts FROM items WHERE item_id = 1"
+    ).fetchone()[0] is None
+    # ⚠️ 关键守卫：item 2 不在传入列表里，它的截止日必须**原样留着**。
+    # 变异反证：把 `WHERE item_id IN (...)` 改成恒真，这一行立刻变红。
+    assert conn.execute(
+        "SELECT deadline_ts FROM items WHERE item_id = 2"
+    ).fetchone()[0] == 2000
+    assert conn.execute(
+        f"SELECT {other_cols} FROM items WHERE item_id = 2"
+    ).fetchone() == before2
+    assert conn.execute("SELECT COUNT(*) FROM items").fetchone()[0] == 2, "不许删行"
 
 
 def test_clear_deadlines_with_empty_list_is_a_noop():
