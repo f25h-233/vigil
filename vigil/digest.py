@@ -212,8 +212,13 @@ def match_lines(
             found = [it for it, title, _ in normed if title == needle]
             if not found and len(needle) >= 4:
                 # 再按子串找。**下限 4 个字**：摘录太短容易误命中别的条目。
-                # 注意是「命中更多条目」而不是「命中错的」——多认领只会让条目
-                # 归到某一行，不会丢；所以这里的下限是保守取值，不是硬约束。
+                # ⚠️ 多认领**不只**是「归到某一行、不会丢」这么轻。
+                # 规划期审查实测：锚点取的是 `picked[0]`，所以子串多认领一个
+                # event_ts 更早的无关条目，会把整行的**分区与署名群**换掉
+                # ——实测能把 activity/群200 的事渲染成「· 群100」并归进通知公告。
+                # 条目确实没丢，但署错了群、归错了分区。
+                # （「锚点优先取整 title 精确命中」的改进已记为延迟项。）
+                # 下限取 4 是保守取值，不是硬约束。
                 found = [it for it, _, blob in normed if needle in blob]
             if not found:
                 unmatched.append(raw_quote)

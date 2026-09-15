@@ -526,6 +526,55 @@ def test_yesterday_defaults_to_the_day_before_today():
     assert digest.yesterday(dt.date(2026, 9, 15)) == "2026-09-14"
 
 
+# ── 锚点不变量（审查轮次 1：I1）─────────────────────────────
+#
+# 锚点 = `hits.sort(key=(event_ts, item_id))` 之后的**第一个** item，它决定整行的
+# 分区与署名群。审查实测：删掉那行 `hits.sort`、把 `picked[0]` 改成 `picked[-1]`、
+# 或把排序键退化成只按 `item_id`，**当时的 200 条测试全绿**——三条都是静默错配。
+# 根因是所有多命中夹具的「命中序」恰好等于「排序序」。下面两条刻意让两者**错开**。
+
+
+def test_anchor_is_earliest_item_regardless_of_input_order():
+    """items 逆序传入 + quotes 逆序列出，锚点仍须是 event_ts 最小的那条。
+
+    红线：模型对 `quotes` 的顺序没有任何约束（prompt 也没规定），
+    所以「按 quotes 命中序取锚点」= 让模型的书写顺序决定群名与分区。
+    """
+    items = [
+        _item(9, title="晚的", event_ts=2000, kind="activity", group_id=200),
+        _item(1, title="早的", event_ts=1000, kind="notice", group_id=100),
+    ]
+
+    lines, _ = digest.match_lines(
+        [{"quotes": ["晚的", "早的"], "label": "L", "text": ""}], items
+    )
+
+    assert lines[0].item_ids == (1, 9)
+    row = digest.build_rows(lines, items)[0]
+    assert (row.kind, row.group_id) == ("notice", 100)
+
+
+def test_anchor_ranks_by_event_ts_before_item_id():
+    """排序键是 ``(event_ts, item_id)``——**先比 event_ts**。
+
+    这条夹具刻意让 `item_id` 的顺序与 `event_ts` 的顺序**相反**（早的那条
+    item_id 更大）：只按 `item_id` 排的实现会挑错锚点，而 `item_ids` 集合、
+    `label` / `text` 全都照旧——**唯独分区与署名群错**。
+    """
+    items = [
+        _item(2, title="晚的", event_ts=2000, kind="activity", group_id=200),
+        _item(9, title="早的", event_ts=1000, kind="notice", group_id=100),
+    ]
+
+    lines, _ = digest.match_lines(
+        [{"quotes": ["晚的", "早的"], "label": "L", "text": ""}], items
+    )
+
+    assert lines[0].item_ids == (9, 2)
+    row = digest.build_rows(lines, items)[0]
+    assert (row.kind, row.group_id) == ("notice", 100)
+
+
 # ── 编排 ────────────────────────────────────────────────────
 
 
