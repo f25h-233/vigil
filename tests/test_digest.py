@@ -96,6 +96,116 @@ def test_user_prompt_carries_the_day():
 
     assert "2026-09-13" in prompt
 
+
+# ── 守卫补强（审查轮次 1：F1–F4）──────────────────────────────
+#
+# 上面 7 条是 brief 给的，覆盖的是「已经写好的那几条」。独立变异反证（22 个）
+# 抓出它们的覆盖缺口：**载荷有无、提示词规则、别的文本字段、条数守恒**
+# 这四类破坏全都 24 passed。下面每条都配了变异证据，见 task-2-report.md。
+
+
+def test_payload_keeps_every_item():
+    """⚠️ 窗口内**每一条** item 都必须出现在载荷里（设计判断第 1 条）。
+
+    日报「不再筛第二遍」是这个工具最不能犯的错——静默漏掉正是它要防的事。
+    变异反证：`for item in items:` 改成 `items[:1]`，原先 7 条测试全绿
+    （因为它们全都只造 1 条 item，数量根本没被约束）。
+    """
+    items = [_item(i, title=f"条目{i}", event_ts=1000 + i) for i in range(1, 6)]
+
+    payload = digest.build_items_payload(items, {}, Redactor())
+
+    assert len(payload) == len(items)
+    assert [p["title"] for p in payload] == [it.title for it in items]
+
+
+def test_payload_cleans_every_text_field():
+    """⚠️ 三条硬规则要覆盖所有**会出网的文本字段**，不只 detail。
+
+    ``clean()`` 管着 title / detail / place / amount 四个字段。title 尤其危险：
+    它是模型被要求「逐字摘录」回连的字段（规则 3），全角引号出现在 title 时
+    照旧触发退化。
+
+    变异反证：让 title/place/amount 同时绕过 ``clean()``，原先全绿。
+    """
+    payload = digest.build_items_payload(
+        [
+            _item(
+                title="昵称“风之海310”卖笔记",
+                detail="联系 13812345678 报名",
+                place="“三食堂”门口 13812345678",
+                amount="“50 元” 13812345678",
+            )
+        ],
+        {},
+        Redactor(),
+    )
+
+    for field in ("title", "detail", "place", "amount"):
+        assert "“" not in payload[0][field], field
+        assert "13812345678" not in payload[0][field], field
+
+
+def test_payload_unknown_group_id_does_not_leak_the_id():
+    """⚠️ 群不在 ``names`` 里时，兜底也绝不能把群号发出去（spec §4.5）。
+
+    真实触发场景：DB 里出现未配置进 ``config/groups.toml`` 的群。
+    变异反证：兜底从 ``""`` 改成 ``str(item.group_id)``，原先全绿——
+    而这是**群号明文出网**。
+    """
+    payload = digest.build_items_payload([_item(group_id=643375490)], {}, Redactor())
+
+    assert payload[0]["group"] == ""
+    assert "643375490" not in json.dumps(payload, ensure_ascii=False)
+
+
+@pytest.mark.parametrize(
+    "rule_phrase",
+    [
+        "每一条 item 都必须出现在日报里",  # 规则 1：不许省略
+        "合并成一行",                    # 规则 2：合并同类项，漏了日报退化成流水账
+        "逐字摘录",                      # 规则 3：quote 回连契约
+        "12 个字",                       # 规则 4：label 要短
+        "一句话说清细节",                 # 规则 5：text 的职责
+        "不要把它写进 label 或 text",     # 规则 6：群名不进输出（实测逼出来的）
+        "不要编造",                      # 规则 7：不许补原文没有的实体
+    ],
+)
+def test_system_prompt_carries_each_rule(rule_phrase):
+    """7 条规则各有一个**只在该规则里出现**的特征短语。
+
+    变异反证：原先只断言 ``"quotes"`` / ``"label"``，而这两个词在末尾的
+    JSON 形状说明行里**也出现**——把规则 2（合并）、规则 4（label 短）、
+    规则 6（不许写群名）整段删掉，原先全绿。而 docstring 明说规则 2 与 6
+    是「实测逼出来的」：删了规则 6 模型会把群名当主语写进 text，与程序在
+    行尾追加的群名重复。
+    """
+    prompt = digest.build_system_prompt()
+
+    assert rule_phrase in prompt
+
+
+def test_user_prompt_embeds_every_item():
+    """⚠️ 载荷必须真的进到 user prompt 里，且一条不少。
+
+    原先只断言 ``"2026-09-13" in prompt``，而日期出现在**前缀**里，
+    与载荷无关。
+
+    变异反证：①把 ``body`` 整个丢掉只留日期前缀 → 原先全绿，等于拿空
+    items 列表去问模型；②``ensure_ascii=False`` 改成 ``True`` → 原先全绿，
+    中文全变 ``\\uXXXX``（模型看不到原文，输出 token 暴涨）。
+    """
+    payload = digest.build_items_payload(
+        [_item(1, title="体检表"), _item(2, title="讲座", event_ts=2000)], {}, Redactor()
+    )
+
+    prompt = digest.build_user_prompt(payload, day="2026-09-13")
+
+    assert "体检表" in prompt
+    assert "讲座" in prompt
+    # ensure_ascii=True 会把中文写成 \uXXXX——见 docstring 变异反证 ②
+    assert "\\u" not in prompt
+
 # ── quote 匹配 ──────────────────────────────────────────────
 
 
