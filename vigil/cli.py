@@ -406,6 +406,37 @@ def cmd_deadline_audit(args) -> int:
         conn.close()
 
 
+def cmd_serve(args) -> int:
+    """起本地只读 Web 服务。手机访问见 spec §4.7（tailscale serve 代理本端口）。"""
+    import uvicorn  # 延迟导入：不跑服务的人不该为它付启动成本
+
+    from .api import WEB_DIST, create_app
+
+    config = _load_config_only()
+    _require_export_db(config)
+
+    if not (WEB_DIST / "index.html").is_file():
+        # 不许静默起一个空白页：明说前端没构建，并给出构建命令。
+        # ⚠️ flush=True：stdout 重定向到文件时 print 是块缓冲的（实测日志 0 字节），
+        # 而这句正是「不许静默」的载体——被缓冲就等于没说过。
+        print(
+            f"[注意] 前端还没构建（找不到 {WEB_DIST / 'index.html'}）。\n"
+            f"  服务仍会启动，但页面只会显示一行提示。构建：\n"
+            f"      cd web && npm install && npm run build",
+            flush=True,
+        )
+
+    app = create_app(config)
+    print(f"VIGIL 服务：http://{args.host}:{args.port}", flush=True)
+    if args.host == "127.0.0.1":
+        print(
+            "  （只监听本机——手机访问见 spec §4.7：tailscale serve 代理本端口）",
+            flush=True,
+        )
+    uvicorn.run(app, host=args.host, port=args.port, log_level="warning")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="vigil", description="VIGIL 守夜人")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -467,6 +498,11 @@ def main(argv: list[str] | None = None) -> int:
     )
     p_dl.add_argument("--apply", action="store_true", help="真的写库（默认只报告）")
     p_dl.set_defaults(func=cmd_deadline_audit)
+
+    p_serve = sub.add_parser("serve", help="起本地 Web 服务（只读库）")
+    p_serve.add_argument("--host", default="127.0.0.1", help="监听地址")
+    p_serve.add_argument("--port", type=int, default=8787, help="端口")
+    p_serve.set_defaults(func=cmd_serve)
 
     p_digest = sub.add_parser("digest", help="日报：把 items 合成一天一页 Markdown")
     p_digest.add_argument("--date", help="日报日期 YYYY-MM-DD（默认昨天）")
