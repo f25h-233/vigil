@@ -12,14 +12,15 @@
 from __future__ import annotations
 
 import datetime as dt
+import pathlib
 import sqlite3
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import Body, FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse, HTMLResponse
 
-from . import store
+from . import overrides, store
 from .categories import load_categories
-from .config import REPO_ROOT, Config
+from .config import REPO_ROOT, Config, Person, load_persons, save_persons
 
 WEB_DIST = REPO_ROOT / "web" / "dist"
 
@@ -92,6 +93,24 @@ def _day_of(ts: int) -> str:
     return dt.datetime.fromtimestamp(ts).strftime("%Y-%m-%d")
 
 
+def _reject_controls(value: str, field: str) -> None:
+    """`label` / `note` 里有换行或别的控制字符 ⇒ **400**（R10：转义与拒绝各管一半）。
+
+    ⚠️ `config._toml_str` 已经能把这些字符**转义**成合法 TOML 并按原样读回来
+    （那是 T7 完成的另一半），但「存得进去」不等于「应该存」：
+    `config/*.toml` 是**人手输**的，把一个换行静默存进一个"名字"里、
+    再在界面上错乱显示，是**最不诚实**的做法——而它一旦落盘，
+    只能靠人肉去看那个文件才发现得了。
+    名字/备注里要换行没有任何正当用途，所以这里选择**响亮地拒绝**。
+    """
+    if any(ch < " " or ord(ch) == 0x7F for ch in value):
+        raise HTTPException(
+            status_code=400,
+            detail=f"{field} 里不能有换行/控制字符（C0 与 DEL）——"
+            "名字里要换行没有任何正当用途，静默存下去只会在界面上错乱显示",
+        )
+
+
 def create_app(config: Config) -> FastAPI:
     app = FastAPI(title="VIGIL 守夜人", docs_url=None, redoc_url=None)
 
@@ -100,6 +119,22 @@ def create_app(config: Config) -> FastAPI:
     names = {g.id: g.name for g in config.groups}
     cats = load_categories()
     cat_by_slug = {c.slug: c for c in cats}
+
+    # ⚠️ overlay 的**文件**在这里就位（D11 允许 Web 写 overlay）。之后每个
+    # 请求的 `store._ensure_overlay(conn)` 才能无条件 ATTACH。
+    # ⚠️ **不能**在这里调 `store.ensure_schema`——那是写 `vigil.db`，
+    # 而本文件的连接是 `mode=ro`（见 connect() 的 docstring）。
+    overrides.ensure_schema()
+
+    def persons_path() -> pathlib.Path:
+        """⚠️ 路径**每次现读** `REPO_ROOT` 全局，不许在 `create_app` 时算好冻进闭包。
+
+        这与 `WEB_DIST` 的既有教训是同一件事（`api.py:289-292` 的 docstring 专门记过）：
+        冻住的话，测试里 `monkeypatch.setattr(api, "REPO_ROOT", tmp_path)` 就够不着它，
+        于是那些测试**测的还是仓库里真实的 `config/persons.toml`**——
+        **会往真仓库里写人**，而且因为它们总能读到点什么、于是全都变成「怎么改都绿」的空守卫。
+        """
+        return REPO_ROOT / "config" / "persons.toml"
 
     def connect() -> sqlite3.Connection:
         # ⚠️ 只开 `mode=ro`，且**绝不**在这里调 `store.ensure_schema`——
@@ -127,6 +162,7 @@ def create_app(config: Config) -> FastAPI:
             "group_id": it.group_id,
             "group_name": names.get(it.group_id, str(it.group_id)),
             "actor": it.actor,
+            "actor_uin": it.actor_uin,
             "place": it.place,
             "amount": it.amount,
             "links": list(it.links),
@@ -154,7 +190,8 @@ def create_app(config: Config) -> FastAPI:
 
     @app.get("/api/items")
     def api_items(
-        kind: str | None = None,
+        kind: list[str] = Query(default=[]),
+        person: list[int] = Query(default=[]),
         since: str | None = None,
         until: str | None = None,
         group: int | None = None,
@@ -169,7 +206,8 @@ def create_app(config: Config) -> FastAPI:
         try:
             items, total = store.search_items(
                 con,
-                kind=kind or None,
+                kinds=kind or None,
+                actor_uins=person or None,
                 since=_day_start(since) if since else None,
                 until=_day_start(until, plus_days=1) if until else None,
                 group=group,
@@ -214,6 +252,121 @@ def create_app(config: Config) -> FastAPI:
             return payload
         finally:
             con.close()
+
+    @app.post("/api/items/{item_id}/kind")
+    def api_set_kind(item_id: int, body: dict = Body(...)) -> dict:
+        """改一条条目的类目。**只写 overlay**（D11）。"""
+        kind = str(body.get("kind", "")).strip()
+        if not kind:
+            raise HTTPException(status_code=400, detail="kind 不能为空")
+        con = connect()
+        try:
+            if store.get_item(con, item_id) is None:
+                raise HTTPException(status_code=404, detail=f"没有这条条目：{item_id}")
+        finally:
+            con.close()
+        ov = overrides.connect()
+        try:
+            return {"edit_id": overrides.set_kind(ov, item_id=item_id, kind=kind)}
+        finally:
+            ov.close()
+
+    @app.delete("/api/items/{item_id}")
+    def api_delete_item(item_id: int) -> dict:
+        """软删一条条目（D15）。`msg_id` 从**源消息**取，用于"永不被重抽复活"。
+
+        ⚠️ **每一条源消息都要落墓碑**（E7）：`store.save_items` 的批内去重
+        **来源取并集**，所以一个 item 可以有 ≥2 条源消息。只墓碑化 `srcs[0]`
+        的话，`refine --redo` 重抽兄弟消息会让条目**以新 item_id 复活**（违反 D15）。
+        `overrides.delete_item` 的 `extra_msg_ids` 就是把这一点收在**唯一一条**
+        写路径里——多开一个"只墓碑化第一条"的函数，等于给后来者留一条静默退化的路。
+        """
+        con = connect()
+        try:
+            if store.get_item(con, item_id) is None:
+                raise HTTPException(status_code=404, detail=f"没有这条条目：{item_id}")
+            srcs = store.source_messages(con, item_id)
+        finally:
+            con.close()
+        ov = overrides.connect()
+        try:
+            return {
+                "edit_id": overrides.delete_item(
+                    ov,
+                    item_id=item_id,
+                    msg_id=srcs[0].msg_id if srcs else None,
+                    extra_msg_ids=[s.msg_id for s in srcs[1:]],
+                )
+            }
+        finally:
+            ov.close()
+
+    @app.post("/api/undo")
+    def api_undo(body: dict = Body(default={})) -> dict:
+        """撤销一条编辑。`edit_id` 缺省 = 撤最近一条。"""
+        target = body.get("edit_id") if isinstance(body, dict) else None
+        ov = overrides.connect()
+        try:
+            if target is None:
+                last = overrides.last_edit(ov)
+                if last is None:
+                    return {"undone": False}
+                target = last[0]
+            return {"undone": overrides.undo(ov, edit_id=int(target))}
+        finally:
+            ov.close()
+
+    @app.get("/api/persons")
+    def api_persons() -> dict:
+        # ⚠️ `path` **一处都不许省**：`DEFAULT_PERSONS` 是 import 期就冻住的常量
+        # （`config.py` 模块级），省掉 path 时读写都会落到**仓库里真实的**
+        # `config/persons.toml`，而 monkeypatch 拦不住它 ⇒ 测试全绿、
+        # 用户的真实名单却已经被整体替换掉了。
+        people = load_persons(persons_path())
+        con = connect()
+        try:
+            counts: dict[int, int] = {}
+            for p in people:
+                _, n = store.search_items(
+                    con, actor_uins=[p.uin], limit=1, offset=0
+                )
+                counts[p.uin] = n
+        finally:
+            con.close()
+        return {
+            "persons": [
+                {"uin": p.uin, "label": p.label, "note": p.note,
+                 "count": counts.get(p.uin, 0)}
+                for p in people
+            ]
+        }
+
+    @app.post("/api/persons", status_code=201)
+    def api_add_person(body: dict = Body(...)) -> dict:
+        uin = body.get("uin")
+        if not isinstance(uin, int) or uin <= 0:
+            raise HTTPException(
+                status_code=400,
+                detail="uin 必须是正整数（0 是匿名哨兵，不能监视）",
+            )
+        label = str(body.get("label", "")).strip()
+        if not label:
+            raise HTTPException(status_code=400, detail="label 不能为空")
+        note = str(body.get("note", ""))
+        _reject_controls(label, "label")
+        _reject_controls(note, "note")
+        path = persons_path()
+        people = [p for p in load_persons(path) if p.uin != uin]
+        people.append(Person(uin=uin, label=label, note=note))
+        save_persons(people, path)
+        return {"uin": uin, "label": label}
+
+    @app.delete("/api/persons/{uin}", status_code=204)
+    def api_del_person(uin: int) -> None:
+        path = persons_path()
+        people = tuple(p for p in load_persons(path) if p.uin != uin)
+        save_persons(people, path)
+        return None
 
     @app.get("/api/digests")
     def api_digests(limit: int = Query(30, ge=1, le=MAX_LIMIT)) -> dict:

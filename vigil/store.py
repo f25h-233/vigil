@@ -12,7 +12,7 @@ import contextlib
 import json
 import sqlite3
 import time
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from dataclasses import dataclass, replace
 
 STATUS_OK = "ok"
@@ -687,6 +687,7 @@ class ApiItem:
     deadline_ts: int | None
     group_id: int
     actor: str | None
+    actor_uin: int | None
     place: str | None
     amount: str | None
     links: tuple[str, ...]
@@ -744,6 +745,7 @@ _ITEM_COLS = (
     "i.item_id, COALESCE(ost.kind, i.kind) AS kind, i.title, i.detail, i.event_ts,"
     " i.deadline_ts, i.group_id,"
     " COALESCE(NULLIF(sn.group_nick, ''), NULLIF(sn.qq_nick, ''), '') AS actor,"
+    " sn.uin AS actor_uin,"
     " i.place, i.amount, i.links,"
     " (SELECT COUNT(*) FROM item_sources src WHERE src.item_id = i.item_id)"
     "   AS source_count"
@@ -791,7 +793,7 @@ def _parse_links(raw: object) -> tuple[str, ...]:
 
 def _to_api_item(row: tuple) -> ApiItem:
     (item_id, kind, title, detail, event_ts, deadline_ts, group_id,
-     actor, place, amount, links, source_count) = row
+     actor, actor_uin, place, amount, links, source_count) = row
     return ApiItem(
         item_id=item_id,
         kind=kind,
@@ -801,6 +803,7 @@ def _to_api_item(row: tuple) -> ApiItem:
         deadline_ts=deadline_ts,
         group_id=group_id,
         actor=actor or None,
+        actor_uin=int(actor_uin) if actor_uin is not None else None,
         place=place,
         amount=amount,
         links=_parse_links(links),
@@ -810,19 +813,34 @@ def _to_api_item(row: tuple) -> ApiItem:
 
 def _item_filters(
     *,
-    kind: str | None,
+    kinds: Sequence[str] | None,
+    actor_uins: Sequence[int] | None,
     since: int | None,
     until: int | None,
     group: int | None,
     q: str | None,
 ) -> tuple[list[str], list[object]]:
-    """拼 WHERE 片段。**关键词的两条路径在这里分岔**（trigram / LIKE）。"""
+    """拼 WHERE 片段。
+
+    ⚠️ **维度内并集、维度间交集**（spec §四 #4）：
+    `kinds` 之间是 OR、`actor_uins` 之间是 OR，而两组之间是 AND。
+    写成"全部 OR 到一起"是最容易犯的错，也是这个函数唯一的语义要点。
+    """
     where: list[str] = [_NOT_DELETED]
     params: list[object] = []
-    if kind:
+
+    if kinds:
         # ⚠️ 按**覆盖后**的类目筛——否则界面上改了分类却筛不出来。
-        where.append("COALESCE(ost.kind, i.kind) = ?")
-        params.append(kind)
+        marks = ",".join("?" * len(kinds))
+        where.append(f"COALESCE(ost.kind, i.kind) IN ({marks})")
+        params.extend(kinds)
+    if actor_uins:
+        # ⚠️ `uin` 只在 `sender_names` 里（`items` 存的是 `actor_uid`）。
+        # 这也是 `search_items` 的 COUNT **必须**带上同一个 LEFT JOIN 的原因：
+        # 少一个 `sn` 就是 `no such column: sn.uin`（两处并排写着就是为了让人看见）。
+        marks = ",".join("?" * len(actor_uins))
+        where.append(f"sn.uin IN ({marks})")
+        params.extend(actor_uins)
     if since is not None:
         where.append("i.event_ts >= ?")
         params.append(since)
@@ -859,7 +877,8 @@ def _item_filters(
 def search_items(
     conn: sqlite3.Connection,
     *,
-    kind: str | None = None,
+    kinds: Sequence[str] | None = None,
+    actor_uins: Sequence[int] | None = None,
     since: int | None = None,
     until: int | None = None,
     group: int | None = None,
@@ -875,14 +894,20 @@ def search_items(
     """
     _ensure_overlay(conn)
     where, params = _item_filters(
-        kind=kind, since=since, until=until, group=group, q=q
+        kinds=kinds, actor_uins=actor_uins,
+        since=since, until=until, group=group, q=q,
     )
     clause = (" WHERE " + " AND ".join(where)) if where else ""
     # ⚠️ 总数也要走同一套 JOIN/过滤——否则分页与「共 N 条」会说谎。
+    # ⚠️ 这里的 FROM 必须与 `_ITEM_JOINS` **逐字一致**（人物筛选用到 `sn.uin`）：
+    # 两处并排写着，就是为了让「改了一处忘了另一处」一眼可见。
     total = int(
         conn.execute(
-            f"SELECT COUNT(*) FROM items i"
-            f" LEFT JOIN ov.item_state ost ON ost.item_id = i.item_id{clause}",
+            "SELECT COUNT(*) FROM items i"
+            " LEFT JOIN sender_names sn"
+            "   ON sn.group_id = i.group_id AND sn.uid = i.actor_uid"
+            " LEFT JOIN ov.item_state ost ON ost.item_id = i.item_id"
+            f"{clause}",
             params,
         ).fetchone()[0]
     )

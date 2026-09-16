@@ -231,3 +231,59 @@ def test_daily_digest_control_without_the_overlay(scene, monkeypatch, tmp_path):
     body = (scene.out_dir / "2026-09-14.md").read_text(encoding="utf-8")
     assert "办卡" in body
     assert empty.is_file(), "读取路径应当把缺失的 overlay 库就位"
+
+
+# ── ④ T8 的写端点：干预的**第三个入口**（HTTP），两个消费方都要同效 ──────
+
+
+def test_http_write_endpoints_drive_both_consumers(scene, monkeypatch):
+    """⭐ 在 Web 上删/改（走 T8 的 HTTP 端点），日报侧必须**同效**。
+
+    与 ①② 的分工：那两条把干预**直接写进 overlay**（`overrides.delete_item(...)`），
+    这条走**产品自己的 HTTP 端点**。没有这条，「端点的写入落到了哪条连接、哪个库」
+    就没人验过——`create_app` 里的 `overrides.ensure_schema()` 与端点里的
+    `overrides.connect()` **各自读一次** `OVERRIDES_DB` 全局，任何一处被冻进闭包
+    （或写死成真实 `data/` 路径），Web 侧自己的测试**照样全绿**，
+    而日报（另一条连接）什么都看不到。
+
+    ⚠️ 走 `db_path` 进 `digest.digest`（不是传内存 conn）：这是另一个进程内入口、
+    自己开连接、自己 ATTACH overlay（R4 补的 `uri=True`）。
+    """
+    fake = _StubLLM([{"quotes": ["办卡广告"], "label": "办卡", "text": "速办"}])
+    monkeypatch.setattr("vigil.digest.chat_json", fake)
+    client = TestClient(create_app(scene.cfg))
+
+    # ① 用**端点**落两条干预：删 item 1（09-14 那天唯一一条）、把 item 2 改成 academic
+    assert client.delete("/api/items/1").status_code == 200
+    assert client.post(
+        "/api/items/2/kind", json={"kind": "academic"}
+    ).status_code == 200
+
+    # ② Web 侧：与端点写的一致
+    payload = client.get("/api/items").json()
+    assert payload["total"] == 2
+    assert {i["item_id"] for i in payload["items"]} == {2, 3}
+    assert client.get("/api/items", params={"kind": "academic"}).json()["total"] == 1
+
+    # ③ 日报侧：09-14 变成空窗、**不调模型**
+    since, until = _window(14, 9)
+    stats = digest.digest(
+        scene.cfg, api_key="k", db_path=scene.db, since=since, until=until,
+        day_label="2026-09-14", output_dir=scene.out_dir,
+    )
+    assert stats.items == 0, "HTTP 端点删掉的条目不许进日报（R13）"
+    assert fake.calls == 0, "窗口里没有可见条目 ⇒ 不该调模型"
+    body = (scene.out_dir / "2026-09-14.md").read_text(encoding="utf-8")
+    assert "办卡广告" not in body
+
+    # ④ 改分类那条：日报的**读取路径**（`window_items`）看到的是**新**类目
+    con = sqlite3.connect(f"file:{scene.db.as_posix()}?mode=ro", uri=True)
+    try:
+        got = {
+            w.item_id: w.kind
+            for w in store.window_items(con, since=_D13, until=_D13 + 3600)
+        }
+    finally:
+        con.close()
+    assert got.get(2) == "academic", "HTTP 端点改的类目没进日报的读取路径"
+    assert 1 not in got, "被端点软删的条目还在日报的读取路径里"

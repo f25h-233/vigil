@@ -822,3 +822,54 @@ def test_deadline_audit_dry_run_is_read_only_so_it_does_not_take_the_lock(
             "只读的核验被锁挡住了——那不是「有人在写」，是假拒绝"
         )
     assert _deadline_ts_of(db) == ts, "dry-run 一个字都不许改库"
+
+
+def test_soft_deleted_item_still_shows_up_in_deadline_audit(cli_env, monkeypatch, capsys):
+    """⑤ `deadline-audit` **刻意不接 overlay**——这个决定必须有守卫（T5 审查的结论）。
+
+    它是**对底层数据的核验**（「这条 item 的截止日在源文里有没有依据」），不是视图：
+    它就该看真实的 `items`——包括已软删的那些。软删只是「界面上别显示」，
+    源文与截止日的矛盾**照样存在**，核验命令看不到它才是错的。
+
+    ⚠️ 这条守卫还替一个**更重的**事实站岗：`cli.py` 里那个
+    `SELECT title FROM items WHERE item_id = ?` 后面直接是 `.fetchone()[0]`。
+    T5 审查实测：**给 `items_with_deadline` 接上 overlay 反而会崩**——
+    软删之后这条查询返回 `None`，`[0]` 抛 `TypeError`。
+    所以「不接」不是遗漏，是判断；而判断需要有东西钉住。
+
+    变异「在 `cmd_deadline_audit` 的查询里过滤软删」→ 本条红
+    （标题不再出现在输出里）。
+    """
+    import sqlite3 as _sq
+
+    from vigil import overrides, store
+
+    db = cli_env / "export.db"
+    _seed_unverifiable_deadline(db)
+    monkeypatch.setattr(cli, "_load_config_only", lambda: _config(cli_env))
+    monkeypatch.setattr(cli, "_require_export_db", lambda config: db)
+
+    overrides.ensure_schema()
+    w = overrides.connect()
+    try:
+        overrides.delete_item(w, item_id=1, msg_id=1, actor="test")
+    finally:
+        w.close()
+
+    # **效果对照**：软删在视图层确实生效——否则下面那句「照旧出现」证明不了因果。
+    # ⚠️ 用 `window_items`（日报的读路径，overlay 感知）而不是 `get_item`：
+    # 后者会 JOIN `sender_names`，而 `_seed_unverifiable_deadline` 只建了 `messages`
+    # （那是 export.py 的产物）——那会变成一条与本条要守的东西无关的红。
+    ro = _sq.connect(f"file:{db.as_posix()}?mode=ro", uri=True)
+    try:
+        visible = [w.item_id for w in store.window_items(ro, since=0, until=2**31)]
+    finally:
+        ro.close()
+    assert 1 not in visible, "软删没生效——这条守卫是空的"
+
+    assert cli.main(["deadline-audit"]) == 0
+    out = capsys.readouterr().out
+    assert "某通知" in out, (
+        "deadline-audit 看不到被软删的条目了。它刻意不接 overlay（对底层数据的核验）："
+        "软删只是「界面别显示」，源文与截止日的矛盾照样存在"
+    )
