@@ -1,206 +1,227 @@
-# VIGIL 进度接力 — M3 完成 / M4 待启动
+# VIGIL 进度接力 — M4 完成 / M5 待启动
 
-> **钩子：新会话先读此文件，再读 `docs/superpowers/specs/2026-09-13-vigil-product-layer-design.md`（§4.8 与 §5 的 M4 节）。**
-> 最后更新：2026-09-16　｜　M3 模式：SDD **wave**（收窄为 2 道）　｜　仓库：`https://github.com/f25h-233/vigil`（private）
+> **钩子：新会话先读此文件，再读 `docs/superpowers/specs/2026-09-13-vigil-product-layer-design.md`（§8.1 与 §9）。**
+> 最后更新：2026-09-16　｜　M4 模式：SDD **wave**（三波 3/2/3，p 全 0）　｜　仓库：`https://github.com/f25h-233/vigil`（private）
 
 ---
 
 ## 一句话
 
-**M3「Web 前端 + PWA」完成——spec §5 五条出口标准全过**（3/4/5 由 PC 侧实测，1/2 由用户手机确认「可添加到主屏」）。
-下一步是按 spec §4.8 写 **M4「自动化」** 计划：任务计划程序每日 `export → refine → digest`。
+**M4「自动化」完成——spec §5 三条出口标准 ①②③ 全部通过**（②③ 由 PC 侧实测；① 的「产出日报」与「无人干预」都实测通过，
+**只有「连续 24 小时」标 ⏸ 待你确认**）。下一步按 spec 走 **M5**：**前端可编辑 + 多维筛选**（范围见 §四）。
 
 ---
 
 ## 当前工作区的真实状态（**以此为准，别凭印象**）
 
 ```
-HEAD      6c0b24a（已推 origin/master，与远端同步、零遗留）
-tests     328 Python passed + 11 前端 vitest
+HEAD      8eadda3（已推 origin/master，与远端同步、零遗留）
+tests     422 passed（M3 收尾时是 328）
 data/vigil.db
-  messages     47,719      items      270      refine_runs 47,719    item_sources 270
-  digests           4      digest_items  21
-  带截止日的 items  13（全部有源文字面依据——M1 的 26 条已核验降级，见 §M3 交付）
-docs/digests/  2026-08-08 / 2026-09-11 / 2026-09-12 / 2026-09-13
-前端构建   web/dist/  180 模块（gitignore，不入库）
+  messages     49,434      items      325      refine_runs 49,434    item_sources 325
+  digests           5      digest_items 34
+docs/digests/  2026-08-08 / 09-11 / 09-12 / 09-13 / **09-15**（M4 产出的第一篇）
+data/logs/     vigil-2026-09-16.log（LAST-ERROR.txt 已被成功运行清掉）
+任务计划       VIGIL每日管线 · Next Run 2026/9/17 08:00 · Status Ready
+真库备份       data/vigil.db.bak-m4-smoke-20260916-165727
 ```
 
-**归档不变量**（M4 开始每天追加后，这是「归档是否完整」的唯一机械判据）：
-**`docs/digests/` 的文件集合 == 库里 `digests` 的窗口日期集合**，且文件与 `body_md` 逐字节相等。
+**归档不变量**（M4 起每天追加，这是「归档是否完整」的唯一机械判据）：
+
+> **`docs/digests/` 的文件集合 == 库里 `digests` 的窗口日期集合，且文件与 `body_md` 逐字节相等。**
+
+⚠️ **这条现在对 git 免疫了**（`.gitattributes` 给 `docs/digests/*.md` 定了 `text eol=lf`，M4 终审 U-6），
+**但跑该判据前仍不要做会重新检出这些文件的 git 操作**——注记在计划 §6.4(a)。
 
 ---
 
-## ⚠️ M4 开工前**必须先处理**的两条
-
-### 1. 已经铺好的路：怎么跑一次完整管线
-
-```bash
-cd D:/github/VIGIL
-uv run vigil serve --host 127.0.0.1 --port 8787   # 后端 + 前端静态托管
-tailscale serve --bg 8787                        # 手机 HTTPS 入口
-# 手机：https://f15h.tail324373.ts.net
-```
-
-**Tailscale 的坑（最容易误判成"中国区网络问题"）**：`tailscale serve --bg 8787` 会
-**挂死 90 秒、无输出、无报错**——因为 `serve` 默认 HTTPS 模式、卡在等证书。
-诊断命令是 `tailscale cert f15h.tail324373.ts.net`（会回 `your Tailscale account does not support getting TLS certs`）。
-解法：<https://login.tailscale.com/admin/dns> → HTTPS Certificates → Enable（本机已于 2026-09-16 开启）。
-**HTTPS 不是锦上添花**：Service Worker 要安全上下文，没 HTTPS 就没有 PWA。
-
-### 2. M4 的**天然前提**：日志模块（spec 记在「前置工作 Step Zero」0.7，明确移入 M4）
-
-现在**全靠 `print()`**，而 M4 要挂机无人值守 ⇒「日志落文件 + 失败可见」是自动化能不能成立的前提。
-`data/logs/vigil-YYYY-MM-DD.log` + 非零退出 + `data/logs/LAST-ERROR.txt`（spec §4.8 原文）。
-
----
-
-## M3 出口标准 · 用户判定
-
-spec §5 五条，**证据全文**在
-`.superpowers/sdd/2026-09-15-vigil-m3-web-pwa/smoke-report.md`（含每格的证据形态：进程输出 / DOM 实测 / 截图）。
-
-| # | 标准 | 结论 |
-|---|---|---|
-| 1 | 手机通过 Tailscale HTTPS 打开 | ✅ 用户手机确认 |
-| 2 | 添加到主屏幕后独立图标、全屏 | ✅ 用户确认「可添加到主屏」（`display:standalone` 那条**未单独复核**） |
-| 3 | 按七个类目筛选正确 | ✅ 「学业」→ 共 **59** 条（与真库 `academic` 计数一致） |
-| 4 | 中文关键词搜到东西 | ✅ 短词「选课」**8** 条（LIKE 路径）+ 长词「校园卡」**42** 条（trigram 路径） |
-| 5 | 点任意 item 看到源消息原文 | ✅ 含**失败 → 重试 → 真数据回来**的完整回路 |
-
-**三个前端视图有史以来第一次在浏览器里渲染**：零 console 错误、零未捕获 JS 异常、零失败请求。
-
----
-
-## M3 交付了什么
+## 一、M4 交付了什么
 
 | 命令 / 产物 | 说明 |
 |---|---|
-| `vigil serve [--host] [--port]` | 只读 FastAPI 服务 + `web/dist` 静态托管 + SPA 兜底 |
-| 5 个只读端点 | `/api/items`（含搜索/筛选/分页）、`/api/items/{id}`、`/api/categories`、`/api/digests`、`/api/digests/{id}` |
-| React + Vite + TS + Tailwind 前端 | 三块视图（信息流 / 类目 / 日报）+ `ItemCard` 源消息回溯 + PWA manifest/SW |
-| FTS5 + trigram 搜索 | **短词（<3 字）走 LIKE 兜底**——trigram 对短词**静默返回 0**，这是只有真跑才现形的缺陷 |
-| `vigil deadline-audit` | 截止日核验；**13 条无依据的已置 NULL**（26 → 13），并接进 refine 写入路径 |
+| `vigil daily` | **每日管线入口**：`export → refine → digest` 一条命令；逐阶段记账、失败继续、返回最坏状态 |
+| `scripts/vigil-daily.cmd` | 任务计划的入口（ASCII-only；含"Python 没起来"的兜底） |
+| `scripts/register-task.ps1` | 幂等注册任务（`VIGIL每日管线`，每日 08:00） |
+| `vigil/logs.py` | 日志：按日轮转文件 + `LAST-ERROR.txt` + `emit`（stdout 原文 + 文件带时间戳） |
+| `vigil/lock.py` | 单实例锁（OS 级字节范围锁，**强杀后由内核回收**） |
+| 退出码契约 | `0` 成功 / `1` 失败或参数配置错误 / **`2` 已有实例在跑（不是错误）** |
+| 写入原子化 | `items`+`refine_runs` 同一事务；`save_digest` 的 DELETE/INSERT 同一事务 |
 
-**M3 的真实教训（代码层）**：
-1. **SPA 兜底会吞掉 PWA 全部静态文件**（`sw.js`/manifest/图标返回 200 的 index.html）——
-   浏览器把 HTML 当 manifest 解析、当 SW 注册，**而所有状态码都是 200、日志上一个异常都没有**
-2. **裸查询串喂 MATCH 会抛 OperationalError**（用户打个引号就 500）→ 短语包裹 + LIKE 转义
-3. **`strptime().timestamp()` 对合法日期也会抛 `OSError`**（`"1970-01-01"`——模型最常用的 null 哨兵），
-   而它在每批 try/except **之外** ⇒ **一个模型输出掀掉整轮 refine**
+**出口证据全文**：`.superpowers/sdd/2026-09-16-vigil-m4-automation/smoke-report.md`
+（每格注明**证据形态**；`review-final.md` 是终审报告）。
 
 ---
 
-## ⭐ M3 最重要的一条设计判断：**没有单一所有者的缺陷，分块审查看不见**
+## 二、⏭ 带进 M5 的遗留（**按优先级**）
 
-全分支 opus 终审抓到的 **4 条 Important，共同结构是「没有哪个任务同时拥有它」**：
+### 1. ⭐ **`items` 无批内去重**（用户裁定「记进 M5，本轮不动」）
 
-| 缺陷 | 为什么任务级审查必漏 |
+真库 325 条 items 里有 **1 组重复**：`item 290` 与 `item 296` **同标题、同 `event_ts`、同群**，
+`created_at` **同秒** ⇒ 同一次 `save_items` ⇒ **同一批**，且**来源是同一条消息**
+（`7685735400902931272`）。
+
+> **机理**：模型在一次响应里把同一条消息抽了两遍，而 `save_items` 没有批内去重。
+> `items` 表按设计没有唯一键（防重复**完全**靠 `refine_runs` 记账跟得上）。
+
+**不是 M4 引入的**（M1 时代的缺失），**也不是 spec §4.8 要的「幂等」**（那条验的是"三次**跑**"，已通过）。
+**修法方向**：`produced` 落库前按 `(title, event_ts, group_id)` 批内去重（~3 行）；
+或给 `items` 加唯一约束——**会与「抽取是视图、不是加工后销毁原件」的既有设计冲突，需权衡**。
+
+### 2. **终审 triage 的「留在下一个里程碑」11 条**
+
+详见 `.superpowers/sdd/.../review-final.md` §四。最值得先做的三条：
+
+| 项 | 说明 |
 |---|---|
-| `_day_start` 能被用户输入换 500 | `_parse_day`（400）与 `_day_start`（日期算术）在同一任务里被当成"同一个校验" |
-| `_parse_deadline` 一个模型输出掀掉整轮 | 是 **M1 留下的保护圈缺口**，M3 只是往里又塞了一个调用点 |
-| `ItemCard` 源消息失败后死路 | 三个视图的重试各由 T5/T6 写，而它是 T4 的「共用组件」——**没哪个任务同时拥有这四处**。**而它正是出口标准 5 本身** |
-| `/api/digests` 零字段断言 | 契约测试归 T3、视图归 T4，**"冻结契约"的覆盖面从来没人整体核对** |
+| **U-4 `groups` 与 `export` 共用 `data/cache/nt_msg_clear.db`** | 两侧都不拥有那个文件；`qqdb.strip_fake_header` 是**就地截断重写**（无临时文件/无原子改名/无锁）。**最坏后果**：导出中途读到被替换的库 ⇒ 分块回退把失败算成 `skipped_count` ⇒ **那部分消息静默消失，还被报告成「QQ 库物理坏页」** |
+| **`_MIME` 守卫里 `.lower()` 无判据**（`api.py`） | 现行代码正确，缺的是"大小写变体"的判据 |
+| **文档退出码表**与 §三 3.4 的措辞对齐 | 已在终审修复 B 里改过一轮，复核一轮 |
 
-> **这就是最后那道全分支审查不能省的理由。** 与「假绿/空守卫」是**两个不同的问题**。
+### 3. **⏸ 两条没取到直接证据的**
+
+- **`StartWhenAvailable` 的「睡眠错过 → 唤醒补跑」**：设置值已核实（`<StartWhenAvailable>true</StartWhenAvailable>`），
+  **行为未验**（要真让机器睡过触发时刻再唤醒）
+- **「连续 24 小时无人干预」**：短触发器自触发已实测通过，连续 24h 待你确认
+
+### 4. **M2/M3 的老清单**：M4 动了 M3-1 / M3-2 / M2-3 / M2-4 / M2-7，其余原样带过来（见 M3 接力）
 
 ---
 
-## 已知缺陷（**带着走，别当它完美**）
+## 三、⭐ M4 最贵的五条教训（**都已进 `vigil-sdd-lessons` 记忆**）
 
-**M3 新增 5 条**（证据在 `smoke-report.md` §六）：
+### 1. **「记下来了」不等于「派下去了」——计划的「发现」节必须与「任务」节双向覆盖**
 
-| # | 项 |
+M4 唯一那条 **Critical**（`export.py` 的整群静默消失）**在规划期就被发现、写进了计划 §二 发现 3**，
+然后……**它没有变成任何任务**，§7.1 的 spec 覆盖对照表里也没有它。
+
+> 后果：`cmd_export` 退 0、`daily` 跳过 digest 的判据失效、**日报照写**——
+> 以「这天很安静」的口气叙述一个**整个群没读进来**的日子，而出口标准①的全部判据都会通过。
+
+**⇒ 下次写计划时：「发现」节里每一条要么有归属任务，要么显式标注"本里程碑不做且因为 X"。**
+（这与记忆里那条「已记录的教训不会自动执行」是同族。）
+
+### 2. ⭐ **「判据本身不可信」的五个形态**（本轮一次收齐）
+
+| 形态 | 实例 |
 |---|---|
-| M3-1 | **`_MIME` 的「键缺失」无守卫**：删掉 `_MIME[".js"]` 后 Starlette 回落 `mimetypes.guess_type`（实测 `('text/javascript', None)`），测试**照样绿**；而删键会同时破坏"缺文件宁 404"分支。**改值被抓、删键漏网** ← 建议 M4 优先 |
-| M3-2 | `except` 分支里的 `store.record_run` 仍裸奔（库坏到写不进去时异常仍逃出 `refine()`）——与 LLMError 分支暴露面相同，没把洞挖大 |
-| M3-3 | 捕宽 `Exception` 会吞 `MemoryError`/`RecursionError`（`BaseException` 不受影响） |
-| M3-4 | `ItemCard` 无 `seq` ref——复审论证**在本组件内不可达**（一个卡片实例终生只对一个 item 发请求） |
-| M3-5 | `test_refine_keeps_going...` 断言了错误文案前缀「第 1 批」——改文案会红（轻耦合） |
+| 变异**存活** | 删掉 `_MIME[".js"]` 后旧测试照样绿（M3-1） |
+| **测试装置自带的行为替代了被测行为** | pytest 9.1.1 的 `LogCaptureHandler.handleError` **就是 `raise`** ⇒ 判据单跑红、整文件跑绿（T1 重开） |
+| **成功路径根本不调那个东西** | emit 替身测试在成功路径上从不触发 ⇒ 假绿（T8） |
+| **变异脚本写错行** | `15 failed` 看着"很有牙"，其实根本没改到目标（T6） |
+| **文本替换静默失效** | 在 CRLF 文本里做替换 ⇒ 四条全"符合预期"（终审修复 A） |
 
-**M2 记的 8 条**——⚠️ **M3 只动了第 1 条（已修：26 条 → 13 条，其余各条 M3 未触碰相关文件，但没复核**。
-本项目出过"没人复核的清单会烂掉"（两条过期快照）的先例，**开工前请各花一分钟核对**）：
+**⇒ 纪律升级**：**变异之后、跑测试之前，必须有"替换生效"的锚点断言**——
+**光是"打印被改的那几行"不够**（打印出来的东西看着像改了、其实没改）。
 
-1. ~~`items.deadline_ts` 半数不可信~~ → **M3 已修**（数据层核验 + 接进写入路径 + 同一性守卫）
-2. **M1 补出的日期在正文里仍可见**：9/13「课程安排：第五周开课」正文的「今日（9月14日）」，
-   源文只有「今天上午有一节课第五周开」。**走的不是 deadline 路径，所以那轮核验管不到**
-3. **`vigil refine` 仍有全角引号退化隐患**：全库 **25 条**消息含 `“ ”`，会让模型退化成无限空格循环。
-   M2 只在日报载荷侧修了（`sanitize_for_llm`），**refine 侧未修**
-4. **`refine.py` 日志与日报同名不同义**：日志「本地丢弃 83」只算**硬丢弃**，日报「本地筛掉 1,014」含「没命中保留规则」——**差 12 倍**
-5. **`PROMPT_VERSION` 的 payload 侧无自动守卫**：指纹只覆盖 `build_system_prompt`
-6. **汉字日期写法无数字边界**：`1月6日` 会在 `11月6日` 里命中；点号写法引入新假阳性面（全库 87 处 `M.D` token）
-7. **Task 12 的覆盖率分支今天不可达**：51 个有数据的日子覆盖率**全 100%**——**这条限定是 M4 才会唤醒的**
-8. **日报措辞不可复现**：结构幂等 ≠ 字节幂等（temperature 0.1 ≠ 0）。**不能用 sha256 证明「LLM 产物没被改动」**
+### 3. **错的论证留在代码里，比没有论证更危险**
+
+同一条论证我犯了三次：M2-3 的"对称剥离所以不会误归属"**逻辑上被推翻**（反例可构造且实跑成立），
+只是**在真实语料上恰好安全**（全库 47,719 条，新增歧义簇 = 0）。
+⇒ 裁定结果站得住，但**理由必须换成"实测"，并写明"日后扩大字符集必须重跑同一测量"**。
+
+### 4. **「设置写对了」≠「行为对了」**（T2 的电源设置那条）
+
+`<StartWhenAvailable>true</StartWhenAvailable>` 是**设置正确**；
+「睡眠错过之后真的会补跑」是**行为正确**。**两件事要分开取证**——
+前者 `/xml` 一读就有，后者要真睡一夜。
+
+### 5. **为了并发安全而加的锁，会把测试变成环境相关的**
+
+F4 给人工命令也上了锁之后，`cli_env` 那批用例**碰到了真实的 `data/vigil.lock`**。
+后果：**"恰好有实例在跑"时那些测试会拿到退出码 2 而莫名变红**，
+且红的 5 条名字里全写着"退出码""密钥"——**看着像产品缺陷**。
+已由 `tests/conftest.py` 的 autouse 夹具挡住（并把 `LOCK_PATH` 指向 `tmp_path`）。
 
 ---
 
-## 关键文件地图
+## 四、M5 范围（**用户 2026-09-16 口头裁定，规划期第一件事是确认**）
+
+| # | 功能 | 需要先定的 |
+|---|---|---|
+| 1 | 前端「**新增监视群号**」 | **会打破 M3 的机械不变量**（"绝不让 Web 侧写 `data/vigil.db`"，靠 `mode=ro`）。要回答"Web 侧能写什么"——写 `config/groups.toml` 是最省的（可不碰 DB）。<br>⚠️ **实际后果**：下次 `export` 会拉一整批新群的历史 → 慢、走 LLM、可能整群读不到。**M4 的日志/LAST-ERROR/非零退出正是让这件事看得见的东西** |
+| 2 | 前端「**新增监视人物**」 + 「按人物筛选」 | ✅ **语义已裁定**：`items.actor_uid` = 源消息发信人（`refine.py:234`）= **发布人**，不是"信息是关于谁的"。用户明确接受 ⇒ **零重抽成本** |
+| 3 | 类目**多选**（维度内并集） | 设计已清楚：`kind IN (...)` |
+| 4 | 人物维度**跨维度交集** | `kind IN (...) AND actor_uid IN (...)`——维度内并集、维度间交集，不与类目体系冲突 |
+
+**API 现状**：`/api/items` 的 `kind` 是**单值** `str | None`，要改成多值。
+
+---
+
+## 五、已经铺好的路：怎么跑 / 怎么重启
+
+```bash
+cd D:/github/VIGIL && uv run vigil serve --host 127.0.0.1 --port 8787   # 后端 + 前端静态托管
+tailscale serve --bg 8787                                               # 手机 HTTPS 入口
+# 手机：https://f15h.tail324373.ts.net
+
+uv run vigil daily          # 手动跑一次完整管线（任务计划跑的是 scripts/vigil-daily.cmd）
+Get-ScheduledTaskInfo -TaskName "VIGIL每日管线" | Format-List LastRunTime,LastTaskResult,NextRunTime
+tail -40 data/logs/vigil-$(date +%Y-%m-%d).log
+```
+
+**Tailscale 的坑**：`tailscale serve --bg 8787` 会**静默挂死 90 秒**（默认 HTTPS、卡在等证书）。
+诊断：`tailscale cert f15h.tail324373.ts.net`（回 `does not support getting TLS certs`）。
+解法：<https://login.tailscale.com/admin/dns> → HTTPS Certificates → Enable（**已于 2026-09-16 开启**）。
+
+**⚠️ 任务计划的两个坑**（M4 实测）：
+1. **`schtasks /change /tn … /st HH:MM` 会弹密码提示并挂死**（实测卡死 180s）。
+   可用替代：`Set-ScheduledTask -Trigger`，且 **`StartBoundary` 必须设未来时间**
+   （`StartWhenAvailable=true` 会让过去时刻立刻补跑一次完整管线）。
+2. **含中文的 `.ps1` 必须 UTF-8 BOM**——无 BOM 时任务名被**静默**注册成乱码，且**伪装成"注册成功"**。
+
+---
+
+## 六、SDD 执行方式（**M5 直接沿用**）
+
+- **模式按任务边界算**：M4 用 wave 三波（3/2/3），**p 全为 0、零越界**。
+  但**真实并行度只由写者表决定**——M4 三波分别只有 3/2/3 条道，不是"wave 更好"。
+  **M5 若只有 Python 一条链或有共享文件，就回 pipeline。**
+- **每任务 = brief → implementer → 审查 → 裁决 → fix → scoped re-review → 波级同步点**。
+- **派发时必带**（M1–M4 血泪，前 13 条见 M3 接力，M4 新增）：
+
+  14. ⭐ **「打印被改的那几行」不够**——必须有**可判定的锚点断言**（"替换生效"），
+      否则打印出来的东西看着像改了、其实没改
+  15. ⭐ **副本里跑测试只设 `PYTHONPATH` 不够**：`sys.path[0]=''`（cwd）**优先于**它。
+      **先 `cd` 进副本**并**断言 `vigil.<模块>.__file__` 的父目录就是副本根**，不满足就停
+  16. ⭐ **计划里的「发现」节必须与「任务」节双向覆盖**（见 §三 教训 1）
+  17. **brief 里的变异也要能在真实代码上跑起来**——写变异前先看目标函数的实际形状
+  18. **controller 给的代码片段/判据本身也会错**——M4 实测 **6 次**：
+      假绿判据、会削弱覆盖的替换片段、自相矛盾的约束、与冻结接口不符的要求……
+      **implementer 按实际修正并报告 = 正解，不记偏差**
+
+- **模型分配实测**：转录型 implementer 用 haiku/sonnet；**小 fix diff 的 scoped 复审用 haiku 足够**
+  （M4 实测产出不逊 sonnet，还做了 AST 证明与数字核对）；**最终全分支审查用 opus**。
+
+---
+
+## 七、关键文件地图
 
 | 路径 | 内容 |
 |---|---|
-| `vigil/api.py` | **M3 主体**：只读 FastAPI、5 个端点、`_MIME` 表、SPA 兜底（含三条边界守卫） |
-| `vigil/refine.py` | M1 主体 + M3 加了**每批本地后处理的保护圈**（"单批失败不中断整轮"） |
-| `vigil/store.py` | M1+M2+M3 累加：FTS5 索引、`search_items`、`window_items`、`save_digest` |
-| `vigil/deadline.py` | M3 新增：截止日**源文核验**（唯一实现，带同一性守卫） |
-| `web/src/` | M3 前端：`views/{Feed,Categories,Digests}.tsx` + `components/ItemCard.tsx` + `types.ts`（**冻结契约**） |
-| `vigil/digest.py` | M2 主体（831 行） |
-| `vigil/cli.py` | 命令入口：`export` / `refine` / `digest` / `serve` / `deadline-audit` |
-| `M2-验收材料.md` | **用户的判定原文在这里，别覆盖** |
-| `docs/superpowers/plans/*.md` | M1/M2/M3 计划（含探针实测、全部裁决、下个里程碑该复用的纪律） |
-| `.superpowers/sdd/2026-09-15-vigil-m3-web-pwa/` | M3 ledger + **`smoke-report.md`**（本地过程记忆，不入库） |
-| `vigil_exit_check.py` | M1 出口机械核验，改完提示词重跑后先跑它 |
+| `vigil/daily.py` | **M4 主体**：三阶段编排 + `RunReport`（失败语义见其 docstring） |
+| `vigil/logs.py` | 日志。**`emit` 的契约是「写不进就抛」**，靠 `handleError` 裸 `raise` 实现 |
+| `vigil/lock.py` | 单实例锁。**锁偏移是 `1_000_000` 不是 0**（Windows 强制锁会让另一句柄**读不了**被锁字节） |
+| `vigil/cli.py` | 四个写库命令**各持锁**；退出码 `0/1/2` |
+| `scripts/` | 任务计划三件套 |
+| `docs/SETUP-自动化.md` | 安装/验证/排障 |
+| `vigil/store.py` | `transaction()`（**`commit()` 在 `try` 里**）+ `save_*` 的 `commit=` 参数 |
+| `vigil/refine.py` | 批次写入同一事务；**成功话术在 `try` 之外**（否则报进度失败会把 ok 改记成 error） |
+| `.gitattributes` | `docs/digests/*.md text eol=lf` —— **归档不变量的免疫层** |
+| `.superpowers/sdd/2026-09-16-vigil-m4-automation/` | ledger（R1–R85）+ `review-final.md` + **`smoke-report.md`**（本地过程记忆，不入库） |
+| `docs/superpowers/plans/2026-09-16-vigil-m4-automation.md` | M4 计划。**§八 是执行期增补与作废表——读它，别照抄计划里的代码块** |
 
 ---
 
-## SDD 执行方式（**M4 直接沿用**）
+## 八、未尽事项
 
-- **模式：按任务边界算，别凭习惯**。M3 用 **wave 收窄为 2 道**（`vigil/**` ∥ `web/**`，跨语言零重叠），
-  **三个波打架率 p 全为 0、零越界**——但那是**写者表算出来的真实并行度只有 2**，不是"wave 更好"。
-  M1 上 wave 吃过亏（任务粒度太小）。**M4 若只有 Python 一条链，就该回 pipeline。**
-- 每任务 = brief → implementer → 审查 → 裁决 → fix → **scoped re-review**。
-- **派发时必带**（M1/M2 血泪 10 条）：
-
-  1. **变异反证必须加阳性对照**，否则「全红」不可信
-  2. **跑测前清 `__pycache__` + `PYTHONDONTWRITEBYTECODE=1`**——`.pyc` 只按 `(mtime 秒, 大小)` 校验，同尺寸变异同秒写入会**复用旧字节码**
-  3. **隔离副本要用 `git -c core.autocrlf=false -c core.eol=lf archive`**——默认产出 CRLF，不是被审字节
-  4. **副本里先自检 `vigil.__file__` 指向副本**——editable finder 会把 `vigil` 硬映射到工作区，不自检则**副本里所有变异都会「存活」**
-  5. **变异锚点写成脚本文件、不走命令行传**——Git Bash 向原生 python 传非 ASCII 参数会被**静默打空**
-  6. **锚点必须全局唯一**，并断言命中次数 ≥1
-  7. **不要在共享工作区里做变异**——会污染并发的其它 agent
-  8. **禁止在真库真窗口重跑已验收产物**——重跑会不可逆地刷新 `created_at`/`digest_id`。证明 LLM 产物未变只能用**隔离副本 + 冻结模型 A/B**
-  9. **文件级 `git add`**，提交后 `git show --stat` 自查——`git add -A` 会卷入同事的未提交改动
-  10. **agent 断线后先查仓库再决定**，不靠自述
-
-- **M3 新增 3 条**（都是本轮实测，详见记忆 `vigil-sdd-lessons` 十八至二十一）：
-
-  11. ⭐ **判据的可判定性**——写断言前先问「**这段代码若是坏的，这个断言会怎样？**」
-      答不上来（"两种情况下都长这样"）就不是判据。**这是变异反证的「上游」**：
-      当测试环境让两种行为产出同一现象时，**变异反证会给出假安全**。
-      （M3 实例：C-1 冒烟判据用"仍显示失败态"，而服务停着时重发与不重发**屏幕一模一样**；
-      改判据为**数请求条数**后才可判定）
-  12. ⭐ **brief 自相矛盾时，「驳回 + 出证据」> 「照做」**——派发词固定加
-      「**若需求自相矛盾或无法同时满足 → 停下报告，不许挑一半照做**」。
-      （M3 实例：controller 的 B-1 测试配方与它自己指定的修法第一步不可能同时为真，
-      **照做会得到一个变异下不变红的"验收核心"**）
-  13. **解释任何耗时/现象之前先测一次**——"听着合理"不是解释。
+- §二 的 M5 遗留（1 条数据缺陷 + 11 条 triage + 2 条 ⏸）
+- `.superpowers/` 与 `_smoke/` 均**不入库**，是本地过程记忆
+- `/tmp` 下累积了 M1–M4 的过程产物（约数百 MB，含几个 71–217 MB 的临时 db）；
+  **C 盘紧张时值得清**，但**删之前先确认不是某个在跑的实验的输入**
 
 ---
 
-## 未尽事项
+## 九、方法论沉淀（详见记忆 `vigil-sdd-lessons`，已含 M1–M4）
 
-- 上述 **5 条 M3 新增缺陷 + 7 条 M2 遗留**（第 7 条正是 M4 会唤醒的）
-- M4 自身的前置：**日志模块**（spec §4.8）、`LAST-ERROR.txt`、幂等可重入验证
-- ledger 里的延迟清单（Minor，各任务审查留档）
-- `.superpowers/` 下的 workspace 与 `_smoke/` 均**不入库**，是本地过程记忆
-
----
-
-## 方法论沉淀（详见记忆 `vigil-sdd-lessons`，已含 M1/M2/M3）
-
-**M3 最贵的三条**：
-
-1. **判据的可判定性**（第十九条的上游问题，见上 11）
-2. **brief 自相矛盾**（见上 12）
-3. **没有单一所有者的缺陷，分块审查结构上看不见**——终审 4 条 Important 全是这一类
-
-**M2 最贵的三条**（仍然有效）：八条「验证工具本身不可信」；「结论对、依据错」四次；
-**已记录的教训不会自动执行**——教训要起作用，必须在**它适用的那个动作发生之前**被强制检索到。
+**M4 最贵的五条**见 §三。其中**最值得记住的是第 1 条**——
+它说明「审查层」也有结构性的盲区：**没有哪个任务拥有它，就没有任何审查会看它**。
