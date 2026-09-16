@@ -11,7 +11,11 @@ REM ASCII-only on purpose: cmd.exe parses this file byte-by-byte in the OEM
 REM codepage. All human-readable Chinese output comes from Python instead.
 setlocal
 
-set "REPO=D:\github\VIGIL"
+REM Derive the repo root from THIS script's location (%~dp0 is the directory
+REM holding this .cmd, with a trailing backslash). Hardcoding an absolute path
+REM here would make -RepoPath a lie: the task would point at the new location
+REM while this file still cd'd to the old one.
+for %%I in ("%~dp0..") do set "REPO=%%~fI"
 set "LOGDIR=%REPO%\data\logs"
 set "ERRFILE=%LOGDIR%\LAST-ERROR.txt"
 

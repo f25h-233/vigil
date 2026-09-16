@@ -48,11 +48,15 @@ export   →   refine   →   digest
 
 ## 三、安装（注册任务）
 
+先 `cd` 到仓库根目录——脚本里用的是相对路径 `scripts/register-task.ps1`，
+直接在新开的 PowerShell 里粘贴下面第二行会找不到文件：
+
 ```powershell
+cd D:\github\VIGIL
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/register-task.ps1
 ```
 
-预期输出三步：`[1/3] 删除同名旧任务`、`[2/3] 注册任务`、`[3/3] 回读任务定义`，
+预期输出两步：`[1/2] 注册任务`、`[2/2] 回读任务定义`，
 最后一段是 `schtasks /query /v /fo LIST` 的原文，里面应能找到：
 
 ```
@@ -67,8 +71,13 @@ Next Run Time:                        2026/9/17 8:00:00
 那一行从默认的 `Stop On Battery Mode, No Start On Batteries` 变成了空）。
 自查不通过时脚本会**报错退出**，不会留下一个"看起来注册成功了、其实一在电池上就永远不跑"的任务。
 
-**这个脚本是幂等的**——先删后建，重复跑不会报错，任务定义逐字节一致。
-换了路径、改了时间、重装了机器，直接再跑一遍就行。
+**这个脚本是幂等的**——靠 `schtasks /create /f` 覆盖（"有则覆盖"是原子的），
+重复跑不会报错，任务定义逐字节一致。换了路径、改了时间、重装了机器，直接再跑一遍就行。
+
+> ⚠️ 脚本**不会先删掉旧任务**再建。这不是省事：先删再建的话，`/create` 一旦失败
+> （最容易踩的是 `-Time` 格式写错，比如 `8:0`），机器上就**一条任务都不剩**，
+> 而报错里只有 schtasks 自己那一句——"你的自动化已经没了"这件事不在报错里。
+> 现在这样，建失败时旧任务原样留着，明天照跑。
 
 > ⚠️ 任务默认是 **Interactive only**（`Logon Mode` 那一行）：**只在你的账户登录时才跑**。
 > 注销/重启后没人登录，它不会自己启动。想要不登录也跑，得改成"不管用户是否登录都运行"，
@@ -116,20 +125,31 @@ Next Run Time:                        2026/9/17 8:00:00
 ## 四、改时间 / 改路径
 
 ```powershell
+cd D:\github\VIGIL
+
 # 改成每天早上 07:30
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/register-task.ps1 -Time 07:30
 
-# 仓库不在 D:\github\VIGIL 时（换了盘/换了目录）
+# 仓库搬到了别处（换了盘/换了目录）：先 cd 到新位置，再把新位置传给 -RepoPath
+cd E:\code\VIGIL
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/register-task.ps1 -RepoPath "E:\code\VIGIL"
 ```
 
-时间格式是 `HH:mm`。改完立刻生效，不用重启什么。
+时间格式是 `HH:mm`；写错了脚本会报错退出，**旧任务原样保留**（见上一节那条提醒）。
+改完立刻生效，不用重启什么。
+
+`-RepoPath` 指向哪儿，任务就指向那儿的 `scripts\vigil-daily.cmd`；而那个 `.cmd` 会**从自己所在的位置**
+推出仓库根（不硬编码路径），所以整条链跟着走——搬完仓库不用再改第三处。
+（实测：把仓库复制到另一个路径、用 `-RepoPath` 注册，任务指向副本的 `.cmd`；跑那个副本，
+它读写的是副本自己的 `data\logs\`，原仓库一个字没动。）
 
 ---
 
 ## 五、看它跑没跑（从粗到细三条）
 
 ```powershell
+cd D:\github\VIGIL   # ② ③ 用的是相对路径，先回到仓库根
+
 # ① 任务计划自己记的账：上次什么时候跑的、结果码是多少、下次什么时候跑
 Get-ScheduledTaskInfo -TaskName "VIGIL每日管线" | Format-List LastRunTime,LastTaskResult,NextRunTime
 
