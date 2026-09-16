@@ -429,9 +429,15 @@ def refine(
 
         # D15：被软删条目的源消息**永不被重抽复活**。
         #
-        # ⚠️ 只在重抽路径上起作用：非 redo 时 `pending_messages` 只返回没有 ok 记录的
-        # 消息，而被软删的条目本来就抽过（有 ok 记录）⇒ 本来就不在集合里。
-        # 会复活它们的**只有** `--redo`，以及将来任何重抽已处理消息的路径。
+        # ⚠️ **非 redo 与 redo 都会经过这道闸门**——过滤是**无条件**的，
+        # 不要把它挪进 `redo` 分支。机理（实测，见 task-6-report.md「勘误」）：
+        # `refine_runs` 按 msg_id 做 `INSERT OR REPLACE`（`store.py:379-384`），
+        # 而 `_record_error` 会把一次成功的 ok 记账**覆写成 error**；`pending_messages`
+        # 的既有语义是「error 行要重试、不算已处理」⇒ 一次「抽过 → 用户软删 →
+        # 后来某轮 `--redo` 失败」之后，**下一轮非 redo 的 refine 照样会把这条消息
+        # 取出来重抽**，被删的条目以**新的 item_id** 复活（overlay 挡的是**旧**
+        # item_id）⇒ D15 被静默重开。`test_refine_skips_tombstoned_even_without_redo`
+        # 钉着这条：把它收窄成 `if redo and tombstones:` 那条测试立刻变红。
         #
         # ⚠️ **刻意不碰 `refine_runs`**：那些行的 ok 记录是**既有事实**，
         # 把它改写成 discarded 会篡改 M1 出口标准赖以成立的账目。
