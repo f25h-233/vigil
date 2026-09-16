@@ -688,3 +688,133 @@ def test_refine_wires_the_deadline_drop_end_to_end(seeded, monkeypatch):
     assert seeded.execute(
         "SELECT count(*) FROM item_sources"
     ).fetchone()[0] == 1, "来源行不受影响"
+
+
+# ── M4 T5：批次写入原子化 + record_run 保护圈 + M2-3 ────────────────
+
+
+def test_batch_write_is_atomic_items_do_not_survive_a_failed_record(seeded, monkeypatch):
+    """⭐⭐ 洞 B 的判据：**items 落库与消息记账要么都成、要么都不成。**
+
+    注入一个"记账那一步炸掉"的失败。旧实现里 `save_items` 已经自己 commit
+    过了，于是这一批的 items **留在库里**而消息**没被标记**——下次
+    `pending_messages` 会把同一批再抽一遍，产出重复 items，全程无声。
+    修好后：两者在同一个事务里，记账失败 ⇒ items 一并回滚。
+
+    断言三件事：
+      · 那一批的 items **不在**库里（回滚了）
+      · 那一批的消息**没有**被标成 ok/discarded（否则下次就不再抽它了，
+        那才是真丢数据）
+      · 整轮没有被掀掉（别的批照常产出）——保护圈仍然有效
+    """
+    fake = FakeLLM(lambda user: _scripted(user, deadline=None))
+    monkeypatch.setattr(refine, "chat_json", fake)
+
+    real_record = store.record_run
+    state = {"blown": False}
+
+    def flaky_record(conn, msg_ids, **kwargs):
+        # 只炸**成功路径**的那次（status=ok），不炸 error 记账——
+        # 炸后者会连带把 _record_error 也弄坏，那就测不出想测的东西了
+        if not state["blown"] and kwargs.get("status") == store.STATUS_OK:
+            state["blown"] = True
+            raise sqlite3.OperationalError("模拟记账失败")
+        return real_record(conn, msg_ids, **kwargs)
+
+    monkeypatch.setattr(refine.store, "record_run", flaky_record)
+
+    stats = refine.refine(
+        StubConfig(), api_key="k", conn=seeded, batch_size=1,
+        on_progress=lambda *a, **k: None,
+    )
+
+    assert state["blown"], "注入没生效——测试本身有问题，别当成通过"
+    assert stats.batches == 3, "3 批必须全部跑完"
+    assert any("第 1 批" in e for e in stats.errors), stats.errors
+    # 第 1 批那 3 条消息（scripts 里第 1 条）不许留下 ok/discarded 记账——
+    # 留下了就意味着这条消息永远不会再被抽，而它的 item 已经回滚没了
+    assert seeded.execute(
+        "SELECT count(*) FROM refine_runs WHERE msg_id = 1 AND status != 'error'"
+    ).fetchone()[0] == 0, "回滚要连记账一起回滚"
+    # ⚠️ 补强（逃逸舱，见报告「偏差」）：brief 原版只断言 `count(*) >= 1`，
+    # 而**旧实现照样满足它**——第 1 批的 item 还在库里、第 3 批的也在，
+    # `>= 1` 分不清「回滚了」与「没回滚」。洞 B 的判据必须点名**那一批**的
+    # item：它要么跟着记账一起消失，要么就是那个会引来重抽的重复条目。
+    assert seeded.execute(
+        "SELECT count(*) FROM items WHERE title = '西太湖报告厅有讲座'"
+    ).fetchone()[0] == 0, "记账失败的批次，它的 items 必须一并回滚"
+    assert seeded.execute("SELECT count(*) FROM items").fetchone()[0] >= 1, \
+        "后面那批的条目照常落库——「继续跑」得是有产出的"
+    # ⚠️ 补强（逃逸舱，见报告「偏差」）：**「落了盘」与「还挂在连接的事务里」
+    # 在同一连接上看起来一模一样**——本文件其余 refine 用例全都在同一条连接上
+    # 读，把 `with store.transaction(conn)` 整块删掉（只留 `commit=False`）
+    # 它们**照样全绿**（实测，报告里的 M2）。而真管线用的是**文件库**、
+    # `finally: conn.close()`：真没 commit 的话，`close()` 会把这一轮的产出
+    # 整个回滚掉——无人值守下就是「跑完了、库里什么都没有」。
+    # 所以这里钉一条「连接上不许留着没提交的事务」：它与 items 是否可见无关，
+    # 是唯一能区分「已提交」与「pending」的判据。
+    assert not seeded.in_transaction, "一轮跑完不许留着未提交的事务"
+
+
+def test_record_error_failure_does_not_kill_the_run(seeded, monkeypatch):
+    """⭐ M3-2：**记账自己也失败时，不许掀掉整轮。**
+
+    三处 `record_run` 原先都裸奔在 `except` 体里。异常处理路径上再抛异常，
+    `except` 接不住自己。这里让 `record_run` **永远**炸——模拟"库锁死/只读/
+    磁盘满"，那正是最可能连续失败的时候。
+
+    断言：整轮跑完、错误**仍然可见**（进 stats.errors），不是静默吞掉。
+    """
+    fake = FakeLLM(lambda user: _scripted(user, deadline=None))
+    monkeypatch.setattr(refine, "chat_json", fake)
+
+    def always_boom(conn, msg_ids, **kwargs):
+        raise sqlite3.OperationalError("模拟库一直写不进去")
+
+    monkeypatch.setattr(refine.store, "record_run", always_boom)
+
+    stats = refine.refine(
+        StubConfig(), api_key="k", conn=seeded, batch_size=1,
+        on_progress=lambda *a, **k: None,
+    )
+
+    assert stats.batches == 3, "记账全炸也不许掀掉整轮"
+    assert any("记账" in e for e in stats.errors), \
+        f"记账失败必须可见（进 stats.errors），实际：{stats.errors}"
+
+
+def test_prompt_sanitizes_fullwidth_quotes(seeded, monkeypatch):
+    """M2-3 + 发现 9：出网文本里不许有全角引号。
+
+    两重收益：① 防模型退化成无限空格循环（原先的理由）；② `“”` 换成
+    `「」` 之后，refine 的归一化表（`_PUNCT`）**认得** `「」` 而不认得 `“”`
+    ——所以模型摘录时引号包一层也不会再丢掉来源（发现 9 实测的那个洞）。
+
+    ⚠️ 偏差（逃逸舱）：brief 里这条用的是 `_seeded_with(msg)` 这个**并不存在**
+    的夹具。这里改成**用既有的 `seeded` 夹具**、往它里面补一条带全角引号的
+    消息——batch_size=1 时每条消息自成一批，最后一批就是这条，断言落在
+    最后一次出网的 `user` 上。没有新造/改写任何既有夹具。
+    """
+    sent = {}
+    fake = FakeLLM()
+
+    def capture(cfg, *, system, user, sleep=None):
+        sent["user"] = user
+        return fake(cfg, system=system, user=user)
+
+    monkeypatch.setattr(refine, "chat_json", capture)
+
+    # ts 取最大，保证它是**最后**一批（pending_messages 按时间升序）
+    seeded.execute(
+        "INSERT INTO messages VALUES (?,?,?,?,?)",
+        (4, 100, 1003, "u_x", "他说“明天交作业”了"),
+    )
+    seeded.commit()
+
+    refine.refine(StubConfig(), api_key="k", conn=seeded, batch_size=1,
+                  on_progress=lambda *a, **k: None)
+
+    assert sent, "一批都没跑，这条测试就没在验证任何东西"
+    assert "“" not in sent["user"] and "”" not in sent["user"], \
+        "全角引号必须被 sanitize_for_llm 换掉"
+    assert "「明天交作业」" in sent["user"]

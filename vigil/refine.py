@@ -23,7 +23,7 @@ from . import prefilter, store
 from .categories import Category, prompt_block
 from .config import Config
 from .deadline import deadline_supported
-from .llm import DEFAULT_MODEL, LLMConfig, LLMError, chat_json
+from .llm import DEFAULT_MODEL, LLMConfig, LLMError, chat_json, sanitize_for_llm
 from .redact import Redactor
 from .store import PendingMessage
 
@@ -39,6 +39,7 @@ class RefineStats:
 
     scanned: int = 0
     discarded_local: int = 0
+    candidates: int = 0          # 通过预筛的候选数（= prefilter.ScreenStats.kept）
     sent_messages: int = 0
     batches_planned: int = 0  # 计划要跑多少批
     batches: int = 0  # **实际**跑了几批——预算 break 之后会小于 planned
@@ -122,9 +123,14 @@ def build_user_prompt(
     lines = []
     anonymous = 0
     for m in messages:
-        body = redactor.text(m.content)
+        # ⚠️ 出网前**必须**过 sanitize_for_llm（M2-3）。全角引号会让模型退化成
+        # 无限空格循环——而 refine 侧的 max_tokens 默认是 None（不发这个字段），
+        # 所以唯一的刹车是 180s 超时 × 3 次重试 ≈ 9 分钟空转。
+        # 附带收益：`“”` 换成 `「」` 之后 refine 的归一化表认得后者，
+        # 模型摘录时自己包一层引号也不会再丢掉来源（计划 §二 发现 9 实测）。
+        body = sanitize_for_llm(redactor.text(m.content))
         if m.sender_uid:
-            name = redactor.text(m.sender) or "未知"
+            name = sanitize_for_llm(redactor.text(m.sender)) or "未知"
             who = f"{redactor.actor(m.sender_uid)} {name}"
         else:
             # 批内计数器，不用 msg_id——不给模型任何长数字，断掉它"抄数字"的路径
@@ -132,6 +138,33 @@ def build_user_prompt(
             who = f"匿名{anonymous}"
         lines.append(f"- {who}: {body}")
     return f"今天的日期是 {today}。\n\n消息如下：\n" + "\n".join(lines)
+
+
+def _record_error(
+    conn: sqlite3.Connection, msg_ids: list[int], *, prompt_ver: str, err: object
+) -> str | None:
+    """把一批消息记成 error 状态。**自己失败不再抛**。
+
+    ⚠️ 存在的理由（M3-2）：三处 `store.record_run` 原先都**裸奔在 `except`
+    体里**。异常处理路径上再抛异常，`except` 是接不住自己的——它会穿过整个
+    批次循环把整轮 refine 掀掉，**而那时恰恰是"库出了问题"的时候**（锁死、
+    只读、磁盘满），也就是最可能连续失败的时候。
+
+    ⚠️ 本函数**不吞**异常：它把失败**返回**给调用方，由调用方照常写进
+    `stats.errors`——账目仍然可见，只是不再掀桌子。M1/M3 的教训是
+    「静默吞异常不可接受」，这条守住了。
+
+    返回值：记账也失败时的描述；成功返回 `None`。
+    """
+    try:
+        with store.transaction(conn):
+            store.record_run(
+                conn, msg_ids, status=store.STATUS_ERROR,
+                prompt_ver=prompt_ver, err=str(err)[:200], commit=False,
+            )
+    except Exception as inner:  # noqa: BLE001 — 见 docstring：返回而非抛出
+        return f"error 记账也失败了: {inner}"
+    return None
 
 
 def _parse_deadline(value: object) -> int | None:
@@ -321,10 +354,25 @@ def refine(
         candidates, screen_stats = prefilter.screen(
             messages, tier_of=config.tier_of
         )
+        stats.candidates = screen_stats.kept
         stats.discarded_local = screen_stats.dropped
+        # ⚠️ `expand_context` **提前到这里**：进度行要报「送模型」就必须先算出来。
+        # 它是纯函数、不碰 I/O，提前没有副作用；下面那个 `if not candidates`
+        # 分支在空候选时 expand_context 返回空表，行为一字不变。
+        in_scope = prefilter.expand_context(messages, candidates, context=context)
+        stats.sent_messages = len(in_scope)
+
+        # ⚠️ 这三个数**自洽**：本地筛掉 + 送模型 == 扫描。这是 M2-4 的修法。
+        # 旧版写「扫描 N 条 → 规则保留 M 条（本地丢弃 D 条）」——43,439 条
+        # 消息同时不属于「保留」也不属于「丢弃」（`prefilter.py:177-179` 的
+        # 「软丢弃」分支），三个数加起来对不上，而 D 又与日报里的「本地筛掉」
+        # 差 7.6 倍。**不要**改回「其中」：规则硬丢弃与本地筛掉**不是**包含
+        # 关系（`expand_context` 不看消息有没有被硬规则判死，被判死的照样
+        # 作为上下文出网）。
         on_progress(
-            f"[refine] 扫描 {screen_stats.total:,} 条 → 规则保留 {screen_stats.kept:,} 条"
-            f"（本地丢弃 {screen_stats.dropped:,}）"
+            f"[refine] 扫描 {stats.scanned:,} 条 → 本地筛掉 "
+            f"{stats.scanned - stats.sent_messages:,} 条"
+            f" → 送模型 {stats.sent_messages:,} 条（候选 {stats.candidates:,} 条）"
         )
 
         # 没进候选的一律记账为 discarded，其中既含硬丢弃也含「没命中保留规则」。
@@ -333,18 +381,29 @@ def refine(
         candidate_ids = {c.msg_id for c in candidates}
         not_candidate_ids = [m.msg_id for m in messages if m.msg_id not in candidate_ids]
         if not dry_run and not_candidate_ids:
-            store.record_run(
-                conn, not_candidate_ids, status=store.STATUS_DISCARDED,
-                prompt_ver=prompt_ver,
-            )
+            try:
+                with store.transaction(conn):
+                    store.record_run(
+                        conn, not_candidate_ids, status=store.STATUS_DISCARDED,
+                        prompt_ver=prompt_ver, commit=False,
+                    )
+            except Exception as exc:  # noqa: BLE001
+                # ⚠️ 偏差（逃逸舱，见报告「偏差」第 2 条）：brief 的 Step 7(g) 只把
+                # 这里**圈进事务**、没给保护圈——而它在**主流程**上（并不在任何
+                # `except` 体里），记账一失败就会穿过整个 refine 掀掉整轮：
+                # `stats.batches` 停在 0、一条消息都不抽。brief 自己的 Step 5 用例
+                # （`test_record_error_failure_does_not_kill_the_run`）要的正是
+                # 「记账全炸也不许掀掉整轮」——两条要求只有补上这个保护圈才同时
+                # 成立，所以按同一取舍补上：**返回**失败而不是抛出，账目照旧可见。
+                # 这批消息会保持未记账，下次 refine 重新本地预筛（不烧 token、
+                # 也**不会**重复产出 items——它们本来就没进候选），比整轮不跑好。
+                stats.errors.append(f"未进候选的消息记账失败: {exc}")
 
         if not candidates:
             on_progress("[refine] 预筛后没有候选，结束")
             return stats
 
-        in_scope = prefilter.expand_context(messages, candidates, context=context)
         batches = prefilter.make_batches(in_scope, max_batch=batch_size)
-        stats.sent_messages = len(in_scope)
         stats.batches_planned = len(batches)
 
         if dry_run:
@@ -380,10 +439,10 @@ def refine(
                 msg = f"第 {index} 批失败: {exc}"
                 stats.errors.append(msg)
                 on_progress(f"[refine] {msg}")
-                store.record_run(
-                    conn, batch_ids, status=store.STATUS_ERROR,
-                    prompt_ver=prompt_ver, err=str(exc)[:200],
-                )
+                if extra := _record_error(
+                    conn, batch_ids, prompt_ver=prompt_ver, err=exc
+                ):
+                    stats.errors.append(f"第 {index} 批 {extra}")
                 continue
 
             # ⚠️ token 累加**留在保护圈外**：token 是真花掉的，本地后处理炸了
@@ -415,22 +474,36 @@ def refine(
                     produced.append(item)
                     hit_ids.update(item.src_msg_ids)
 
+                # 截止日降级是**纯本地**判定，放事务外——事务里只留 DB 写。
+                dropped = 0
                 if produced:
                     produced, dropped = _drop_unsupported_deadlines(produced, batch)
-                    stats.deadlines_dropped += dropped
-                    stats.items_saved += store.save_items(
-                        conn, produced, model=model, prompt_ver=prompt_ver
-                    )
 
-                store.record_run(
-                    conn, batch_ids, status=store.STATUS_DISCARDED,
-                    prompt_ver=prompt_ver,
-                )
-                if hit_ids:
+                # ⚠️ 落库 + 记账必须在**同一个事务**里（见 store.transaction 的
+                # docstring）：分开提交时，两步之间崩掉会让同一批消息下次被
+                # 重抽，产出重复 items 且无声。`commit=False` 是关键——漏一个
+                # 就白搭，而且**不会报错**，只会静默地退回旧行为。
+                with store.transaction(conn):
+                    saved = 0
+                    if produced:
+                        saved = store.save_items(
+                            conn, produced, model=model, prompt_ver=prompt_ver,
+                            commit=False,
+                        )
                     store.record_run(
-                        conn, sorted(hit_ids), status=store.STATUS_OK,
-                        prompt_ver=prompt_ver, item_count=len(produced),
+                        conn, batch_ids, status=store.STATUS_DISCARDED,
+                        prompt_ver=prompt_ver, commit=False,
                     )
+                    if hit_ids:
+                        store.record_run(
+                            conn, sorted(hit_ids), status=store.STATUS_OK,
+                            prompt_ver=prompt_ver, item_count=saved,
+                            commit=False,
+                        )
+
+                # ⚠️ 只有事务真的提交了才动 stats——回滚了还记账，账目会说谎
+                stats.deadlines_dropped += dropped
+                stats.items_saved += saved
 
                 on_progress(
                     f"[refine] 批次 {index}/{len(batches)}：{len(batch)} 条 → "
@@ -445,10 +518,10 @@ def refine(
                 msg = f"第 {index} 批本地后处理失败: {exc}"
                 stats.errors.append(msg)
                 on_progress(f"[refine] {msg}")
-                store.record_run(
-                    conn, batch_ids, status=store.STATUS_ERROR,
-                    prompt_ver=prompt_ver, err=str(exc)[:200],
-                )
+                if extra := _record_error(
+                    conn, batch_ids, prompt_ver=prompt_ver, err=exc
+                ):
+                    stats.errors.append(f"第 {index} 批 {extra}")
                 continue
 
         return stats
