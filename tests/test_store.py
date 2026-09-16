@@ -1185,3 +1185,54 @@ def test_transaction_rolls_back_when_commit_itself_fails():
         "SELECT msg_id FROM refine_runs ORDER BY msg_id"
     ).fetchall()] == [2], \
         "只该有第 2 次那笔记账——第 1 次那批（msg 1）必须跟着回滚"
+
+
+# ── Task 3：批内去重 ─────────────────────────────────────────────
+
+
+def _item(title="标题", *, event_ts=1_700_000_000, group_id=100, src=(1,), kind="notice"):
+    from vigil.store import ExtractedItem
+
+    return ExtractedItem(
+        kind=kind, title=title, detail=None, event_ts=event_ts,
+        deadline_ts=None, group_id=group_id, actor_uid="u_x", place=None,
+        links=(), amount=None, confidence=0.9, src_msg_ids=src,
+    )
+
+
+def test_dedupe_batch_collapses_identical_items():
+    """item 290/296 的真实形状：同批同标题同 event_ts 同群。"""
+    out = store._dedupe_batch([_item(src=(11,)), _item(src=(11,))])
+    assert len(out) == 1
+
+
+def test_dedupe_batch_merges_sources():
+    """⚠️ 重复项的来源取并集，不是丢掉第二条——否则 item_sources 少一行且无声。"""
+    out = store._dedupe_batch([_item(src=(11,)), _item(src=(22,))])
+    assert len(out) == 1
+    assert out[0].src_msg_ids == (11, 22)
+
+
+def test_dedupe_batch_keeps_distinct_titles():
+    out = store._dedupe_batch([_item("甲"), _item("乙")])
+    assert [i.title for i in out] == ["甲", "乙"]
+
+
+def test_dedupe_batch_keeps_same_title_in_other_group():
+    out = store._dedupe_batch([_item(group_id=1), _item(group_id=2)])
+    assert len(out) == 2
+
+
+def test_dedupe_batch_keeps_same_title_at_other_time():
+    out = store._dedupe_batch([_item(event_ts=1), _item(event_ts=2)])
+    assert len(out) == 2
+
+
+def test_save_items_writes_deduped_rows(memdb):
+    store.ensure_schema(memdb)
+    n = store.save_items(
+        memdb, [_item(src=(11,)), _item(src=(11,))],
+        model="m", prompt_ver="v3",
+    )
+    assert n == 1
+    assert memdb.execute("SELECT COUNT(*) FROM items").fetchone()[0] == 1

@@ -13,7 +13,7 @@ import json
 import sqlite3
 import time
 from collections.abc import Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 STATUS_OK = "ok"
 STATUS_DISCARDED = "discarded"
@@ -273,6 +273,36 @@ def transaction(conn: sqlite3.Connection) -> Iterator[None]:
         raise
 
 
+def _dedupe_batch(items: list[ExtractedItem]) -> list[ExtractedItem]:
+    """批内去重：``(title, event_ts, group_id)`` 相同的只留一条。
+
+    ⚠️ 存在的理由是一个真实缺陷（M4 实测）：模型在**一次响应**里把同一条消息
+    抽了两遍，而 `items` 表没有唯一键，于是库里出现两条一模一样的条目
+    （真库 item 290 / 296，来源同为 msg 7685735400902931272）。
+    `trans._run` 的记账防不住它——**同一次 `save_items` 内部**的重复，
+    没有任何一层会拦。
+
+    ⚠️ **来源取并集而不是丢弃**：两条重复项的 `src_msg_ids` 可能不同
+    （同秒的两条不同消息），直接丢一条会让 `item_sources` 少一行。
+    "可回溯到原文"是 M1 的出口标准，不能在这里静默失守。
+
+    ⚠️ 键里**不带** `actor_uid` / `kind`：同标题同秒同群的条目，即便模型给了
+    不同的类目，也是同一条信息被抽了两遍——按最早的那条留下。
+    """
+    seen: dict[tuple[str, int, int], int] = {}
+    out: list[ExtractedItem] = []
+    for it in items:
+        key = (it.title, it.event_ts, it.group_id)
+        idx = seen.get(key)
+        if idx is None:
+            seen[key] = len(out)
+            out.append(it)
+            continue
+        merged = tuple(dict.fromkeys((*out[idx].src_msg_ids, *it.src_msg_ids)))
+        out[idx] = replace(out[idx], src_msg_ids=merged)
+    return out
+
+
 def save_items(
     conn: sqlite3.Connection,
     items: list[ExtractedItem],
@@ -287,6 +317,7 @@ def save_items(
     ⚠️ `commit=False` 用于把本函数并入外层 `transaction()` —— 调用方有责任
     用 `with transaction(conn):` 圈住，否则写的东西永远不会落盘。
     """
+    items = _dedupe_batch(items)
     stamp = int(time.time()) if now is None else now
     for item in items:
         cur = conn.execute(
