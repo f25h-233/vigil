@@ -1085,3 +1085,233 @@ def test_to_item_place_evidence_must_come_from_the_source_message(msg_factory):
     )
     assert it is not None
     assert it.place is None, "依据只许来自源消息；跨消息拼接会凭空造出证据"
+# ── Task 6：墓碑阻复活（D15） ─────────────────────────────────────
+
+
+def test_refine_skips_tombstoned_messages_on_redo(seeded, monkeypatch):
+    """被软删条目的源消息，`--redo` 时不得再被抽取（D15）。
+
+    用 `seeded` 夹具里既有的 msg_id=3（"数学作业截止到9月7号"）。
+    """
+    from vigil import overrides
+
+    overrides.ensure_schema()
+    ov = overrides.connect()
+    overrides.ensure_tables(ov)
+    overrides.delete_item(ov, item_id=1, msg_id=3)
+    ov.close()
+
+    fake = FakeLLM(script=lambda _user: {"items": [
+        {"quote": "数学作业截止到9月7号", "kind": "academic",
+         "title": "数学作业截止", "deadline": "2026-09-07", "confidence": 0.9}
+    ]})
+    monkeypatch.setattr(refine, "chat_json", fake)
+
+    stats = refine.refine(
+        StubConfig(), api_key="k", conn=seeded, batch_size=1, redo=True,
+        on_progress=lambda *_: None,
+    )
+    assert stats.skipped_deleted == 1
+    sent = " ".join(c["user"] for c in fake.calls)
+    assert "数学作业" not in sent, "⚠️ 被墓碑挡下的消息**一步都不许出网**"
+
+
+def test_refine_skips_deleted_counts_zero_without_tombstones(seeded, monkeypatch):
+    """没有墓碑时该字段必须是 0——不能因为字段存在就恒为 1（否则判据是装饰）。"""
+    fake = FakeLLM(script=lambda _user: {"items": []})
+    monkeypatch.setattr(refine, "chat_json", fake)
+
+    stats = refine.refine(
+        StubConfig(), api_key="k", conn=seeded, batch_size=1, redo=True,
+        on_progress=lambda *_: None,
+    )
+    assert stats.skipped_deleted == 0
+
+
+def test_refine_survives_soft_delete_without_msg_id(seeded, monkeypatch):
+    """⚠️ 补的守卫（偏差，见报告「偏差」第 1 条）：`msg_id=None` 的软删不许让 refine 崩。
+
+    `overrides.delete_item` 明确允许不传 `msg_id`（D2/T4 的既有事实：界面仍然
+    会隐藏这条 item，只是那条源消息将来 `--redo` 时**会**复活），而 T6 起
+    **每一轮** refine 都会去读墓碑。⇒ 这条路径必须在「没有源消息可墓碑化」时
+    安静地什么都不做，而不是抛异常把整条每日管线停摆。
+
+    三条一起才完整：①有名有姓的墓碑要挡（上一条）、②没有墓碑时字段是 0
+    （再上一条）、③**有墓碑但没有 msg_id** 时既不崩也不误伤。
+    第 ③ 条此前零守护——brief 的两条用例都只走 `msg_id=3` 这条路。
+    """
+    from vigil import overrides
+
+    overrides.ensure_schema()
+    ov = overrides.connect()
+    overrides.delete_item(ov, item_id=1, msg_id=None)
+    ov.close()
+
+    fake = FakeLLM(script=lambda _user: {"items": []})
+    monkeypatch.setattr(refine, "chat_json", fake)
+
+    stats = refine.refine(
+        StubConfig(), api_key="k", conn=seeded, batch_size=1, redo=True,
+        on_progress=lambda *_: None,
+    )
+    assert stats.skipped_deleted == 0, "没有 msg_id ⇒ 没有源消息可墓碑化，不许误伤"
+    assert stats.batches == 3, "3 批照常跑完——无 msg_id 的软删不该挡住任何消息"
+    assert stats.errors == [], f"读墓碑不该抛：{stats.errors}"
+def test_refine_tombstones_survive_a_full_state_rebuild(seeded, monkeypatch):
+    """⚠️ 补的守卫（偏差，见报告「偏差」第 2 条）：墓碑不许只活在物化的 `item_state` 里。
+
+    `deleted_msg_ids` 是**读 `item_state`** 的（`item_edits JOIN item_state`），而
+    `ensure_schema` 只建表、**不重建**它——`rebuild_state()` 只在 `undo` 里被调用。
+    ⇒ 这张物化表一旦被整体重算，墓碑集必须**一个不差**；否则它会静默变小
+    ⇒ 重抽把用户删掉的条目复活，而**没有任何东西会报错**。
+    T6 是 `deleted_msg_ids` 的第一个消费者，所以由消费者这一侧把它钉住。
+    """
+    from vigil import overrides
+
+    overrides.ensure_schema()
+    ov = overrides.connect()
+    overrides.delete_item(ov, item_id=1, msg_id=3)
+    overrides.rebuild_state(ov)
+    assert overrides.deleted_msg_ids(ov) == frozenset({3}), \
+        "全量重算之后墓碑集必须一字不差——它是重抽跳过的唯一依据"
+    ov.close()
+
+    fake = FakeLLM(script=lambda _user: {"items": [
+        {"quote": "数学作业截止到9月7号", "kind": "academic",
+         "title": "数学作业截止", "deadline": "2026-09-07", "confidence": 0.9}
+    ]})
+    monkeypatch.setattr(refine, "chat_json", fake)
+
+    stats = refine.refine(
+        StubConfig(), api_key="k", conn=seeded, batch_size=1, redo=True,
+        on_progress=lambda *_: None,
+    )
+    assert stats.skipped_deleted == 1
+    sent = " ".join(c["user"] for c in fake.calls)
+    assert "数学作业" not in sent
+
+
+def test_refine_skips_tombstoned_even_without_redo(seeded, monkeypatch):
+    """⚠️ 补的守卫（偏差，见报告「偏差」第 3 条）：墓碑过滤不许被收窄到 `redo` 分支上。
+
+    brief 的注释说「非 redo 时……被软删的条目本来就抽过（有 ok 记录）⇒ 本来就不在
+    集合里」——**这句话有个反例**：`record_run` 按 `msg_id` 做 `INSERT OR REPLACE`，
+    所以「抽过（ok + item）→ 用户软删 → 后来某轮 `--redo` 失败」会把那条记账
+    **从 ok 覆盖成 error**，而 `pending_messages` 的既有语义正是「error 行要重试、
+    不算已处理」⇒ **下一轮非 redo 的 refine 照样会把这条消息取出来重抽**
+    ⇒ 用户删掉的条目以新的 `item_id` 复活（overlay 挡的是旧 `item_id`）。
+
+    即：墓碑过滤是**全部路径**上的闸门，不是 redo 专用的。把它写成
+    `if redo and tombstones:` 时，本条变红。
+    """
+    from vigil import overrides
+
+    overrides.ensure_schema()
+    ov = overrides.connect()
+    overrides.delete_item(ov, item_id=1, msg_id=3)
+    ov.close()
+    # 那条消息的记账被一次失败的 redo 覆盖成 error ⇒ 它重新变成「待处理」
+    store.record_run(
+        seeded, [3], status=store.STATUS_ERROR, prompt_ver=refine.PROMPT_VERSION,
+    )
+
+    fake = FakeLLM(script=lambda _user: {"items": [
+        {"quote": "数学作业截止到9月7号", "kind": "academic",
+         "title": "数学作业截止", "deadline": "2026-09-07", "confidence": 0.9}
+    ]})
+    monkeypatch.setattr(refine, "chat_json", fake)
+
+    stats = refine.refine(
+        StubConfig(), api_key="k", conn=seeded, batch_size=1,
+        on_progress=lambda *_: None,
+    )
+    assert stats.skipped_deleted == 1, "非 redo 路径上墓碑照样要挡"
+    sent = " ".join(c["user"] for c in fake.calls)
+    assert "数学作业" not in sent
+def test_refine_fails_safe_when_the_overlay_is_unreadable(seeded, monkeypatch):
+    """⚠️ 补的守卫（偏差，见报告「偏差」第 4 条）：overlay 读不到时 refine 必须照常跑完。
+
+    `_tombstoned_msg_ids` 的 docstring 承诺「读不到一律返回空集」，理由是
+    **代价不对称**：最坏后果只是「这次重抽把某条复活了」（用户再删一次即可），
+    而在这里抛异常会让**整条每日管线停摆**（每天的定时 refine 直接失败）。
+
+    ⚠️ 这条承诺此前**零守护**：变异实测——把 `except sqlite3.Error` 整段去掉、
+    让异常照常冒出去，44 条测试**一条都不红**。而它正是那种「只在出事那天
+    才起作用」的代码（锁死 / 权限 / 路径不可写）。
+    """
+    from vigil import overrides
+
+    def boom(*_a, **_k):
+        raise sqlite3.OperationalError("模拟 overlay 读不了：被锁死/没权限")
+
+    monkeypatch.setattr(overrides, "connect", boom)
+
+    fake = FakeLLM(script=lambda _user: {"items": []})
+    monkeypatch.setattr(refine, "chat_json", fake)
+
+    stats = refine.refine(
+        StubConfig(), api_key="k", conn=seeded, batch_size=1, redo=True,
+        on_progress=lambda *_: None,
+    )
+    assert stats.errors == [], f"读墓碑失败不许变成错误：{stats.errors}"
+    assert stats.skipped_deleted == 0, "读不到墓碑 ⇒ 一个都不跳（宁可复活，不可停摆）"
+    assert stats.batches == 3, "整轮照常跑完"
+
+
+def test_refine_skipped_deleted_counts_only_what_it_actually_skipped(
+    seeded, monkeypatch
+):
+    """⚠️ 补的守卫（偏差，见报告「偏差」第 5 条）：报告里的两个数都要说真话。
+
+    · `skipped_deleted` 数的是**这轮实际跳过的消息**，不是「墓碑总数」——
+      墓碑可以指向窗口外 / 库里根本没有的消息（非 redo、since/until、异地删除）。
+    · `stats.scanned` 是**过滤之后**的（"这轮真正要处理多少条"）：CLI 拿
+      `scanned - sent_messages` 报「本地筛掉」，把墓碑算进 scanned 会让它
+      把"被墓碑挡下的"错报成"本地筛掉的"。
+
+    这两条此前**零守护**：变异实测（J 把计数改成 `len(tombstones)`、H 把
+    `stats.scanned` 提到过滤之前）44 条测试**一条都不红**。
+    """
+    from vigil import overrides
+
+    overrides.ensure_schema()
+    ov = overrides.connect()
+    overrides.delete_item(ov, item_id=1, msg_id=3)      # 在待抽集合里
+    overrides.delete_item(ov, item_id=2, msg_id=999)    # 窗口外 / 库里没有
+    ov.close()
+
+    fake = FakeLLM(script=lambda _user: {"items": []})
+    monkeypatch.setattr(refine, "chat_json", fake)
+
+    stats = refine.refine(
+        StubConfig(), api_key="k", conn=seeded, batch_size=1, redo=True,
+        on_progress=lambda *_: None,
+    )
+    assert stats.skipped_deleted == 1, "数的是实际跳过的 1 条，不是墓碑总数 2"
+    assert stats.scanned == 2, "scanned 是过滤之后的（CLI 拿它做减法）"
+def test_refine_reports_the_skip_on_the_progress_line(seeded, monkeypatch):
+    """⚠️ 补的守卫（偏差，见报告「偏差」第 6 条）：跳过数必须**出现在进度行里**。
+
+    brief 的 Interfaces 要求 `skipped_deleted`「报告里要看得见」，而让操作员
+    看得见它的唯一机制就是 Step 4 那行进度——CLI 并不单独打印它
+    （`cli.py` 只报 scanned / 本地筛掉 / 送模型）。删掉那行时 46 条测试
+    **一条都不红**（变异 I 实测）⇒ 整条要求零守护。
+    """
+    from vigil import overrides
+
+    overrides.ensure_schema()
+    ov = overrides.connect()
+    overrides.delete_item(ov, item_id=1, msg_id=3)
+    ov.close()
+
+    monkeypatch.setattr(
+        refine, "chat_json", FakeLLM(script=lambda _user: {"items": []})
+    )
+
+    lines: list[str] = []
+    refine.refine(
+        StubConfig(), api_key="k", conn=seeded, batch_size=1, redo=True,
+        on_progress=lines.append,
+    )
+    assert any("已软删" in x and "1" in x for x in lines), \
+        f"跳过数必须出现在进度里，实际：{lines}"
