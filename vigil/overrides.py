@@ -71,6 +71,12 @@ def ensure_schema(path: pathlib.Path | None = None) -> None:
     target.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(target))
     try:
+        # ⚠️ WAL **必须在这里设**（裁定 R6）：T5 之后 `api.py` 的 `mode=ro` 只读连接
+        # 会与 `refine` / T8 的写端点**并发**访问同一个库。rollback-journal 下写者持
+        # EXCLUSIVE 锁 ⇒ 读请求撞 `database is locked`；而 `mode=ro` 的连接**不能**
+        # 把库转成 WAL（它连库头都写不了）⇒ 只能在建库时设。
+        # 实测：WAL 不影响 `mode=ro` 的 ATTACH（`-shm`/`-wal` 由 SQLite 按需重建）。
+        conn.execute("PRAGMA journal_mode=WAL")
         ensure_tables(conn)
         conn.commit()
     finally:
@@ -179,7 +185,9 @@ def undo(conn: sqlite3.Connection, *, edit_id: int) -> bool:
     """
     cur = conn.execute("DELETE FROM item_edits WHERE edit_id = ?", (edit_id,))
     if cur.rowcount == 0:
-        conn.rollback()
+        # ⚠️ **不许** rollback（reviewer 实测的 FIX 2）：调用方可能正开着一段事务
+        # （T8 的"批量写 + 末尾校验"），回滚会把**它**写进去还没 commit 的东西一起丢掉
+        # （实测 1→0）。失败分支本身什么都没改，不需要任何补偿动作。
         return False
     rebuild_state(conn)
     conn.commit()
@@ -194,13 +202,24 @@ def last_edit(conn: sqlite3.Connection) -> tuple[int, int, str] | None:
 
 
 def deleted_msg_ids(conn: sqlite3.Connection) -> frozenset[int]:
-    """被软删条目对应的源消息 id——`refine` 靠它跳过重抽（D15）。"""
+    """被软删条目对应的源消息 id——`refine` 靠它跳过重抽（D15）。
+
+    ⚠️ **与 `item_state` 是同一次折叠**（裁定 R5）：墓碑化的是「**最终态**
+    `deleted=1` 的 item 所引用的源消息」，不是"历史上有过 `delete` 事件"。
+    `delete(i, msg=10)` 之后再 `set_kind(i)` ⇒ i 可见 ⇒ 10 **不**再被墓碑化
+    （`test_delete_then_set_kind_last_wins` 早就裁定了这条语义；两次独立折叠会让
+    两个视图对同一份日志给出**相反**答案——R13 同族）。
+
+    ⚠️ **一条消息产出多条 item 时取 exists 语义**：该 msg 只要有**任意**一条
+    最终态为 deleted 的 item 就墓碑化它。不这么做，重抽会把用户删掉的那条
+    **复活**（直接违反 D15）；代价（同源的兄弟条目也会被冻结）见报告「疑虑」。
+    """
     return frozenset(
         int(r[0])
         for r in conn.execute(
-            "SELECT DISTINCT msg_id FROM item_edits"
-            " WHERE action = ? AND msg_id IS NOT NULL",
-            (ACTION_DELETE,),
+            "SELECT DISTINCT e.msg_id FROM item_edits e"
+            " JOIN item_state s ON s.item_id = e.item_id"
+            " WHERE s.deleted = 1 AND e.msg_id IS NOT NULL"
         )
     )
 

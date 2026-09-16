@@ -148,14 +148,61 @@ def test_store_ensure_schema_provisions_the_overlay_file(memdb):
     assert overrides.OVERRIDES_DB.exists()
 
 
-def test_deleted_msg_ids_only_counts_delete_events_and_tolerates_none(ov):
-    """D15 的接口契约——`refine` 拿它决定"哪些源消息永不被重抽复活"。
+def test_deleted_msg_ids_folds_like_item_state(ov):
+    """**R5**：`deleted_msg_ids` 与 `item_state` 必须是**同一次折叠**的两个视图。
 
-    ⚠️ 两件事在变异反证里都是**零守护**：
-    · 只有 `delete` 事件算数。`set_field` 这类事件也带 `msg_id`（表结构允许），
-      混进来会让**没被删的条目**在重抽时被跳过——静默丢数据。
+    两条序列只差最后一步，答案必须相反（reviewer 用 400 条随机事件序列实测旧实现
+    在此分歧 65 次：`delete` 后 `set_kind` ⇒ 条目**可见**，而 msg 仍被墓碑化）。
+
+    ⚠️ 判据：`msg_id` 被墓碑化 ⟺ **最终态** `deleted=1` 的 item 的源 msg 包含它。
+    依据是 brief 自己早就裁定过的语义——`test_delete_then_set_kind_last_wins`。
+    """
+    # ① delete 之后没有后续事件 ⇒ 最终态仍被删 ⇒ msg 被墓碑化
+    overrides.delete_item(ov, item_id=9, msg_id=555)
+    assert ov.execute("SELECT deleted FROM item_state WHERE item_id=9").fetchone()["deleted"] == 1
+    assert overrides.deleted_msg_ids(ov) == frozenset({555})
+
+    # ② delete 之后跟着 set_kind ⇒ 最终态**可见** ⇒ 这个 msg 不再算被墓碑化
+    overrides.delete_item(ov, item_id=10, msg_id=777)
+    overrides.set_kind(ov, item_id=10, kind="life")
+    assert ov.execute("SELECT deleted FROM item_state WHERE item_id=10").fetchone()["deleted"] == 0
+    assert overrides.deleted_msg_ids(ov) == frozenset({555}), (
+        "视图与 item_state 分歧：条目已经可见了，msg 却还被墓碑化"
+    )
+
+
+def test_deleted_msg_ids_uses_exists_semantics_for_multi_item_messages(ov):
+    """**R5 的边角**：一条消息产出**多条** item 时取 **exists** 语义。
+
+    构造：同一条源消息 888 产出两条 item——12 已被 `set_kind` 复活、11 仍被删。
+    · exists ⇒ 888 **仍**被墓碑化（否则重抽会把 11 复活，直接违反 D15）；
+    · and（"该 msg 的**所有** item 都被删才墓碑化"）⇒ 888 会被漏掉。
+
+    ⚠️ 两条 item 必须**都真的引用 888**——12 要先 `delete(msg_id=888)` 再 `set_kind`
+    （`set_kind` 自己不带 msg_id，光靠它构造不出这个局面）。
+    ⚠️ 代价（12 这样的同源条目也会被冻结）写在 task-4-report.md 的「疑虑」里。
+    """
+    overrides.delete_item(ov, item_id=12, msg_id=888)
+    overrides.set_kind(ov, item_id=12, kind="life")   # 兄弟条目复活 ⇒ 仍引用 888
+    overrides.delete_item(ov, item_id=11, msg_id=888)  # 这一条仍被删
+    assert ov.execute("SELECT deleted FROM item_state WHERE item_id=12").fetchone()["deleted"] == 0
+    assert ov.execute("SELECT deleted FROM item_state WHERE item_id=11").fetchone()["deleted"] == 1
+    assert overrides.deleted_msg_ids(ov) == frozenset({888}), (
+        "exists 语义被破坏：同源的另一条还删着，msg 却没被墓碑化（重抽会把它复活）"
+    )
+
+
+def test_deleted_msg_ids_ignores_msgs_of_items_that_are_not_deleted(ov):
+    """R5 语义下的两条边界（旧注解说的"只认 delete 事件"已不准确，见 R5）：
+
+    · **没被删**的 item 上记的 `msg_id` 不许混进来（`set_field` 这类事件也带
+      `msg_id`，表结构允许）——混进来会让没被删的条目在重抽时被跳过，静默丢数据；
     · `msg_id=None` 的软删是 `delete_item` 明确允许的（界面不知道 msg_id 时），
       不能让 `deleted_msg_ids` 炸——而 `refine` 每次重抽都要调它。
+
+    ⚠️ 一条 item 的**多个**源 msg 今天不可能同时出现（只有 `delete` 事件带 msg_id），
+    所以"取全部源 msg"与"只取 delete 事件的 msg"**今天等价**；若 T7 让 `set_field`
+    也带 msg_id，这个选择才第一次可观测（报告「疑虑」里记了它）。
     """
     # 直接调私有 `_append`：要走**真实写路径**，不手搓 INSERT。
     overrides._append(
@@ -261,3 +308,51 @@ def test_attach_readonly_on_non_uri_connection_fails_loudly(tmp_path):
         assert "ov" not in {r[1] for r in conn.execute("PRAGMA database_list")}
     finally:
         conn.close()
+
+
+# --- Fix loop 第 1 轮：裁决 R5 / R6 + reviewer 的 FIX 2 ---------------------------------
+
+
+def test_undo_with_unknown_edit_id_does_not_discard_caller_writes(ov):
+    """**FIX 2 回归**（reviewer 实测）：未知 `edit_id` 的 `undo` 不许回滚**调用方**的事务。
+
+    旧实现里那句 `conn.rollback()` 会把调用方已经写进来、还没 commit 的行一起丢掉
+    （实测：先 INSERT 一行，再 `undo(99999)` ⇒ 那行消失，1→0）。
+    今天 `_append` 自带 commit 碰不到它；**T8 只要做"批量写 + 末尾校验"就会静默丢写**。
+    """
+    ov.execute(
+        "INSERT INTO item_edits (item_id, msg_id, action, actor, created_at)"
+        " VALUES (1, 2, 'delete', 't', 0)"
+    )
+    assert overrides.undo(ov, edit_id=999999) is False
+    assert ov.execute("SELECT COUNT(*) FROM item_edits").fetchone()[0] == 1, (
+        "undo 的失败分支把调用方未提交的写入回滚掉了"
+    )
+
+
+def test_ensure_schema_sets_wal_journal_mode(tmp_path):
+    """**R6**：spec §3.3 明写 WAL，而默认建出来的库是 `delete`。
+
+    为什么必须**在建库时**设：T5 之后 `api.py` 的 `mode=ro` 只读连接会与
+    `refine` / T8 的写端点**并发**访问同一个库。rollback-journal 下写者持
+    EXCLUSIVE 锁 ⇒ 读请求撞 `database is locked`；而 `mode=ro` 的连接**不能**
+    把库转成 WAL（它连库头都写不了）。
+
+    ⚠️ 顺带钉住 R6 的风险面（实测）：WAL **不妨碍** `mode=ro` 的挂载
+    ——`-shm` / `-wal` 由 SQLite 按需重建（写者干净关闭时它们会被删掉）。
+    """
+    path = tmp_path / "overrides.db"
+    overrides.ensure_schema(path)
+    # 第二条连接：journal_mode 是**库**的属性，不是连接的
+    conn = overrides.connect(path)
+    try:
+        assert conn.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"
+    finally:
+        conn.close()
+    # WAL 也不影响只读挂载（T5 的读路径形状）
+    ro = sqlite3.connect(":memory:", uri=True)
+    try:
+        overrides.attach_readonly(ro, path)
+        assert ro.execute("SELECT COUNT(*) FROM ov.item_edits").fetchone()[0] == 0
+    finally:
+        ro.close()
