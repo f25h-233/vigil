@@ -144,3 +144,30 @@ def test_prune_keeps_files_at_the_boundary(logdir):
 
 def test_prune_tolerates_missing_dir(logdir):
     assert logs.prune_old_logs() == []      # logdir 还没建
+
+
+def test_handler_rolls_over_at_midnight(logdir, monkeypatch):
+    """⭐ 跨零点自动换文件。
+
+    没有这条的话，把 `DailyFileHandler.emit` 整个方法体换成
+    `super().emit(record)`（等于删掉跨零点逻辑）**11 条测试全绿**——
+    实测过。而它要防的是：一个从 23:50 跑到 00:20 的 refine 会把第二天
+    的事件全写进前一天的文件里，于是"日志是哪天跑的"这件事就对不上了。
+    """
+    day1 = dt.date(2026, 9, 16)
+    monkeypatch.setattr(logs, "_today", lambda: day1)
+
+    logs.setup()
+    logs.emit("零点前")
+    assert "零点前" in logs.log_path(day1).read_text(encoding="utf-8")
+
+    # 时钟跨过零点
+    day2 = day1 + dt.timedelta(days=1)
+    monkeypatch.setattr(logs, "_today", lambda: day2)
+    logs.emit("零点后")
+
+    after = logs.log_path(day2).read_text(encoding="utf-8")
+    assert "零点后" in after, "跨零点后的记录必须进**新一天**的文件"
+    assert "零点前" not in after, "旧记录不许跟着跑到新文件里"
+    assert "零点后" not in logs.log_path(day1).read_text(encoding="utf-8"), \
+        "新记录不许再写进前一天的文件"

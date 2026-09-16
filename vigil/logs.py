@@ -46,6 +46,18 @@ import re
 from .config import REPO_ROOT
 
 LOG_DIR = REPO_ROOT / "data" / "logs"
+
+
+def _today() -> dt.date:
+    """今天。**单独一个函数是为了让测试能换掉它**——跨零点换文件那条逻辑
+    没法靠等真的等到零点来测，而不测就等于没有（本项目抓过的「空守卫」）。
+
+    ⚠️ 生产路径也一律走它，不要图省事直接写 `dt.date.today()`：两处各写一份
+    的话，测试换掉的那个和实际用的那个会不是同一个。
+    """
+    return dt.date.today()
+
+
 LAST_ERROR_NAME = "LAST-ERROR.txt"
 
 # 日志保留天数。spec §7 R4 记着「磁盘紧张（C: 7.8 GB / D: 29 GB）」，
@@ -64,7 +76,7 @@ _LOG_NAME_RE = re.compile(r"^vigil-(\d{4})-(\d{2})-(\d{2})\.log$")
 
 def log_path(day: dt.date | None = None) -> pathlib.Path:
     """当天的日志文件路径。`LOG_DIR` 现读（见模块 docstring 末尾）。"""
-    day = day or dt.date.today()
+    day = day or _today()
     return LOG_DIR / f"vigil-{day:%Y-%m-%d}.log"
 
 
@@ -78,14 +90,19 @@ class DailyFileHandler(logging.FileHandler):
 
     def __init__(self, directory: pathlib.Path) -> None:
         self._dir = directory
-        self._day = dt.date.today()
-        super().__init__(self._name(), encoding="utf-8", delay=False)
+        self._day = _today()
+        super().__init__(self._current_path(), encoding="utf-8", delay=False)
 
-    def _name(self) -> str:
+    def _current_path(self) -> str:
+        # ⚠️ 这个方法**不能**叫 `_name`：`logging.Handler.__init__` 会给自己赋
+        # `self._name = None`（它是 `set_name` 的存储），同名方法会被实例属性
+        # **遮蔽**——构造时还调得动（那一次是在 `super().__init__` **之前**求值），
+        # 跨零点再调就成了 `None()` → TypeError。实测踩过：是
+        # `test_handler_rolls_over_at_midnight` 一红就红在这一行抓出来的。
         return str(self._dir / f"vigil-{self._day:%Y-%m-%d}.log")
 
     def emit(self, record: logging.LogRecord) -> None:
-        today = dt.date.today()
+        today = _today()
         if today != self._day:
             self._day = today
             self.acquire()
@@ -93,7 +110,7 @@ class DailyFileHandler(logging.FileHandler):
                 if self.stream:
                     self.stream.close()
                     self.stream = None
-                self.baseFilename = os.path.abspath(self._name())
+                self.baseFilename = os.path.abspath(self._current_path())
                 self.stream = self._open()
             finally:
                 self.release()
@@ -210,7 +227,7 @@ def prune_old_logs(*, keep_days: int = KEEP_DAYS,
     directory = LOG_DIR          # 现读
     if not directory.is_dir():
         return []
-    cutoff = (today or dt.date.today()) - dt.timedelta(days=keep_days)
+    cutoff = (today or _today()) - dt.timedelta(days=keep_days)
 
     removed: list[str] = []
     for p in sorted(directory.iterdir()):
