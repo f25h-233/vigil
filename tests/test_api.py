@@ -160,11 +160,161 @@ def test_api_typo_is_404_not_the_spa_page(client):
     assert "detail" in r.json()
 
 
+def test_bare_api_is_404_not_the_spa_page(client, tmp_path, monkeypatch):
+    """⭐ 裸 `/api`（无尾斜杠）也必须 404。
+
+    守卫原先只写了 `startswith("api/")`，而 `full_path == "api"` 不满足它
+    → 一路走到 SPA 兜底 → **200 的 HTML**：调用方 `r.json()` 直接炸，
+    而真正的 404 被吞掉（与上面 `/api/typo` 同一种病，只差一个斜杠）。
+
+    ⚠️ 断言**正文**而不只是状态码：本项目实测过「只看状态码的测试是空的」
+    ——兜底那一路返回的正是 200 的 index.html。这里把真 dist 摆上，
+    兜底确实能工作（见下一条阳性对照），所以 404 只可能来自那个守卫。
+    """
+    import vigil.api as api
+
+    dist = tmp_path / "dist"
+    dist.mkdir()
+    (dist / "index.html").write_text("<title>VIGIL 守夜人</title>", encoding="utf-8")
+    monkeypatch.setattr(api, "WEB_DIST", dist)
+
+    for path in ["/api", "/api/"]:
+        r = client.get(path)
+        assert r.status_code == 404, path
+        assert "VIGIL 守夜人" not in r.text, f"{path} 被 SPA 兜底接走了"
+        assert r.headers["content-type"].startswith("application/json"), path
+        assert "detail" in r.json(), path
+
+
+def test_spa_fallback_still_serves_frontend_routes(client, tmp_path, monkeypatch):
+    """阳性对照：无后缀的前端路由仍由 SPA 兜底发 index.html。
+
+    没有这条，「`/api` 是 404」可能只是因为**兜底整个坏掉了**——
+    那是把要修的东西连同兜底一起关掉的假绿。
+    """
+    import vigil.api as api
+
+    dist = tmp_path / "dist"
+    dist.mkdir()
+    (dist / "index.html").write_text("<title>VIGIL 守夜人</title>", encoding="utf-8")
+    monkeypatch.setattr(api, "WEB_DIST", dist)
+
+    r = client.get("/feed")
+    assert r.status_code == 200
+    assert r.text.startswith("<title>VIGIL 守夜人</title>")
+
+
 def test_categories_carry_counts(client):
     cats = client.get("/api/categories").json()["categories"]
     assert len(cats) == 7
     assert {"slug", "label", "icon", "count"} == set(cats[0])
     assert [c["slug"] for c in cats][0] == "notice"     # 顺序 = config 里的顺序
+
+
+# ── 日报两个端点（字段被 types.ts 冻结，Digests.tsx 直接消费）──────────
+#
+# ⚠️ 本文件此前对 digest **零断言**（不是"断言少"，是完全没有）。每个任务
+# 「自己那部分绿了」，而冻结契约的覆盖面从来没人整体核对过——这正是缺口能
+# 活到终审的结构性原因。下面几条按 `web/src/types.ts` 的 DigestSummary /
+# DigestDetail 逐字段核，**不照 api.py 的实现猜**。
+
+# types.ts 的 `Item`——日报详情里的 items 与 /api/items 是同一形状
+_ITEM_FIELDS = {
+    "item_id", "kind", "kind_label", "kind_icon", "title", "detail", "event_ts",
+    "deadline_ts", "group_id", "group_name", "actor", "place", "amount",
+    "links", "source_count",
+}
+# types.ts 的 `DigestSummary`
+_DIGEST_SUMMARY_FIELDS = {
+    "digest_id", "day", "window_from", "window_to", "created_at", "item_count",
+}
+
+# 窗口起点取**本地** 9/13 00:00，与 api._day_start 同口径——`day` 的推导正是
+# 要按本地日算，随手挑一个时间戳就测不到这件事（见 test_digest_day_is_local_day）。
+_DIGEST_FROM = int(dt.datetime(2026, 9, 13, 0, 0).timestamp())
+
+
+def _seed_digest(db: pathlib.Path, *, digest_id: int = 1) -> None:
+    """往临时库塞一篇日报 + 它引用的 item 1（db_path fixture 已经建好表）。"""
+    con = sqlite3.connect(str(db))
+    con.execute(
+        "INSERT INTO digests (digest_id, window_from, window_to, body_md, model,"
+        " prompt_ver, created_at) VALUES (?,?,?,?,?,?,?)",
+        (
+            digest_id, _DIGEST_FROM, _DIGEST_FROM + 86400,
+            "# 守夜人日报 · 2026-09-13\n\n正文一段。", "m", "v1", 1,
+        ),
+    )
+    con.execute(
+        "INSERT INTO digest_items (digest_id, item_id) VALUES (?,?)", (digest_id, 1)
+    )
+    con.commit()
+    con.close()
+
+
+def test_digests_list_carries_the_frozen_field_set(client, db_path):
+    """`/api/digests` 是**有外壳的**：`{digests: [...]}`（api.ts fetchDigests 也这么解）。"""
+    _seed_digest(db_path)
+    body = client.get("/api/digests").json()
+    assert set(body) == {"digests"}
+    rows = body["digests"]
+    assert isinstance(rows, list) and len(rows) == 1
+    d = rows[0]
+    assert set(d) == _DIGEST_SUMMARY_FIELDS          # 与 types.ts 逐字对应
+    assert isinstance(d["digest_id"], int)
+    assert isinstance(d["day"], str)
+    assert isinstance(d["window_from"], int)
+    assert isinstance(d["window_to"], int)
+    assert isinstance(d["created_at"], int)
+    assert isinstance(d["item_count"], int)
+    assert d["item_count"] == 1                      # 列表项下面那行「N 条条目」
+
+
+def test_digest_detail_carries_body_and_linked_items(client, db_path):
+    _seed_digest(db_path)
+    body = client.get("/api/digests/1").json()
+    assert set(body) == _DIGEST_SUMMARY_FIELDS | {"body_md", "items"}
+    assert isinstance(body["body_md"], str) and body["body_md"].startswith("# 守夜人日报")
+    items = body["items"]
+    assert isinstance(items, list) and len(items) == 1
+    assert set(items[0]) == _ITEM_FIELDS             # 关联条目与 /api/items 同形状
+    assert items[0]["item_id"] == 1                  # 就是日报引用的那一条
+
+
+def test_digest_day_is_the_local_day(client, db_path):
+    """⚠️ `day` 是**时区敏感**推导，而 Digests.tsx 拿它当整页唯一标题。
+
+    本项目已两次栽在 UTC/本地 8 小时差上（api.py:41-42 的注释记着这件事），
+    所以期望值**用 stdlib 独立算**——**不许调 `api._day_of`**：拿被测实现去
+    验证被测实现是空守卫，换成 UTC 口径照样绿。
+    """
+    _seed_digest(db_path)
+    expect = dt.datetime.fromtimestamp(_DIGEST_FROM).strftime("%Y-%m-%d")
+    assert client.get("/api/digests").json()["digests"][0]["day"] == expect
+    assert client.get("/api/digests/1").json()["day"] == expect
+    # 本机时区是 UTC+08:00：本地 9/13 00:00 在 UTC 口径下是 09-12，所以这句
+    # 对「换成 UTC 口径」有**真实区分力**（实测：把 _day_of 换成 UTC 版本，
+    # 上面两句变红）。若在 UTC+00:00 的机器上跑，两个口径同串、这里就没有
+    # 区分力——那种环境下它证明不了本地/UTC 之别，别把它当成证明。
+    utc_day = dt.datetime.fromtimestamp(_DIGEST_FROM, dt.timezone.utc).strftime("%Y-%m-%d")
+    if utc_day != expect:
+        assert client.get("/api/digests/1").json()["day"] != utc_day
+
+
+def test_missing_digest_is_404_json(client, tmp_path, monkeypatch):
+    """不存在的日报 → 404 的 JSON，不是 200 的 HTML（同 /api/typo 那一类）。"""
+    import vigil.api as api
+
+    dist = tmp_path / "dist"
+    dist.mkdir()
+    (dist / "index.html").write_text("<title>VIGIL 守夜人</title>", encoding="utf-8")
+    monkeypatch.setattr(api, "WEB_DIST", dist)
+
+    r = client.get("/api/digests/999999")
+    assert r.status_code == 404
+    assert "VIGIL 守夜人" not in r.text
+    assert r.headers["content-type"].startswith("application/json")
+    assert "detail" in r.json()
 
 
 def test_since_and_until_include_the_named_days(client):
@@ -177,6 +327,44 @@ def test_since_and_until_include_the_named_days(client):
 def test_bad_date_is_400_not_500(client):
     r = client.get("/api/items", params={"since": "不是日期"})
     assert r.status_code == 400 and "detail" in r.json()
+
+
+# ── 坏输入的第二种形状：日期合法，但落不到可表示的 epoch 秒上 ──────────
+#
+# ⚠️ 「能解析成日期」与「能表示成时间戳」不是同一件事。下面四条一起才完整：
+# 前两条钉住两个**实测**的失败窗口，后两条是阳性对照——证明 400 不是靠
+# 「把整条日期路径弄挂」换来的假绿（那种改法会让后两条也变红）。
+
+
+def test_until_far_future_is_400_not_500(client):
+    """`9999-12-31` 是合法日期，但 until 的右端要 +1 天 →
+    `date + timedelta` 先抛 OverflowError，未捕获就是 500。"""
+    r = client.get("/api/items", params={"until": "9999-12-31"})
+    assert r.status_code == 400
+    assert "detail" in r.json()
+
+
+def test_since_before_epoch_is_400_not_500(client):
+    """`1970-01-01` 是合法日期，却在本机（Windows）的 `timestamp()` 上抛
+    OSError [Errno 22]。它正是用户/模型表达「最早」时最经典的哨兵。"""
+    r = client.get("/api/items", params={"since": "1970-01-01"})
+    assert r.status_code == 400
+    assert "detail" in r.json()
+
+
+def test_normal_date_window_still_200(client):
+    """阳性对照：正常窗口必须照常 200——否则上面两条的 400 可能是
+    「整条路径被弄挂」换来的（那种改法会让这条变红）。"""
+    r = client.get(
+        "/api/items", params={"since": "2026-09-13", "until": "2026-09-13"}
+    )
+    assert r.status_code == 200 and r.json()["total"] == 1
+
+
+def test_date_inside_the_range_is_200(client):
+    """边界内正常值：2038 年也在可表示范围内（本机实测 = 2145888000）。"""
+    r = client.get("/api/items", params={"until": "2038-01-01"})
+    assert r.status_code == 200 and r.json()["total"] == 1
 
 
 def test_limit_over_max_is_422(client):
@@ -215,6 +403,51 @@ def test_static_file_is_served_as_a_file_not_the_spa_page(client, tmp_path, monk
     r = client.get("/manifest.webmanifest")
     assert r.status_code == 404                          # 真没有就 404，不许拿 index.html 顶
     assert client.get("/some/route").text.startswith("<title>VIGIL")   # SPA 兜底仍工作
+
+
+def test_static_file_content_type_comes_from_the_table(client, tmp_path, monkeypatch):
+    """⭐ 真文件的 content-type 必须与 `_MIME` 的**值**一致。
+
+    这是**栽过一次**的同类缺陷（见 api.py 里 _MIME 上方那段长注释）：SPA 兜底
+    曾让 sw.js / manifest / 图标返回 200 的 HTML，浏览器把 HTML 当 manifest
+    解析、当 SW 注册，「添加到主屏」整条路走不通——**而所有状态码都是 200**，
+    日志上一个异常都没有。终审实测更狠：把 ``_MIME[".js"]`` 的值改成
+    ``text/html``，当时 14 条测试全绿——状态码对了、正文也对了，唯独 MIME
+    错了，而**后果与「发 HTML」完全相同**。
+
+    所以期望值在测试里**逐字写死**，绝不写成 ``api._MIME[".js"]``——那等于
+    拿被测实现去验证被测实现，两边一起改就怎么改都绿（空守卫的经典形状）。
+    全表覆盖：任何一格的值写错，这条都变红。
+
+    ⚠️ 用 `startswith`：Starlette 对 ``text/*`` 会追加 ``; charset=utf-8``
+    （本机实测 ``text/javascript; charset=utf-8``）。
+    """
+    import vigil.api as api
+
+    dist = tmp_path / "dist"
+    dist.mkdir()
+    (dist / "index.html").write_text("<title>VIGIL 守夜人</title>", encoding="utf-8")
+    expect = {
+        ".js": "text/javascript",                    # ← PWA 的 SW：错了整条路走不通
+        ".css": "text/css",
+        ".webmanifest": "application/manifest+json",  # ← 「添加到主屏」的清单，同上
+        ".json": "application/json",
+        ".png": "image/png",
+        ".svg": "image/svg+xml",
+        ".ico": "image/x-icon",
+        ".woff2": "font/woff2",
+        ".txt": "text/plain",
+    }
+    for suffix in expect:
+        (dist / f"probe{suffix}").write_bytes(b"x")
+    monkeypatch.setattr(api, "WEB_DIST", dist)
+
+    for suffix, mime in expect.items():
+        r = client.get(f"/probe{suffix}")
+        assert r.status_code == 200, suffix
+        assert r.headers["content-type"].startswith(mime), (
+            suffix, r.headers["content-type"], mime,
+        )
 
 
 def test_path_traversal_is_blocked(client, tmp_path, monkeypatch):

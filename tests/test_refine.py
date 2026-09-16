@@ -524,6 +524,139 @@ def test_refine_keeps_deadline_with_literal_evidence():
     assert out[0].deadline_ts == ts
 
 
+def test_parse_deadline_treats_out_of_range_dates_as_no_deadline():
+    """⚠️ 「能解析成日期」与「能转成 unix 秒」是**两件事**——坏输入有两种形状。
+
+    `_parse_deadline` 原先只捕 ValueError（挡"格式错"），而 `"1970-01-01"`
+    是**合法日期**，却在 `timestamp()` 上抛 OSError（本机实测；Windows 拒绝
+    1970-01-03 之前的日期）。而它偏偏是模型表达「没有截止日」最经典的哨兵
+    ——最常见的那个值成了地雷。既有语义是"解析不了就当没有——**不猜**"，
+    格式错与范围外在这条语义下没有区别，所以都返回 None。
+
+    ⚠️ 这几格是**平台相关**的（POSIX 的 `timestamp()` 通常接受 1970 年）。
+    本项目是 Windows 本地工具，按本机事实写；换平台时这条要重新裁决，
+    别把它的绿当成跨平台的绿。
+    """
+    # 本体：无论"吞掉异常"还是"本来就转得成"，**都不许抛**出去——
+    # 抛出去就是「一条 item 掀掉整轮」的起点（见下面两条端到端用例）
+    for value in ("1970-01-01", "1970-01-02", "4000-01-01", "9999-12-30"):
+        assert refine._parse_deadline(value) is None, value
+    assert refine._parse_deadline("不是日期") is None   # 原有的格式错照旧
+    assert refine._parse_deadline("") is None
+    assert refine._parse_deadline(None) is None
+    # 阳性对照：窗口内的正常日期照常解析——上面那些 None 不是"整个函数瘫了"
+    import datetime as dt
+
+    assert refine._parse_deadline("2026-09-07") == int(
+        dt.datetime(2026, 9, 7).timestamp()
+    )
+
+
+# ── B-1：一个模型输出不许掀掉整轮 refine ────────────────────
+#
+# ⚠️ 下面两条端到端用例的分工，读之前先看明白（brief 的原始配方在这里做了
+# 一处必要的拆分，理由写进报告）：
+#   · `..._survives_the_1970_sentinel_...` 就是 brief 的配方本身：模型吐哨兵
+#     日期 1970-01-01，整轮必须跑完。它钉的是修法**第一步**的语义（范围外的
+#     日期 = 没有截止日），把 `_parse_deadline` 的捕获退回 ValueError 它就变红。
+#   · `..._keeps_going_when_a_batch_postprocess_fails` 注入一个**真正的**本地
+#     后处理异常（落库失败），钉的是修法**第二步**。把保护圈退回只捕 LLMError
+#     它就变红——终审点名的性质（「单批失败不中断整轮」）由它验收。
+# 两条合起来才盖住「M1 留的洞」与「M3 塞进去的新调用点」两个半边。
+
+
+def _scripted(user: str, *, deadline: str | None) -> dict:
+    """按批次内容产出条目——3 条种子消息 → batch_size=1 时正好 3 批。"""
+    if "明天下午有讲座" in user:
+        return {
+            "items": [
+                {"quote": "明天下午有讲座", "kind": "activity",
+                 "title": "西太湖报告厅有讲座", "detail": None, "deadline": None,
+                 "place": None, "amount": None, "confidence": 0.9}
+            ]
+        }
+    if "数学作业截止到9月7号" in user:
+        return {
+            "items": [
+                {"quote": "数学作业截止到9月7号", "kind": "academic",
+                 "title": "数学作业截止", "detail": None, "deadline": deadline,
+                 "place": None, "amount": None, "confidence": 0.9}
+            ]
+        }
+    return {"items": []}
+
+
+def test_refine_survives_the_1970_sentinel_end_to_end(seeded, monkeypatch):
+    """⚠️ `"1970-01-01"` 是模型表达「没有截止日」最经典的哨兵，而它是**合法
+    日期**——`strptime` 过了，`timestamp()` 抛 OSError。它从 `_to_item` 抛出，
+    而 `_to_item` 在每批 try/except 的**外面**，于是整轮 refine 终止：
+    前面跑完的批次白跑，剩下的批次永远不跑。
+
+    这条从模型输出一路走到 items 表，断的是**整轮跑完**，
+    不是"`_parse_deadline` 不抛"（那只是单元级、证明不了什么）。
+    """
+    fake = FakeLLM(lambda user: _scripted(user, deadline="1970-01-01"))
+    monkeypatch.setattr(refine, "chat_json", fake)
+
+    stats = refine.refine(
+        StubConfig(), api_key="k", conn=seeded, batch_size=1,
+        on_progress=lambda *a, **k: None,
+    )
+
+    assert stats.batches == 3, "3 批必须全部跑完（被掀掉的话停在 1）"
+    assert stats.errors == [], "哨兵日期是「没有截止日」，不是错误"
+    # 两条条目都落库：哨兵那条的 deadline_ts 是 NULL（"没有截止日"），
+    # 其余字段照常——降级的是日期，不是条目本身
+    assert dict(seeded.execute("SELECT title, deadline_ts FROM items").fetchall()) == {
+        "西太湖报告厅有讲座": None, "数学作业截止": None,
+    }
+    assert stats.items_saved == 2
+    assert stats.deadlines_dropped == 0, "哨兵不是「源文无依据」，不该计入降级"
+    assert seeded.execute(
+        "SELECT count(*) FROM refine_runs WHERE status = 'error'"
+    ).fetchone()[0] == 0
+
+
+def test_refine_keeps_going_when_a_batch_postprocess_fails(seeded, monkeypatch):
+    """⭐ 单批的**本地后处理**失败，整轮不被打断。
+
+    保护圈原先只圈住 `chat_json` 那一句（M1 的形状：只对**网络**失败成立），
+    解析/核验/落库/记账全在圈外——`store.save_items(...)` 那个 sqlite3.Error
+    正是 brief 亲自点名的一半。这条注入一个真的本地失败，然后断言：
+
+      · 3 批全部跑完（被掀掉的话 `stats.batches == 1`）
+      · 失败那批进 `stats.errors`、进 refine_runs 的 error 行（**可见**，
+        不是静默吞异常——静默吞异常是不可接受的）
+      · 别的批次的 item **真的落库了**（"继续跑"必须有产出）
+    """
+    fake = FakeLLM(lambda user: _scripted(user, deadline=None))
+    monkeypatch.setattr(refine, "chat_json", fake)
+
+    real_save = store.save_items
+
+    def flaky_save(conn, items, **kwargs):
+        if any(it.title == "西太湖报告厅有讲座" for it in items):
+            raise sqlite3.OperationalError("模拟落库失败")
+        return real_save(conn, items, **kwargs)
+
+    monkeypatch.setattr(refine.store, "save_items", flaky_save)
+
+    stats = refine.refine(
+        StubConfig(), api_key="k", conn=seeded, batch_size=1,
+        on_progress=lambda *a, **k: None,
+    )
+
+    assert stats.batches == 3, "3 批必须全部跑完（被掀掉的话停在 1）"
+    assert any("第 1 批" in e for e in stats.errors), stats.errors
+    assert seeded.execute(
+        "SELECT count(*) FROM refine_runs WHERE status = 'error' AND msg_id = 1"
+    ).fetchone()[0] == 1, "失败要记进 refine_runs，不能只写在 stats 里"
+    assert seeded.execute("SELECT title FROM items").fetchall() == [
+        ("数学作业截止",)
+    ], "后面那批的条目照常落库——「继续跑」得是有产出的"
+    assert stats.items_saved == 1
+
+
 def test_refine_wires_the_deadline_drop_end_to_end(seeded, monkeypatch):
     """接线也要守——**brief 的两条用例直接调私有函数，一条都没经过 `refine()`**。
 
