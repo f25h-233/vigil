@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import hashlib
 import pathlib
 import sqlite3
 
@@ -543,23 +544,108 @@ def test_missing_static_asset_is_404_not_index_html(
 # ── Task 8：写端点（只写 overlay，绝不写 vigil.db） ──────────────
 
 
+def _vigil_db_fingerprint(db: pathlib.Path) -> dict[str, str]:
+    """`data/vigil.db` 的**整个文件集**指纹：主文件 + WAL 边车（`-wal` / `-shm`）。
+
+    ⚠️ **为什么不能只哈希主文件**（T8 审查的 FIX 1，实测）：生产库是
+    `journal_mode=wal`，而 **WAL 下写完之后主文件的字节可以一字不变**——
+    改动全在 `-wal` 里。实测（副本里，把 `api_set_kind` 变异成写主库）：
+    主文件 sha256 `bdb901ec…` 前后相同，`-wal` 从 `e3b0c442…`（空）变成 `af0c6653…`，
+    `status_code` 还是 200。**条件是写的过程中一直开着一条读者连接**（生产就是这样：
+    api 的 `mode=ro` 与 refine/digest 的写并发，R6 加 WAL 正是为此）——
+    写者 close 时不是最后一个连接，于是**不 checkpoint**，证据只留在 `-wal` 里。
+    ⇒ 只哈希主文件的守卫在那时是**假绿**：「字节没变」**不等于**「没写过」。
+
+    ⚠️ **取指纹必须在预热之后**：本 API 的第一条连接会把 `-wal`（0 字节）与
+    `-shm` 造出来——那是「打开过」的痕迹，不是「写过」。所以测试先来一次读
+    （`GET /api/items`）再取 before；`<missing>` 与 0 字节是两种不同的值，
+    刻意不统一，免得把「侧车刚被建出来」误读成「写过了」。
+    """
+    out: dict[str, str] = {}
+    for suffix in ("", "-wal", "-shm"):
+        path = db if not suffix else db.with_name(db.name + suffix)
+        out[suffix or "main"] = (
+            hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else "<missing>"
+        )
+    return out
+
+
+def _assert_db_untouched(before: dict[str, str], after: dict[str, str], what: str) -> None:
+    """比整个文件集，并把**变了哪个文件**写进消息（诊断用：假红也要能一眼定性）。"""
+    changed = [name for name in before if before[name] != after[name]]
+    assert not changed, (
+        "⚠️ 写端点动了 data/vigil.db——D11 的机械保证被打破",
+        what,
+        {name: (before[name], after[name]) for name in changed},
+    )
+
+
 def test_write_kind_does_not_touch_vigil_db(client, db_path):
     """⭐ D11 的机械守卫：写端点跑完，`data/vigil.db` 的字节必须**一点没变**。
 
     ⚠️ 这不是"检查没报错"——是把**整个文件的哈希**前后比。
     任何绕过 overlay 直接写主库的实现，都会在这里变红。
     """
-    import hashlib
-
-    before = hashlib.sha256(db_path.read_bytes()).hexdigest()
+    before = _vigil_db_fingerprint(db_path)
 
     r = client.post("/api/items/1/kind", json={"kind": "life"})
     assert r.status_code == 200
     assert r.json()["edit_id"] > 0
 
-    assert hashlib.sha256(db_path.read_bytes()).hexdigest() == before, (
-        "⚠️ 写端点动了 data/vigil.db——D11 的机械保证被打破"
-    )
+    _assert_db_untouched(before, _vigil_db_fingerprint(db_path), "POST /api/items/1/kind")
+
+
+def test_delete_and_undo_do_not_touch_vigil_db(client, db_path):
+    """⭐ FIX 1 的另一半：**删除与撤销**也上文件哈希（reviewer 问的"该不该扩"）。
+
+    判据与 `set_kind` 那条**同源**（同一个指纹助手），但覆盖的是另外两条写路径。
+    为什么它们不能只靠状态断言（"列表里没了"/"undo 之后回来了"）：
+    状态断言只能证明**overlay 写对了**，证明不了**主库没被顺手写**——
+    「既写 overlay 又 UPDATE 主库」的实现在那两条断言下**全绿**，而它正是
+    最可能被"顺手同步一下"引入的违规形状（D11 的机械保证是"绝不允许"，不是"以 overlay 为准"）。
+    """
+    before = _vigil_db_fingerprint(db_path)
+    assert client.delete("/api/items/1").status_code == 200
+    _assert_db_untouched(before, _vigil_db_fingerprint(db_path), "DELETE /api/items/1")
+
+    before = _vigil_db_fingerprint(db_path)
+    assert client.post("/api/undo", json={"edit_id": None}).json()["undone"] is True
+    _assert_db_untouched(before, _vigil_db_fingerprint(db_path), "POST /api/undo")
+
+
+def test_no_write_endpoint_touches_the_wal_sidecar(client, db_path):
+    """⭐ FIX 1 的核心：**生产库是 WAL**，主文件字节不变**也可能是写过**（见助手 docstring）。
+
+    这条把夹具库切成 `journal_mode=wal`，并且**整段过程一直开着一条读者连接**
+    （= 生产中 api 与 refine 并发的形状）⇒ 违规写的证据**只**会留在 `-wal` 里。
+    实测：把 `api_set_kind` 变异成写主库时，**只哈希主文件的守卫全绿**，
+    而本条（含 `-wal`/`-shm`）变红。三条写端点都过一遍。
+    """
+    con = sqlite3.connect(str(db_path))
+    try:
+        assert con.execute("PRAGMA journal_mode=wal").fetchone()[0] == "wal"
+    finally:
+        con.close()
+
+    # 预热：让 API 的第一条连接把 `-wal`/`-shm` 建出来（那是"打开过"，不是"写过"）
+    assert client.get("/api/items").status_code == 200
+
+    reader = sqlite3.connect(f"file:{db_path.as_posix()}?mode=ro", uri=True)
+    try:
+        reader.execute("SELECT COUNT(*) FROM items").fetchone()
+        steps = (
+            ("POST /api/items/1/kind", lambda: client.post(
+                "/api/items/1/kind", json={"kind": "life"})),
+            ("DELETE /api/items/1", lambda: client.delete("/api/items/1")),
+            ("POST /api/undo", lambda: client.post("/api/undo", json={"edit_id": None})),
+        )
+        for what, call in steps:
+            before = _vigil_db_fingerprint(db_path)
+            r = call()
+            assert r.status_code == 200, (what, r.status_code, r.text)
+            _assert_db_untouched(before, _vigil_db_fingerprint(db_path), what)
+    finally:
+        reader.close()
 
 
 def test_set_kind_is_visible_in_the_list(client):

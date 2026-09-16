@@ -834,6 +834,9 @@ def test_soft_deleted_item_still_shows_up_in_deadline_audit(cli_env, monkeypatch
     ⚠️ 这条守卫还替一个**更重的**事实站岗：`cli.py` 里那个
     `SELECT title FROM items WHERE item_id = ?` 后面直接是 `.fetchone()[0]`。
     T5 审查实测：**给 `items_with_deadline` 接上 overlay 反而会崩**——
+    （T8 fix loop **复跑确认**了这条：把标题查询接上 overlay 并过滤软删后，
+    本条红在 `TypeError: 'NoneType' object is not subscriptable`，
+    `vigil/cli.py:525`——就是下面那句 `.fetchone()[0]`。见 task-8-report.md 的 E5。）
     软删之后这条查询返回 `None`，`[0]` 抛 `TypeError`。
     所以「不接」不是遗漏，是判断；而判断需要有东西钉住。
 
