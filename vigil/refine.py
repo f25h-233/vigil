@@ -22,7 +22,7 @@ from pathlib import Path
 from . import prefilter, store
 from .categories import Category, prompt_block
 from .config import Config
-from .deadline import deadline_supported
+from .deadline import deadline_sane, deadline_supported, place_supported
 from .llm import DEFAULT_MODEL, LLMConfig, LLMError, chat_json, sanitize_for_llm
 from .redact import Redactor
 from .store import PendingMessage
@@ -276,6 +276,11 @@ def _to_item(
     if source is None:
         return None
 
+    # ⚠️ 依据只许来自**这一条**消息（`src_msg_ids` 恒为 `(source.msg_id,)`）。
+    # 拿整个 batch 的正文去拼会重演 `deadline.py` 里 `_GAP` 注释记的那个坑：
+    # 跨消息拼接**凭空造出证据**。
+    source_ids = frozenset({source.msg_id})
+
     kind = str(raw.get("kind", "")).strip()
     if kind not in known_kinds:
         return None
@@ -299,15 +304,25 @@ def _to_item(
         text = str(value).strip()
         return text or None
 
+    # ⚠️ 两道要素闸门都在**写入边界**上做，理由与 _drop_unsupported_deadlines
+    # 的 docstring 完全一样：数据一旦入库就到处流，每个读取方各挡一次迟早有人忘。
+    sources_text = "\n".join((m.content or "") for m in batch if m.msg_id in source_ids)
+    raw_place = _text("place")
+    place = raw_place if place_supported(raw_place, sources_text) else None
+
+    deadline_ts = _parse_deadline(raw.get("deadline"))
+    if deadline_ts is not None and not deadline_sane(deadline_ts, source.ts):
+        deadline_ts = None
+
     return store.ExtractedItem(
         kind=kind,
         title=title,
         detail=_text("detail"),
         event_ts=source.ts,
-        deadline_ts=_parse_deadline(raw.get("deadline")),
+        deadline_ts=deadline_ts,
         group_id=source.group_id,
         actor_uid=source.sender_uid or None,
-        place=_text("place"),
+        place=place,
         links=links,
         amount=_text("amount"),
         confidence=max(0.0, min(1.0, confidence)),

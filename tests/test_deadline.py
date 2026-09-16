@@ -50,3 +50,88 @@ def test_unverified_ids_treats_missing_source_row_as_unsupported():
 
 def test_unverified_ids_ignores_items_without_deadline():
     assert deadline.unverified_item_ids([(1, None), (2, None)], {}) == frozenset()
+
+# ── Task 2：place 证据闸门 ────────────────────────────────────────
+
+import datetime as _dt
+
+from vigil.deadline import deadline_sane, place_supported
+
+
+def _ts(y, m, d, h=12):
+    return int(_dt.datetime(y, m, d, h).timestamp())
+
+
+def test_place_supported_by_literal_substring():
+    assert place_supported("西太湖校区", "西太湖连隔板") is True
+
+
+def test_place_supported_by_bigram_overlap():
+    """源文只有「西太湖」，place 是「西太湖校区」——2 字子串命中即算有依据。"""
+    assert place_supported("科教城宿舍", "科教城的同学宿舍没有校园网") is True
+
+
+def test_place_without_evidence_is_unsupported():
+    """item 249 的真实形状：源文只有时间，没有任何地点。"""
+    assert place_supported("立德楼1阶", "周六下午4.00-8.00") is False
+
+
+def test_place_shorter_than_2_chars_is_not_judged():
+    """⚠️ 单字 place（真实数据 item 295 的 `湖`）判据**不适用**——bigram 是空集。
+
+    这是「多分支判据必须多分支守卫」的落点：若把这条分支写成 return False，
+    它就会把「湖」误清，而**没有任何测试会因此变红**。
+    """
+    assert place_supported("湖", "湖收磁吸灯或者小台灯") is True
+
+
+def test_place_none_is_not_judged():
+    """没有 place 就没有可核验的东西——返回 True（不构成"无依据"）。"""
+    assert place_supported(None, "任意源文") is True
+    assert place_supported("", "任意源文") is True
+
+
+def test_place_ignores_separators_and_whitespace():
+    """place 用了顿号/空格分隔（真实数据 item 271 的形状）。"""
+    assert place_supported("8号楼超市、2号楼超市", "8号楼超市今天上新") is True
+
+
+# ── Task 2：deadline 时序闸门 ─────────────────────────────────────
+
+
+def test_deadline_before_message_day_is_insane():
+    """item 83 的真实形状：死线比消息早 91 天。"""
+    assert deadline_sane(_ts(2026, 5, 6), _ts(2026, 8, 5)) is False
+
+
+def test_deadline_same_day_is_sane():
+    """同一天不过夜——不判死（当天截止是常见的真实情况）。"""
+    assert deadline_sane(_ts(2026, 9, 16, 8), _ts(2026, 9, 16, 23)) is True
+
+
+def test_deadline_after_message_is_sane():
+    assert deadline_sane(_ts(2026, 9, 20), _ts(2026, 9, 16)) is True
+
+
+def test_deadline_none_is_sane():
+    assert deadline_sane(None, _ts(2026, 9, 16)) is True
+
+
+def test_day_start_survives_pre_1970_event_ts():
+    """⚠️ 回退分支的守卫（偏差新增，见报告「偏差」第 3 与第 4 条）。
+
+    触发点不在单元层，而是**整批丢数据**：既有夹具用 ts=1000/1001/1002，
+    `_day_start_of` 一抛，`refine()` 每批的 `try/except` 就把那一批的 items
+    全吞掉（实测：`test_refine_parses_deadline` 与
+    `test_refine_wires_the_deadline_drop_end_to_end` 双双变红）。
+    没有这条守卫，把回退分支删掉就只有那两条**别的文件**的用例偶然挡一下。
+
+    ⚠️ **不写死 -28800**：它是 UTC+8 的机器相关值，换时区就不对。这里钉的是
+    与机器无关的三条性质：不抛、< ts（不是把 ts 原样返回）、同一天归一。
+    """
+    ds = deadline._day_start_of(1000)          # 1970-01-01 08:16:40 本地
+    assert deadline._day_start_of(4600) == ds, "同一天内的两个时刻必须归到同一个日界"
+    assert ds < 1000, "日界必须**早于**当天时刻（不是把 ts 原样返回）"
+    assert ds >= 1000 - 86400, "日界不可能比前一天还早"
+    # 判据是「早于消息当天」，不是「算不出来就清」——畸形 event_ts 不许把未来死线判死
+    assert deadline.deadline_sane(_ts(2026, 9, 7), 1000) is True
