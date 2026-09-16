@@ -760,6 +760,17 @@ _ITEM_JOINS = (
 # 漏掉任何一处的后果是「界面上删了、日报里还在」（R13）。
 _NOT_DELETED = "IFNULL(ost.deleted, 0) = 0"
 
+# ⚠️ 日报的**计数**（`item_count`）必须与 `digest_items` 用**同一套过滤**
+# （裁决 R9 / T5 修复轮 1）。此前这里是未过滤的 `COUNT(*) FROM digest_items`，
+# 而 `digest_items` 已过滤 ⇒ 同一响应里「列表说 3 条、items 只有 2 条」，自相矛盾
+# （`web/src/types.ts` 直接用这个字段）。抽成常量是为了**只剩一处可改**。
+_DIGEST_ITEM_COUNT = (
+    " (SELECT COUNT(*) FROM digest_items di"
+    " JOIN items i ON i.item_id = di.item_id"
+    " LEFT JOIN ov.item_state ost ON ost.item_id = i.item_id"
+    f" WHERE di.digest_id = d.digest_id AND {_NOT_DELETED})"
+)
+
 
 def _parse_links(raw: object) -> tuple[str, ...]:
     """``items.links`` 存的是 JSON 数组文本。
@@ -932,10 +943,14 @@ def kind_counts(conn: sqlite3.Connection) -> dict[str, int]:
 def list_digests(
     conn: sqlite3.Connection, *, limit: int = 30
 ) -> list[DigestSummaryRow]:
-    """日报列表，最近的窗口在前。**不带正文**——列表页用不上，白白撑大响应。"""
+    """日报列表，最近的窗口在前。**不带正文**——列表页用不上，白白撑大响应。
+
+    ⚠️ `item_count` 与 `digest_items` 同源（裁決 R9）：软删的条目**不计入**。
+    """
+    _ensure_overlay(conn)
     rows = conn.execute(
         "SELECT d.digest_id, d.window_from, d.window_to, d.created_at,"
-        " (SELECT COUNT(*) FROM digest_items di WHERE di.digest_id = d.digest_id)"
+        f"{_DIGEST_ITEM_COUNT}"
         " FROM digests d ORDER BY d.window_from DESC LIMIT ?",
         (limit,),
     ).fetchall()
@@ -943,9 +958,11 @@ def list_digests(
 
 
 def get_digest(conn: sqlite3.Connection, digest_id: int) -> DigestRow | None:
+    """一篇日报（含正文）。⚠️ `item_count` 与 `digest_items` 同源（裁決 R9）。"""
+    _ensure_overlay(conn)
     row = conn.execute(
         "SELECT d.digest_id, d.window_from, d.window_to, d.body_md, d.created_at,"
-        " (SELECT COUNT(*) FROM digest_items di WHERE di.digest_id = d.digest_id)"
+        f"{_DIGEST_ITEM_COUNT}"
         " FROM digests d WHERE d.digest_id = ?",
         (digest_id,),
     ).fetchone()
@@ -955,8 +972,12 @@ def get_digest(conn: sqlite3.Connection, digest_id: int) -> DigestRow | None:
 def digest_items(conn: sqlite3.Connection, digest_id: int) -> list[ApiItem]:
     """一篇日报引用的条目，按 ``(event_ts, item_id)`` 升序——与日报正文同序。
 
-    ⚠️ 软删的条目在这里也必须消失：`/api/digests/{id}` 的条目清单
-    与日报正文是**同一份数据的两处显示**，缺一边就是 R13。
+    ⚠️ 软删的条目在这里必须消失（D15）。理由**不是**「与 `body_md` 保持一致」
+    ——`digests.body_md` 是**快照**（生成当时的正文，不随干预层变化），
+    过滤与不过滤都会与它不同。真理由是两条：
+    ① D15 要求被删条目从界面**与日报**一起消失；
+    ② `/api/digests/{id}` 里 `item_count` 与 `items` 是**同一个响应**，
+       两者必须自洽（裁決 R9——`item_count` 与这里同源）。
     """
     _ensure_overlay(conn)
     rows = conn.execute(

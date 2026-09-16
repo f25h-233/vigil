@@ -18,6 +18,7 @@
 
 from __future__ import annotations
 
+import logging
 import pathlib
 import sqlite3
 import time
@@ -25,6 +26,10 @@ import time
 from .config import REPO_ROOT
 
 OVERRIDES_DB = REPO_ROOT / "data" / "overrides.db"
+
+# ⚠️ 情形②的降级**必须响亮**（裁决 R8）：静默降级会把真正的部署问题
+# （`data/` 不可写 / 路径非法）藏起来，而表现是「人工干预全都不见了」。
+_log = logging.getLogger(__name__)
 
 ACTION_SET_KIND = "set_kind"
 ACTION_SET_FIELD = "set_field"
@@ -54,6 +59,39 @@ CREATE TABLE IF NOT EXISTS item_state (
 
 class OverlayError(RuntimeError):
     """人工干预层的使用错误——快速失败。"""
+
+
+def _qualified_ddl(schema: str) -> list[str]:
+    """把 `_TABLES_DDL` 的库名限定到 `schema`，并按语句拆开返回。
+
+    ⚠️ **不手抄第二份 DDL**：抄一份就会与 `_TABLES_DDL` 漂移，
+    而漂移方向恰好是「兜底时看到的表 ≠ 生产里读到的表」。
+    ⚠️ 返回**语句列表**而不是整段脚本：`executescript` 会先隐式 COMMIT，
+    而调用方（`digest` / `refine` 的连接）可能正开着一段事务。
+    """
+    out = _TABLES_DDL
+    out = out.replace(
+        "CREATE TABLE IF NOT EXISTS ", f"CREATE TABLE IF NOT EXISTS {schema}."
+    )
+    out = out.replace(
+        "CREATE INDEX IF NOT EXISTS ", f"CREATE INDEX IF NOT EXISTS {schema}."
+    )
+    # ⚠️ 索引的**表名不许带库名**（SQLite 语法：`CREATE INDEX ov.x ON item_edits(...)`
+    # 是 `near ".": syntax error`）；只限定索引名，表名由 SQLite 在同一 schema 内解析
+    # （实测：`ov` 里没有 `main.item_edits` 也能建成功）。
+    return [stmt for stmt in (s.strip() for s in out.split(";")) if stmt]
+
+
+def _attach_empty_overlay(conn: sqlite3.Connection) -> None:
+    """情形②的兜底：挂一个**内存空库**当 `ov`，并把两张表立起来。
+
+    ⚠️ 只用于「库本来就不存在、而且建不出来」——那时「没有任何干预」是**确定的**
+    （文件都没有）。文件存在时**绝不许**走这里：`attach_readonly` 会抛 `OverlayError`。
+    ⚠️ 零写：`:memory:` 不产生任何文件，也不碰主库——所以"读取路径不许写盘"仍然成立。
+    """
+    conn.execute("ATTACH DATABASE ':memory:' AS ov")
+    for stmt in _qualified_ddl("ov"):
+        conn.execute(stmt)
 
 
 def ensure_tables(conn: sqlite3.Connection) -> None:
@@ -99,6 +137,13 @@ def attach_readonly(conn: sqlite3.Connection, path: pathlib.Path | None = None) 
     这不违反 D11（overlay 本来就在 Web 的可写范围内），也比"读路径分支 SQL"干净得多
     ——分支 SQL 会让"忘了处理没 attach 的情况"重新变成一种可能。
 
+    ⚠️ **挂不上时分两种情形处置**（裁决 R8 / T5 修复轮 1）：
+    * **文件存在**但挂不上 ⇒ 抛 `OverlayError`，**绝不降级**：文件里可能有墓碑，
+      降级 = 被软删的条目悄悄复活 + 改过的类目回退（直接违反 D15）。
+    * **文件不存在、而且建不出来**（`data/` 不可写 / 路径非法）⇒ 降级为「无干预」：
+      `ATTACH ':memory:' AS ov` + 建表（**零写**），并**响亮地记一条日志**。
+      这时"没有任何干预存在"是确定的语义，不是猜测。
+
     ⚠️ **Task 4 实测的平台事实（brief 的写法在本机对部分调用方不可用）**：
     `file:...?mode=ro` 这个 URI 形式**只有连接带 `SQLITE_OPEN_URI` 时才被解析**，
     也就是必须由 `sqlite3.connect(..., uri=True)` 打开。连接没带这个标志时，
@@ -113,20 +158,37 @@ def attach_readonly(conn: sqlite3.Connection, path: pathlib.Path | None = None) 
     ⚠️ **为什么不"兜底挂一次可写的再 PRAGMA 冻住"**：`PRAGMA ov.query_only=1`
     实测是**连接级**的（主库也一起写不了），而 `digest.py:577` / `refine.py:399`
     的连接**既要读** `window_items`**又要写**自己的表——兜底会把它们写坏。
-    所以这里**只**给出「挂不上就报错」，绝不退化成可写挂载。
+    所以这里**绝不**退化成"挂可写的真库再冻住"：文件**存在**时挂不上就报错
+    （情形①），只有"文件本来就不存在且建不出来"才降级成内存空库（情形②）。
     """
     if any(r[1] == "ov" for r in conn.execute("PRAGMA database_list")):
         return
     target = path or OVERRIDES_DB
     if not target.is_file():
-        ensure_schema(target)
+        try:
+            ensure_schema(target)
+        except (OSError, sqlite3.Error) as exc:
+            # ── 情形②（裁决 R8）：库**本来就不存在**，而且**建不出来** ──────
+            # （`data/` 不可写、路径非法……）这时"没有任何干预存在"是**确定的**
+            # ——文件都没有。所以语义上降级成"无干预"是**正确**的，
+            # 而不是把它当成错误。⚠️ 但必须**响亮**：静默降级会让真正的
+            # 部署问题（不可写的 data/）表现成「我的干预全没了」。
+            _attach_empty_overlay(conn)
+            _log.warning(
+                "overlay 库不存在且建不出来（%s）：本连接降级为「无干预」（内存空库）。人工改过的分类与软删在这一进程里看不到。原因：%s",
+                target, exc,
+            )
+            return
     try:
         conn.execute(f"ATTACH DATABASE 'file:{target.as_posix()}?mode=ro' AS ov")
     except sqlite3.OperationalError as exc:
-        # 把「怎么修」写进异常里——不然踩到的人只会看到一句 SQLite 的文件名报错。
+        # ── 情形①（裁决 R8）：文件**存在**但挂不上 ⇒ **绝不降级** ──────────
+        # 文件里**可能有墓碑**：降级 = 被软删的条目悄悄复活 + 改过的类目回退，
+        # 直接违反 D15。宁可这个请求响亮地失败，也不许给出"看似正常的旧数据"。
         raise OverlayError(
-            "overlay 只读挂载失败：连接需由 sqlite3.connect(..., uri=True) 打开"
-            f"（四条生产连接见 task-4-report.md / task-5-report.md）。原始错误：{exc}"
+            "overlay 已存在但只读挂载失败（**不降级**：降级会让软删的条目复活）。常见原因：本连接不是 sqlite3.connect(..., uri=True) 打开的"
+            "（四条生产连接见 task-4-report.md / task-5-report.md）；或 data/ 不可写导致 WAL 的 -shm/-wal 无法重建。"
+            f"原始错误：{exc}"
         ) from exc
 
 
