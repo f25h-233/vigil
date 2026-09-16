@@ -2200,3 +2200,59 @@ def test_persist_leaves_no_tmp_file_behind(seeded, monkeypatch, tmp_path):
                   output_dir=tmp_path)
 
     assert sorted(p.name for p in tmp_path.iterdir()) == ["2026-09-13.md"]
+
+
+
+# ── overlay 接入日报：**日报侧的语义继承**守卫（T5 Fix loop 第 1 轮 / FIX 1）──────
+
+
+def _section_of(body: str, heading: str) -> str | None:
+    """取 ``## <heading>`` 到下一个 ``## `` 之间的正文；没有这一节返回 None。"""
+    marker = f"## {heading}\n"
+    if marker not in body:
+        return None
+    return body.split(marker, 1)[1].split("\n## ", 1)[0]
+
+
+def test_digest_buckets_by_the_overridden_kind(seeded, monkeypatch, tmp_path):
+    """⭐ **日报必须按「覆盖后的类目」分桶**——这是 R13 在日报侧的落点。
+
+    ⚠️ 变异反证（T5 审查实测 W3）：把 `store.window_items` 里的
+    `COALESCE(ost.kind, i.kind)` 写回 `i.kind`（JOIN 与 attach 都留着、
+    SQL 完全合法）⇒ **全量 478 条一条都不红**。
+    后果正是「界面上改了分类、**日报仍按旧类目分桶出正文**」。
+
+    为什么此前零守护：6 条 overlay 测试**全在 `tests/test_store.py`**，
+    日报侧一条都没有——而 spec §3.3 说 `digest.py` 走 `window_items`、
+    「一处生效，所有消费方自动继承」；**那句继承此前是无人守的断言**。
+    """
+    from vigil import overrides
+
+    conn, since, until = seeded
+    # item 1 原本是 notice（📋 通知公告），人工改成 academic（📚 学业）
+    overrides.ensure_schema()          # autouse 夹具已把 OVERRIDES_DB 挪到 tmp
+    w = overrides.connect()
+    try:
+        overrides.set_kind(w, item_id=1, kind="academic")
+    finally:
+        w.close()
+
+    fake = _FakeLLM([
+        {"quotes": ["体检表"], "label": "体检", "text": "10月8日前交"},
+        {"quotes": ["讲座"], "label": "讲座", "text": "周五晚"},
+    ])
+    monkeypatch.setattr("vigil.digest.chat_json", fake)
+
+    digest.digest(
+        _Config({100: "班级群", 200: "新生群"}), api_key="k", conn=conn,
+        since=since, until=until, day_label="2026-09-13", output_dir=tmp_path,
+    )
+    body = (tmp_path / "2026-09-13.md").read_text(encoding="utf-8")
+
+    academic = _section_of(body, "📚 学业")
+    assert academic is not None, "改了类目之后，日报里必须出现新类目那一节"
+    assert "体检" in academic, "被改过类目的条目必须出现在**新**类目下"
+    notice = _section_of(body, "📋 通知公告")
+    assert notice is None or "体检" not in notice, (
+        "同一条不许**同时**留在旧类目下（那是「改了分类、日报照旧」）"
+    )

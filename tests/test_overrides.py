@@ -356,3 +356,68 @@ def test_ensure_schema_sets_wal_journal_mode(tmp_path):
         assert ro.execute("SELECT COUNT(*) FROM ov.item_edits").fetchone()[0] == 0
     finally:
         ro.close()
+
+
+# --- T5 Fix loop 第 1 轮：裁决 R8（挂载失败分两种情形）-------------------------------
+
+
+def test_attach_readonly_degrades_to_empty_overlay_when_file_cannot_be_created(
+    tmp_path, caplog
+):
+    """**R8 情形②**：库不存在、而且**建不出来** ⇒ 降级为「无干预」，**不许抛**。
+
+    ⚠️ reviewer 实测的失败面：`data/` 不可写时，`ensure_schema` 的 `mkdir`/`connect`
+    抛的是**裸 `OperationalError`**（那两行原本在 `try` **外**）⇒ **Web 全部读端点
+    与日报一起 500**，而这时"用户从没做过任何干预"与"库被删了"在语义上等价
+    ——本该只是"没有干预"。
+
+    ⚠️ 降级**必须响亮**（日志），否则真正的部署问题会表现成「我的干预全没了」。
+    用**父路径是文件**来制造"建不出来"：`mkdir(parents=True)` 必失败（NotADirectoryError），
+    且与平台/权限无关，测试在 CI 上也稳定。
+    """
+    import logging
+
+    blocker = tmp_path / "blocker"
+    blocker.write_text("不是目录", encoding="utf-8")
+    target = blocker / "overrides.db"
+
+    conn = sqlite3.connect(":memory:", uri=True)
+    try:
+        with caplog.at_level(logging.WARNING, logger="vigil.overrides"):
+            overrides.attach_readonly(conn, target)  # ⚠️ 不许抛
+        assert "ov" in {r[1] for r in conn.execute("PRAGMA database_list")}
+        # 降级挂的是**空库**：两张表都在、都是 0 行
+        assert conn.execute("SELECT COUNT(*) FROM ov.item_state").fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM ov.item_edits").fetchone()[0] == 0
+        # 零写：没有凭空造出文件、也没碰主库
+        assert not target.exists()
+        assert any("降级" in r.getMessage() for r in caplog.records), (
+            "降级必须响亮：日志里没有这条警告"
+        )
+    finally:
+        conn.close()
+
+
+def test_attach_readonly_never_degrades_when_the_file_exists(tmp_path):
+    """**R8 情形①**：文件**存在**但挂不上 ⇒ **必须响亮失败**，绝不降级。
+
+    为什么不能一刀切降级：文件里**可能有墓碑**。降级 = 被软删的条目悄悄复活
+    + 改过的类目回退——**直接违反 D15**，而且是"看起来一切正常"的那种违反。
+
+    这里制造"挂不上"的手段与 T4 的哨兵同源（连接没开 `uri=True`，URI 被当成
+    字面文件名）。与哨兵的分工：哨兵钉**平台事实**，本条钉**失败时的处置**。
+    """
+    target = tmp_path / "overrides.db"
+    overrides.ensure_schema(target)  # ⚠️ 先让文件**存在**——这才是情形①
+    assert target.is_file()
+
+    conn = sqlite3.connect(":memory:")  # 刻意不开 uri=True ⇒ 挂载必失败
+    try:
+        with pytest.raises(overrides.OverlayError, match="不降级"):
+            overrides.attach_readonly(conn, target)
+        # 关键不变量：失败**绝不**退化成"挂上了一个空的 ov"
+        assert "ov" not in {r[1] for r in conn.execute("PRAGMA database_list")}
+    finally:
+        conn.close()
+    # 文件原样还在（没有因为它挂不上就删/重建）
+    assert target.is_file()

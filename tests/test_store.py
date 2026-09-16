@@ -1427,3 +1427,41 @@ def test_query_layer_provisions_a_missing_overlay_file(memdb):
     items, total = store.search_items(memdb, limit=50, offset=0)
     assert (total, len(items)) == (1, 1), "没有干预时，读取路径必须照常返回全部条目"
     assert overrides.OVERRIDES_DB.exists(), "读取路径应当把空的 overlay 库就位"
+
+
+
+def test_digest_item_count_agrees_with_digest_items_when_one_is_deleted(memdb):
+    """⭐ 裁决 R9（T5 Fix loop 第 1 轮）：**同一个响应里计数与列表不许打架**。
+
+    ⚠️ 这个分歧是 T5 **引入的**：`item_count` 原先与 `digest_items` 一致，
+    过滤只加在了 `digest_items` 上 ⇒ 软删一条被历史日报引用的条目后，
+    `GET /api/digests/{id}` 与 `/api/digests` 都返回 `item_count: 3` 而
+    `items` 只有 2 条——而 `web/src/types.ts` 直接用这个字段渲染。
+
+    判据（R9）：D15 要求被删条目从界面**与日报**一起消失；
+    计数与列表是**同一份数据的两种读法**，必须同源。
+    """
+    store.ensure_schema(memdb)
+    ids = [_seed(memdb, title=f"条目{i}") for i in (1, 2, 3)]
+    store.save_digest(
+        memdb, window_from=1, window_to=2, body_md="x", model="m",
+        prompt_ver="v1", item_ids=ids,
+    )
+    did = memdb.execute("SELECT MAX(digest_id) FROM digests").fetchone()[0]
+
+    # 删之前：三者一致
+    assert len(store.digest_items(memdb, did)) == 3
+    assert store.get_digest(memdb, did).item_count == 3
+    assert store.list_digests(memdb)[0].item_count == 3
+
+    ov = _ov_conn()
+    overrides.delete_item(ov, item_id=ids[0], msg_id=None)
+    ov.close()
+
+    assert len(store.digest_items(memdb, did)) == 2
+    assert store.get_digest(memdb, did).item_count == 2, (
+        "`/api/digests/{id}` 的 item_count 与 items 打架（R9）"
+    )
+    assert store.list_digests(memdb)[0].item_count == 2, (
+        "`/api/digests` 的 item_count 与 `/api/digests/{id}` 的 items 打架（R9）"
+    )
