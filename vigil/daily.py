@@ -20,7 +20,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 from . import digest as digest_mod
 from . import export as export_mod
@@ -50,8 +50,12 @@ class RunReport:
     stages: tuple[StageResult, ...] = ()
     last_error: str = ""
     deadline: str = ""
-    # 阶段名 → 该阶段话术里用到的计数，纯给日志/排障看
-    counters: dict[str, str] = field(default_factory=dict)
+
+    # ⚠️ 这里曾有一个 `counters: dict[str, str]`（阶段名 → 该阶段话术）。T7 审查 F4
+    # 判它是**死字段**：`grep -rn counters vigil/ tests/ web/src` 除本文件外**零命中**，
+    # `cmd_daily` 不读它、测试也不钉它的值（变异成 `{}` 全绿）。而它承载的信息
+    # `report.stages[i].detail` 一字不少，所以删掉——不给「看起来有、其实没人看」
+    # 的字段留位（那正是本轮反复抓到的「空守卫」形状）。要加回来，请先给出消费方。
 
     @property
     def ok(self) -> bool:
@@ -63,18 +67,19 @@ class RunReport:
         return all(s.ok for s in self.stages)
 
 
-def _summarize(results: list[StageResult]) -> tuple[str, dict[str, str]]:
-    """把失败的阶段拼成一句人话 + 一份计数表。
+def _summarize(results: list[StageResult]) -> str:
+    """把失败的阶段拼成一句人话。
 
     ⚠️ 判据是 `ok` 而不是 `skipped_reason`：跳过的那条**照样进** last_error，
     且它把上游的理由复述了一遍（"digest: 已跳过：export 失败 ⇒ …"）。
     那不是重复计入——`LAST-ERROR.txt` 的读者（第二天早上的人）问的第一个
     问题是"今天为什么没有日报"，答案必须在这一句里。
+
+    （曾同时返回一张 `counters` 表，T7 审查 F4 判它死字段后删掉了——
+    见 `RunReport` 上那段。）
     """
     failed = [r for r in results if not r.ok]
-    last_error = "；".join(f"{r.name}: {r.detail}" for r in failed)
-    counters = {r.name: r.detail for r in results}
-    return last_error, counters
+    return "；".join(f"{r.name}: {r.detail}" for r in failed)
 
 
 def run(
@@ -229,10 +234,8 @@ def run(
             results.append(StageResult(STAGE_DIGEST, False, f"抛出异常：{exc}"))
             emit(f"[daily] digest 失败：{exc}")
 
-    last_error, counters = _summarize(results)
     report = RunReport(
-        stages=tuple(results), last_error=last_error,
-        deadline=day, counters=counters,
+        stages=tuple(results), last_error=_summarize(results), deadline=day,
     )
 
     emit("─── 本轮小结 ───")
