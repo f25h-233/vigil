@@ -234,3 +234,89 @@ def test_emit_propagates_log_write_failure(logdir, monkeypatch):
 
     with pytest.raises(OSError):
         logs.emit("这句写不进去")
+
+
+def _our_handler() -> logs.DailyFileHandler:
+    """取出**我们自己的** handler。
+
+    ⚠️ **绝不能用 `handlers[0]`**——实测（pytest 9.1.1）：`logs.setup()` 把
+    `propagate` 设成 False，而 `_pytest/logging.py` 的 `catching_logs.__enter__`
+    会给**每一个非传播的 logger** 挂上它自己的 `LogCaptureHandler`。于是从
+    第二个测试起 `handlers[0]` 是 pytest 那个，不是 `DailyFileHandler`。
+    后果特别阴：pytest 的 `LogCaptureHandler.handleError` 是 **`raise`**
+    （它故意重抛，好让 logging 出错就弄红测试）——把写失败挂到它身上，测试
+    会**绿**，但绿的是 pytest 的 handler，本模块的代码一行都没走到。
+
+    这不是假设：本条修复的第一版就用 `handlers[0]`，`-k` 单跑红、整文件跑绿
+    ——因为整文件跑时前面已经有别的测试把 logger 变成非传播的，pytest 的
+    handler 已经挂上了。
+    """
+    for h in logging.getLogger("vigil").handlers:
+        if isinstance(h, logs.DailyFileHandler):
+            return h
+    raise AssertionError("vigil logger 上没挂 DailyFileHandler——setup() 没生效？")
+
+
+def test_real_write_failure_propagates_not_swallowed(logdir, monkeypatch):
+    """⭐⭐ 真实写失败必须抛，**不许被 logging 吞掉**。
+
+    与 `test_emit_propagates_log_write_failure` 的区别（那条留着，测的是另一层）：
+      · 那条 monkeypatch 掉了 `handler.emit` 整个方法 —— 绕过了真实写路径
+      · 这条让**真实写路径**失败：`logging.StreamHandler.emit` 写流时抛 OSError，
+        它会 `except Exception: self.handleError(record)`。**标准实现的 `handleError`
+        只往 stderr 打 traceback、不重抛** ⇒ 在任务计划下（stderr 被丢弃）
+        「磁盘满」这件事外面一个字都看不见。
+
+    实测来源：T7 的 implementer 在写 `daily.py` 时发现「写不进就抛」只对跨零点
+    rollover 成立，普通写失败被吞。它与本模块那条「轮转失败可吞 / 写失败必须抛」
+    的刻意不对称是同一件事的两面。
+
+    ⚠️ handler 用 `_our_handler()` 取，不用 `handlers[0]`（原因见那个函数）。
+    """
+
+    class _BoomStream:
+        def write(self, s):
+            raise OSError("模拟磁盘满")
+
+        def flush(self):
+            pass
+
+    logs.setup()
+    handler = _our_handler()
+    monkeypatch.setattr(handler, "stream", _BoomStream())
+
+    with pytest.raises(OSError):
+        logs.emit("这句写不进去")
+
+
+def test_healthy_stream_is_not_told_to_raise(logdir, monkeypatch):
+    """阳性对照：**「写失败就抛」不是「任何情况都抛」**。
+
+    与 `test_real_write_failure_propagates_not_swallowed` 只差一件事：
+    这里的流**写得进去**。若那条测试无论流好不好都红（例如有人把
+    `handleError` 写成无条件的 `raise OSError(...)`，或 `emit` 里凭空多抛），
+    这条会立刻把它戳穿——所以两条必须一起在。
+
+    还断言了消息**真的走完了格式化+写入**，不是"没抛就完事"：换成
+    BufferingHandler 之类吞掉内容的实现，这条也红。
+    """
+
+    class _GoodStream:
+        def __init__(self):
+            self.written: list[str] = []
+
+        def write(self, s):
+            self.written.append(s)
+
+        def flush(self):
+            pass
+
+    logs.setup()
+    handler = _our_handler()
+    good = _GoodStream()
+    monkeypatch.setattr(handler, "stream", good)
+
+    logs.emit("这句写得进去")          # 必须正常返回，不许抛
+
+    assert any("这句写得进去" in s for s in good.written), \
+        "记录没走完真实写路径——这条阳性对照就没能证明「失败才抛」"

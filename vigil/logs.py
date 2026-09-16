@@ -114,6 +114,17 @@ class DailyFileHandler(logging.FileHandler):
         `exit 0 但日志有洞` 的运行——**正是 M4 要消灭的那个形状**：
         「没人看得见」比「这次没跑完」更糟。代价（磁盘满到连 LAST-ERROR.txt
         都写不出来）是物理约束，接受。
+
+        ⚠️ **「写失败会不会抛」不由本方法决定，由 `handleError` 决定。**
+        `logging.StreamHandler.emit`（下面 `super().emit` 调到的那个）自带
+        `except Exception: self.handleError(record)`，而**标准实现的
+        `handleError` 只往 stderr 打一份 traceback、不重抛**——于是本方法
+        这里写的「抛」在覆盖 `handleError` 之前**是空头支票**：真实写失败
+        （磁盘满）被吞掉，外面一个字都看不见。详见本类下面的 `handleError`。
+        ⚠️ 同一条纪律也适用于「文件 handler 每条记录都 flush」：
+        那是 `StreamHandler.emit` 自带的行为，由
+        `test_every_record_is_flushed_immediately` 守卫——哪天有人换了
+        handler 类型，那条测试要能红。
         """
         today = _today()
         if today != self._day:
@@ -128,6 +139,26 @@ class DailyFileHandler(logging.FileHandler):
             finally:
                 self.release()
         super().emit(record)
+
+    def handleError(self, record: logging.LogRecord) -> None:
+        """不让 logging 把写失败吞掉——**原样抛出**。
+
+        ⚠️ 为什么要覆盖：`logging.StreamHandler.emit` 自带
+        `except Exception: self.handleError(record)`，而**标准实现**的 `handleError`
+        只往 stderr 打一份 traceback、**不重抛**。任务计划**丢弃 stderr** ⇒
+        磁盘满时「日志写不进去」这件事**外面一个字都看不见**——正是本模块
+        `emit` 那条 docstring 说的「`exit 0` 但日志有洞」，也正是 M4 要消灭的形状。
+
+        ⚠️ **与标准库行为相反是刻意的**，理由与轮转失败那条对称：
+          · 轮转失败 = **打扫**失败（丢的是历史日志）→ **吞掉**
+          · 写失败   = **本次运行的记录没了**          → **抛**
+        代价（这一次运行会中断）是**知情的取舍**：**「没人看得见」比「这次没跑完」更糟**。
+
+        ⚠️ 这里用裸 `raise` 重抛当前异常。这是安全的：**本方法只由 handler 的
+        `emit` 在 `except` 里调用**（`logging.Handler.handle` 不调它，
+        `Logger.callHandlers` 也不调），因此必有活动异常。
+        """
+        raise
 
 
 def setup(*, level: int = logging.INFO) -> logging.Logger:
