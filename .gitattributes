@@ -7,3 +7,11 @@
 *.jpg  binary
 *.db   binary
 *.zip  binary
+
+# ⚠️ 日报是**归档**，不是源码：M4 的归档不变量要求「磁盘文件与库里 body_md **逐字节相等**」，
+# 而 `digest.py` 是以 `newline="\n"` 写出 **LF** 的。
+# 上面那行 `* text=auto` 配合本机 `core.autocrlf=true`，会让**任何一次重新检出的 git 操作**
+# （`git checkout --` / 切分支 / `git stash`）把这些文件变成 CRLF，
+# 于是不变量判据读出**假红**——而库里的 `body_md` 一个字都没变。
+# 强制两个方向都是 LF：不变量从此**对 git 免疫**，不靠"记得别 checkout"。
+docs/digests/*.md  text eol=lf
