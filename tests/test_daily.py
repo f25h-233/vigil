@@ -6,11 +6,12 @@
 
 from __future__ import annotations
 
+import logging
 import pathlib
 
 import pytest
 
-from vigil import daily
+from vigil import daily, logs
 
 
 class _FakeConfig:
@@ -255,3 +256,252 @@ def test_broken_emit_never_returns_a_success_report(wired):
         daily.run(config=_FakeConfig(), key="k", llm_key="l",
                   day="2026-09-16", on_progress=dead_emit)
     assert calls == [], "第一行 emit 就炸了，不该有任何阶段开跑"
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# 以下三条 + 两个夹具是**补的**（T7 审查 R65 / F2·F3 点名的覆盖缺口）。
+#
+# 审查实测：`since/until` 对调、`day_label` 换掉、`api_key`/`db_path`/`prompt_ver`
+# 换垃圾值、以及把生产默认 `emit = on_progress or logs.emit` 换成 `or print`——
+# **全都 11/11 绿**。共同根因：上面 `wired` 里那三个假函数签名是 `(config, **kw)`，
+# **把关键字参数整个吞掉**，于是原有 11 条只钉住了「顺序 + 失败账目」，
+# **一个参数都没钉**。对 `daily.run()` 这个无人值守的唯一入口来说，
+# 「窗口对调 / 标签错 / 拿错密钥」都是**静默产出错误日报**的形状；
+# 最后一条（默认 sink）更重：换掉它 = 整条日志链静默消失。见计划 §8.5。
+# ─────────────────────────────────────────────────────────────────────────
+
+
+@pytest.fixture
+def logdir(tmp_path, monkeypatch):
+    """把日志目录换到临时目录（与 `tests/test_logs.py` 的同名夹具同形）。
+
+    ⚠️ **必须有**：`logs.emit` 除 `print` 之外那一半会**真的写文件**，而本仓库的
+    `data/logs/` 是生产日志目录——测试静默往里写，正是 `logs.py` 模块 docstring
+    点名要避免的事（`LOG_DIR` 一律现读就是为了这个）。
+
+    ⚠️ 顺带把 `propagate`/`level` 也还原：`logs.reset()` **不管这两个**（它只摘
+    handler、复位幂等标志），而它们是**进程级**状态。不还原的话，本文件会把后面
+    `tests/test_logs.py` 的前提悄悄改掉——那正是「单跑红、整跑绿」最爱出没的地方。
+    """
+    logger = logging.getLogger("vigil")
+    before = (logger.propagate, logger.level)
+    monkeypatch.setattr(logs, "LOG_DIR", tmp_path / "logs")
+    logs.reset()
+    yield tmp_path / "logs"
+    logs.reset()
+    logger.propagate, logger.level = before
+
+
+def _our_handler() -> logs.DailyFileHandler:
+    """取**我们自己的** handler。**绝不能用 `handlers[0]`**。
+
+    与 `tests/test_logs.py:_our_handler` 同款（那里记着完整实测经过）：pytest 9.1.1
+    下 `_pytest/logging.py` 会给每个非传播 logger 挂上自己的 `LogCaptureHandler`，
+    而它的 `handleError` **就是 `raise`**——把"写必炸的流"挂到它身上，测试会**绿**，
+    但绿的是 pytest 的 handler，本项目的代码一行都没走到（实测形态：单跑红、整跑绿）。
+    """
+    for h in logging.getLogger("vigil").handlers:
+        if isinstance(h, logs.DailyFileHandler):
+            return h
+    raise AssertionError("vigil logger 上没挂 DailyFileHandler——setup() 没生效？")
+
+
+def _stages_recording_kwargs(monkeypatch) -> dict[str, dict]:
+    """像 `wired` 一样换掉三阶段，但**把收到的参数原样记下来**。
+
+    ⚠️ 三个假函数**不调用** `on_progress`：这一组要问的是「谁被传了进来」，
+    而不是阶段内部行为（那是 `wired` 那组的事）。所以它们对真 sink 没有任何副作用。
+    """
+    seen: dict[str, dict] = {}
+
+    def fake_export(config, key, *, on_progress=None):
+        seen["export"] = {"config": config, "key": key, "on_progress": on_progress}
+        return _export_stats()
+
+    def fake_refine(config, **kw):
+        seen["refine"] = {"config": config, **kw}
+        return _refine_stats()
+
+    def fake_digest(config, **kw):
+        seen["digest"] = {"config": config, **kw}
+        return _digest_stats()
+
+    monkeypatch.setattr(daily.export_mod, "export", fake_export)
+    monkeypatch.setattr(daily.refine_mod, "refine", fake_refine)
+    monkeypatch.setattr(daily.digest_mod, "digest", fake_digest)
+    return seen
+
+
+def test_stage_arguments_are_wired_from_the_day_window(monkeypatch):
+    """⭐ 三个阶段拿到的参数**必须**来自同一条窗口，不许对调、不许写死。
+
+    审查实测（R65）：`since/until` 对调、`day_label` 换掉、`api_key`/`db_path`/
+    `prompt_ver` 换垃圾值——原先 **11/11 全绿**，也就是说这些接线**没有任何判据**。
+
+    ⚠️ 判据读的是**假函数收到的 kwargs**，不是 `daily.py` 的源码文本：
+    文本判据（"看一眼写对没有"）会在有人把调用改成别的形状时静默失效。
+    """
+    day = "2026-09-16"
+    db_key = "db-密钥-只该进-export"
+    llm_key = "llm-密钥-只该进模型"
+
+    class _Cfg:
+        """只带 `output_db` 的假配置（与 `_FakeConfig` 同款，但**值特意不同**：
+        这样"把 db_path 写死成别的路径"也会红）。"""
+
+        output_db = pathlib.Path("wired-output.db")
+
+    seen = _stages_recording_kwargs(monkeypatch)
+    cfg = _Cfg()
+    sink = lambda _msg: None            # noqa: E731 —— 只为验「sink 有没有被原样传下去」
+    report = daily.run(config=cfg, key=db_key, llm_key=llm_key,
+                       day=day, on_progress=sink)
+
+    assert report.ok
+    assert sorted(seen) == ["digest", "export", "refine"], "三个阶段都得跑到，且只有它们"
+
+    # ── 窗口：必须与 `daily` 自己用的那一个 `day_window(day)` 逐字一致 ──
+    window = daily.digest_mod.day_window(day)
+    dst = seen["digest"]
+    assert (dst["since"], dst["until"]) == window, (
+        f"digest 拿到的窗口是 {dst['since']}..{dst['until']}，而 "
+        f"day_window({day}) = {window}——对调或写死都会在这里红"
+    )
+    assert dst["since"] < dst["until"], "窗口反了：since 比 until 还晚（对调的正身）"
+    assert dst["day_label"] == day, "日报的日期标签不是这一天——日报会标错日子"
+
+    # ── 密钥：export 拿 DB 密钥，refine/digest 拿 LLM 密钥——**两把不许混** ──
+    assert seen["export"]["key"] == db_key
+    for stage in ("refine", "digest"):
+        assert seen[stage]["api_key"] == llm_key, (
+            f"{stage} 拿到的不是 LLM 密钥——密钥混用就是把 DB 密钥发给云端"
+        )
+        assert seen[stage]["api_key"] != db_key, f"{stage} 拿到了 DB 密钥"
+
+    # ── db_path：refine/digest 都得指向 config.output_db ────────────────
+    for stage in ("refine", "digest"):
+        assert seen[stage]["db_path"] == _Cfg.output_db
+
+    # ── 提示词版本与模型：不许写死成别的（审查的 M15 换的就是这两个） ────
+    assert seen["refine"]["prompt_ver"] == daily.refine_mod.PROMPT_VERSION
+    assert seen["refine"]["model"] == daily.refine_mod.DEFAULT_MODEL
+    assert seen["digest"]["model"] == daily.digest_mod.DEFAULT_MODEL
+
+    # ── config 与 sink：原样传递，不许被换成别的东西 ─────────────────────
+    for stage in ("export", "refine", "digest"):
+        assert seen[stage]["config"] is cfg
+        assert seen[stage]["on_progress"] is sink, f"{stage} 的进度回调被换掉了"
+
+
+def test_default_progress_sink_is_logs_emit(monkeypatch, logdir, capsys):
+    """⭐⭐ 缺省 sink 必须是 `logs.emit`——**不许被换成 `print`**。
+
+    审查实测（R65 的 M17）：把生产默认 `emit = on_progress or logs.emit` 换成
+    `or print`，**11/11 全绿**。而 M4 的核心承诺是「无人值守下失败看得见」，
+    靠的就是 `logs.emit`「写不进就抛」这条契约（`DailyFileHandler.handleError`）
+    由 `daily.run()` 的缺省 sink 接住。换成 `print` ⇒ **整条日志链静默消失**
+    （任务计划丢弃 stdout），却没有任何测试会红——正是本轮反复抓到的「空守卫」形状。
+
+    ⚠️ **偏离派发单，写在明处**：派发单要求对 `inspect.signature(daily.run)` 的
+    默认值**裸判** `is logs.emit`。但实现冻的是 `on_progress=None` + 函数体里
+    **现读** `logs.emit`（`emit = on_progress or logs.emit`），所以那条裸判在
+    **基线就红**——与「阳性对照 M4 必须全绿」直接冲突。这里拆成三条判据，合起来
+    覆盖同一个缺口，且对两种退化形状（改签名默认值 / 改 `or` 的右边）都有效：
+
+      A. 签名默认值只允许是 `None` 或 `logs.emit` 本身；
+      B. **缺省调用**时三个阶段拿到的 sink `is logs.emit`（同一对象，不是"长得像"），
+         而且它真的把日志**写进了文件**（端到端：`print` 到不了文件）；
+      C. 把 `logs.emit` 换成探针后，缺省调用必须打到**探针**，且 stdout 一个字都没有
+         ——`or print` 的形状在 C 上必红。
+
+    B 与 C 只差「sink 有没有被换掉」，合起来正好把「走 logs.emit」与「走 print」
+    这条线钉死（C 的 stdout 断言就是阴性对照：真走 logs.emit 时 print 不该被调用）。
+    """
+    import inspect                      # 只在本条测试里用
+
+    default = inspect.signature(daily.run).parameters["on_progress"].default
+    assert default is None or default is logs.emit, (
+        f"on_progress 的签名默认值是 {default!r}——只允许 `None`（现读 logs.emit）"
+        "或 `logs.emit` 本身；`print` 是审查点名的退化形状"
+    )
+
+    # ── B：缺省调用 ⇒ sink 是 logs.emit 这个对象，且真的落到文件 ──────────
+    seen = _stages_recording_kwargs(monkeypatch)
+    logs.setup()
+    report = daily.run(config=_FakeConfig(), key="k", llm_key="l", day="2026-09-16")
+    assert report.ok
+
+    for stage in ("export", "refine", "digest"):
+        assert seen[stage]["on_progress"] is logs.emit, (
+            f"{stage} 拿到的缺省 sink 不是 `logs.emit` 本身"
+            f"（是 {seen[stage]['on_progress']!r}）——换掉它，整条日志链会静默消失"
+        )
+    text = logs.log_path().read_text(encoding="utf-8")
+    assert "vigil daily 开始" in text, (
+        "缺省 sink 没把开场横幅写进日志文件——「无人值守下失败看得见」靠的就是它"
+    )
+
+    # ── C：换成探针 ⇒ 缺省调用必须打到探针，且 stdout 一个字都没有 ────────
+    capsys.readouterr()                 # 清掉 B 段真 logs.emit 打到 stdout 的那些行
+    heard: list[str] = []
+    monkeypatch.setattr(logs, "emit", heard.append)
+    daily.run(config=_FakeConfig(), key="k", llm_key="l", day="2026-09-16")
+
+    assert heard, "缺省调用一次都没走到 logs.emit——默认 sink 被换掉了"
+    assert any("vigil daily 开始" in m for m in heard), "开场横幅没走 logs.emit"
+    assert "全部成功" in "\n".join(heard), "小结没走 logs.emit——账目也一起丢了"
+    assert capsys.readouterr().out == "", (
+        "缺省 sink 绕过 logs.emit 直接 print 了——生产默认必须是 logs.emit"
+    )
+
+
+def test_broken_real_emit_never_yields_an_ok_report(wired, logdir, monkeypatch, capsys):
+    """⭐ 用**真的** `logs.emit` 接一条写必炸的流，断言 `run()` 不给 `ok=True`。
+
+    这是 §8.5 那条链的**端到端接缝**（真 `logs.emit`，不是替身）。T7 的审查用同一形状
+    实测过：**修 `logs.py` 之前**（标准库 `handleError` 把写失败吞掉），`run()` 返回
+    `ok=True` / `last_error=''` / 印「全部成功」⇒ `cmd_daily` 会 `return 0`、而日志
+    一个字都没写成——**正是 M4 要消灭的形状**。`94a9b54` 让
+    `DailyFileHandler.handleError` 原样重抛之后，这里必须**抛**。
+
+    与 `test_broken_emit_never_returns_a_success_report` 的分工：那条用**假 sink**
+    （测 `run()` 自己怎么处置"抛出"），这条用**真 logs.emit + 真 logging 写路径 +
+    真 handler**——只有这条能证明「写失败真的一路走到 `run()`」这个**前提**本身成立。
+    前提不成立时，假 sink 那条照样是绿的，而生产链是断的。
+
+    ⚠️ handler 按**类型**取，不用 `handlers[0]`（原因见 `_our_handler`）：
+    挂错对象（pytest 的 `LogCaptureHandler`，它的 `handleError` 就是 `raise`）会让
+    这条在整文件跑时**假绿**——实测形态正是「单跑红、整跑绿」。
+
+    ⚠️ 三个阶段仍然用假货：退化（写失败被吞）时它们**会**被跑到，那时若接的是真阶段，
+    这条测试会去碰真库、真模型——测试本身绝不许有这种副作用。
+    """
+    class _BoomStream:
+        def write(self, s):
+            raise OSError(28, "No space left on device（模拟磁盘满）")
+
+        def flush(self):
+            pass
+
+    logs.setup()
+    monkeypatch.setattr(_our_handler(), "stream", _BoomStream())
+
+    calls, _ = wired
+    raised = False
+    try:
+        # ⚠️ 不传 on_progress：逼它走缺省 = 真 logs.emit（生产形状）
+        report = daily.run(config=_FakeConfig(), key="k", llm_key="l", day="2026-09-16")
+    except OSError:
+        raised = True                   # 合法结局之一：抛 ⇒ cmd_daily 顶层兜底 ⇒ exit 1
+
+    if not raised:
+        assert not report.ok, (
+            "真 logs.emit 写不进去，run() 却给了 ok=True 的账目 ⇒ cmd_daily 会 return 0"
+            "而日志有洞——正是 M4 要消灭的形状"
+        )
+        assert report.last_error, "失败没留在账上"
+
+    assert calls == [], "记录根本写不出去的一轮，不该把阶段跑下去"
+    assert "全部成功" not in capsys.readouterr().out, (
+        "日志写不进去却印了「全部成功」——这正是审查实测到的修前行为"
+    )
