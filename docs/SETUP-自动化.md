@@ -63,6 +63,10 @@ Start Time:                           8:00:00
 Next Run Time:                        2026/9/17 8:00:00
 ```
 
+最后一行应是 `电源与漏跑设置已确认`（脚本自查了下面「笔记本」那三条；`Power Management`
+那一行从默认的 `Stop On Battery Mode, No Start On Batteries` 变成了空）。
+自查不通过时脚本会**报错退出**，不会留下一个"看起来注册成功了、其实一在电池上就永远不跑"的任务。
+
 **这个脚本是幂等的**——先删后建，重复跑不会报错，任务定义逐字节一致。
 换了路径、改了时间、重装了机器，直接再跑一遍就行。
 
@@ -70,6 +74,35 @@ Next Run Time:                        2026/9/17 8:00:00
 > 注销/重启后没人登录，它不会自己启动。想要不登录也跑，得改成"不管用户是否登录都运行"，
 > 那需要把账户密码存进任务计划（`schtasks /create /ru ... /rp ...`）——本管线没走这条路，
 > 因为把密码写进任务定义里不划算。
+
+> 🔋 **笔记本 / 睡眠：两条漏跑已经替你关掉了**（本机实测 `PCSystemType=2`，就是笔记本）。
+> `schtasks /create` 建出来的任务默认带三条"笔记本杀手"，**它们的共同点是完全没有日志——
+> 因为任务根本没起来**：
+>
+> | 默认设置 | 后果 |
+> |---|---|
+> | `DisallowStartIfOnBatteries=true` | 08:00 时机器在用电池 → **不启动** |
+> | `StopIfGoingOnBatteries=true` | 跑到一半拔电源 → **任务被杀** |
+> | `StartWhenAvailable=false` | 08:00 时机器在睡眠 → **这次跳过，且永不补跑** |
+>
+> 注册脚本已经用 cmdlet 把这三条改掉（`schtasks` 命令行**没有**开关能改它们）：
+> 前两条关掉，**`StartWhenAvailable` 打开——机器一可用就补跑**（睡眠错过的那次会补上）。
+>
+> 自查（三行都应是下面的值）：
+>
+> ```powershell
+> schtasks /query /tn "VIGIL每日管线" /xml | Select-String "Batteries|StartWhenAvailable"
+> # 期望：
+> #   <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+> #   <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+> #   <StartWhenAvailable>true</StartWhenAvailable>
+> # （StartWhenAvailable 缺省为 false，所以"元素不出现"就是没设上）
+> ```
+>
+> ⚠️ **没有**开 `WakeToRun`：那会主动唤醒你的笔记本，是可感知的打扰。
+> `StartWhenAvailable` 已经能做到"机器一可用就补跑"，且不惊醒任何人。
+> 代价是：**机器整夜关机/睡眠时，08:00 那次不会准点跑，而是等你下次开机/唤醒后补跑。**
+> 结果一样会落到 `docs/digests/`，只是时间不是你起床前。
 
 ---
 
