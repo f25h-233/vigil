@@ -70,17 +70,24 @@ Write-Host $out
 #   StopIfGoingOnBatteries=true       → 跑到一半拔电源就被杀
 #   StartWhenAvailable 缺省 false     → 到点时机器在睡眠，这次直接跳过且永不补跑
 # 三条的共同点：**完全没有日志**，因为任务根本没起来。而 M4 存在的全部理由
-# 就是"无人值守下的静默失败"。schtasks 命令行没有开关能改这三条，所以用
-# cmdlet 补——注意这跟"手写 Task Scheduler XML schema"是两回事，
-# `New-ScheduledTaskSettingsSet` 是强类型的 cmdlet 参数，没有拼字段名的风险。
+# 就是"无人值守下的静默失败"。schtasks 命令行没有开关能改这三条，所以用 cmdlet 补。
 #
 # ⚠️ 刻意**不加** -WakeToRun：那会主动唤醒用户的笔记本，是可感知的打扰；
 # -StartWhenAvailable 已经能做到"机器一可用就补跑"，且不惊醒任何人。
-$settings = New-ScheduledTaskSettingsSet `
-    -AllowStartIfOnBatteries `
-    -DontStopIfGoingOnBatteries `
-    -StartWhenAvailable
-Set-ScheduledTask -TaskName $TaskName -Settings $settings | Out-Null
+#
+# ⚠️ 用**先读后改**，不要 `New-ScheduledTaskSettingsSet` + `Set-ScheduledTask -Settings`：
+# 后者是**整体替换**，实测会顺带把 `Task version` 从 1.2 顶到 1.3 并打开
+# `UseUnifiedSchedulingEngine`——两个我们没选过的漂移。而它们在"只在用户登录时运行 +
+# StartWhenAvailable"这个组合下的行为，本轮没有任何实测证据。
+# 我们没选过的东西不该出现在关键路径上：M4 的出口标准就压在"任务真的会自己跑起来"。
+#
+# ⚠️ 属性名写错在 CimInstance 上**不会报错**（只会静默多出一个谁也不看的属性），
+# 所以下面那条 XML 回读自查是必需的——它正是为这个兜底的。
+$task = Get-ScheduledTask -TaskName $TaskName
+$task.Settings.DisallowStartIfOnBatteries = $false
+$task.Settings.StopIfGoingOnBatteries     = $false
+$task.Settings.StartWhenAvailable         = $true
+Set-ScheduledTask -TaskName $TaskName -Settings $task.Settings | Out-Null
 
 Write-Host "[3/3] 回读任务定义，确认真的写进去了："
 schtasks /query /tn $TaskName /v /fo LIST
