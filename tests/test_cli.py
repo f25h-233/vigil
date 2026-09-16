@@ -600,3 +600,225 @@ def test_query_commands_do_not_write_to_the_log(monkeypatch, tmp_path, argv,
     monkeypatch.setattr(cli.logs, "emit", boom)
 
     assert cli.main(argv) == 0
+
+
+# ── C-1：真的 `export()` 读不到群 ⇒ 真的 `cmd_export` 非零（M4 终审）────
+#
+# ⚠️ 上面那些 export 判据（`:98` 起）用的全是**手造的 `ExportStats`**：它们
+# 证明的是「`failed_groups` 非空 ⇒ 退 1」，**证明不了**「读不到的群会进
+# `failed_groups`」。而终审 C-1 的洞恰恰在后者——`_read_group` 在分块回退里
+# 那条索引查询失败时 `return GroupRead([], [])`，与「这个群本来就没消息」
+# **完全同形** ⇒ 一个群整群读不到时 `cmd_export` 退 0、`daily` 照写日报。
+# 所以这一条必须跑**真的** `export_mod.export`。
+
+
+def _fake_source_db(path) -> None:
+    """真 `nt_msg.db` 的最小同形替身：38 列、列名是纯数字、明文 sqlite。
+
+    ⚠️ 明文：`open_encrypted` 会被换成直连（真实现走 sqlcipher3，对明文库
+    必然解密失败）——本文件测的不是解密。
+    """
+    import sqlite3
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(path))
+    cols = ", ".join(f'"400{i:02d}"' for i in range(1, 39))
+    conn.execute(f"CREATE TABLE group_msg_table ({cols})")
+    # 这两张表在真源库里本来就有：`dataline_msg_table` 是 qqcli 兼容层要写的
+    # 目标（同列结构），`c2c_msg_table` 是 qqcli 打开库时会校验的
+    conn.execute(f"CREATE TABLE dataline_msg_table ({cols})")
+    conn.execute("CREATE TABLE c2c_msg_table (x)")
+    conn.execute(
+        f"INSERT INTO group_msg_table VALUES ({','.join(['NULL'] * 38)})"
+    )
+    conn.commit()
+    conn.close()
+
+
+class _UnreadableGroup:
+    """只让**群 100** 的查询抛（真 sqlite 连接的替身），其余照常。
+
+    ⚠️ 群号必须参与判定：群 200 要**一切正常**（源库里它一条消息都没有），
+    否则「读不到」与「本来就没有」就分不开了——而那正是这条要钉的区别。
+    """
+
+    def __init__(self, conn, gid: int) -> None:
+        self._conn, self._gid = conn, gid
+
+    def execute(self, sql, params=(), *rest):
+        import sqlite3
+
+        if "FROM group_msg_table " in sql and params and params[0] == self._gid:
+            raise sqlite3.OperationalError("database disk image is malformed")
+        return self._conn.execute(sql, params, *rest)
+
+    def close(self) -> None:
+        self._conn.close()
+
+
+def test_export_returns_nonzero_when_the_real_export_cannot_read_a_group(
+    cli_env, monkeypatch, capsys
+):
+    """⭐⭐ 真的 `export()` 读不到一个群 ⇒ 真的 `cmd_export` 退 **1**。
+
+    终审 C-1 的完整链路是「整群读不到 ⇒ `failed_groups` 里没有它 ⇒ 退 0 ⇒
+    `daily` 照写日报」。本条的判据一路从 `_read_group` 走到退出码，中间**不许
+    有任何替身**（除了「打开加密库」那一步）。
+
+    对照组（同一份源库、同一个替身，只是不抛）：退 **0**。没有这一半，
+    「任何情况都退 1」也能让第一条绿。
+
+    变异「`export.py` 的 `raise` 改回 `return GroupRead([], [])`」→ 第一条红。
+    """
+    import sqlite3
+
+    from vigil import lock  # noqa: F401  —— 只为与下面那条用例同款地说明锁
+
+    _fake_source_db(cli_env / "qq" / "nt_msg.db")
+    monkeypatch.setattr(
+        "vigil.export.qqdb.open_encrypted",
+        lambda path, key: _UnreadableGroup(sqlite3.connect(str(path)), 100),
+    )
+
+    assert cli.main(["export"]) == 1, (
+        "整群读不到的 export 报了成功——任务计划看到 exit 0，而那个群一条都没读进来"
+    )
+    assert "[失败] 1 个群整群读不到" in capsys.readouterr().out
+
+    # ── 对照组：同一个替身不抛 ⇒ 退 0，两个群都在 per_group 里 ──────
+    monkeypatch.setattr(
+        "vigil.export.qqdb.open_encrypted",
+        lambda path, key: sqlite3.connect(str(path)),
+    )
+    assert cli.main(["export"]) == 0
+
+
+# ── F4 的第四条写库命令：`deadline-audit --apply` 也要上锁（终审 U-3/M-1）──
+#
+# F4 的裁定是「人工命令也要上锁」（R71），但实现的是**按名字枚举**的三个
+# （export/refine/digest）。写库路径还有**第四条**：`cmd_deadline_audit` →
+# `store.clear_deadlines`（它自己 commit）。终审实测（锁被持有时）：
+# `export` rc=2（被保护），`deadline-audit --apply` rc=**0** 且库**仍被改**。
+
+
+def _seed_unverifiable_deadline(db) -> int:
+    """造一个导出库，里面有一条「截止日在源文里找不到依据」的 item。
+
+    返回那个 `deadline_ts`——「库被改没被改」就靠它判。
+    """
+    import datetime as dt
+    import sqlite3
+
+    from vigil import store
+    from vigil.store import ExtractedItem
+
+    db.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(db))
+    store.ensure_schema(conn)
+    # `messages` 表按 web/export 产出的形状建（ensure_schema 不管它）
+    conn.executescript(
+        "CREATE TABLE IF NOT EXISTS messages (msg_id INTEGER PRIMARY KEY,"
+        " group_id INTEGER NOT NULL, ts INTEGER NOT NULL, sender_uid TEXT,"
+        " content TEXT NOT NULL);"
+    )
+    ts = int(dt.datetime(2026, 9, 26).timestamp())
+    with store.transaction(conn):
+        store.save_items(
+            conn,
+            [ExtractedItem(
+                kind="notice", title="某通知", detail=None, event_ts=ts,
+                deadline_ts=ts, group_id=100, actor_uid=None, place=None,
+                links=(), amount=None, confidence=0.9, src_msg_ids=(1,),
+            )],
+            model="m", prompt_ver="v2", commit=False,
+        )
+        conn.execute(
+            "INSERT INTO messages (msg_id, group_id, ts, sender_uid, content)"
+            " VALUES (1, 100, ?, 'u1', '这条正文里没有任何日期')",
+            (ts,),
+        )
+    conn.close()
+    return ts
+
+
+def _deadline_ts_of(db, item_id: int = 1):
+    import sqlite3
+
+    conn = sqlite3.connect(str(db))
+    try:
+        return conn.execute(
+            "SELECT deadline_ts FROM items WHERE item_id = ?", (item_id,)
+        ).fetchone()[0]
+    finally:
+        conn.close()
+
+
+def test_deadline_audit_apply_returns_2_and_leaves_the_db_alone_when_locked(
+    cli_env, monkeypatch, capsys
+):
+    """⭐ `deadline-audit --apply` 撞车 ⇒ **2**，且**库一个字没动**。
+
+    终审实测（锁被持有时）：`export` rc=2（被保护），而 `deadline-audit --apply`
+    rc=**0** 且 `items.deadline_ts` 被置 NULL——「所有写库命令都上锁」这条 M4
+    承诺此前只覆盖**按名字枚举**的三个。而它对库的写**不可逆**（核验判错就
+    把真截止日抹了），所以「锁在保护、它照写」是这条里最重的一半。
+
+    变异「去掉 `cmd_deadline_audit` 里的 `with lock.SingleInstance():`」→
+    本条红，且报告里**两个数一起现形**（实测 `(0, None) == (2, ts)`）：
+    退出码 0 而不是 2，**并且库已经被改了**。
+    """
+    from vigil import lock
+
+    db = cli_env / "export.db"
+    ts = _seed_unverifiable_deadline(db)
+    monkeypatch.setattr(cli, "_load_config_only", lambda: _config(cli_env))
+    monkeypatch.setattr(cli, "_require_export_db", lambda config: db)
+
+    assert _deadline_ts_of(db) == ts, "造场景失败：这条的截止日一开始就该在"
+
+    with lock.SingleInstance(lock.LOCK_PATH):     # 「另一个实例」持着同一把锁
+        rc = cli.main(["deadline-audit", "--apply"])
+    after = _deadline_ts_of(db)
+
+    # ⚠️ 两个事实**合成一条断言**：分成两条的话，前一条一红后一条就再也不跑，
+    # 而「库被改了没」恰恰是这里最重的一半（deadline_ts 置 NULL 不可逆）。
+    assert (rc, after) == (2, ts), (
+        f"锁被持有时 rc={rc}（应当是 2），deadline_ts={after}（应当是 {ts}，"
+        f"即**一个字都没改**）——退 0 + 库被改说明这把锁根本没保护到它"
+    )
+    # 退出码是给任务计划的，人还要看得见「为什么没跑」——与其它三个写库
+    # 命令同一句话术，且**不许**静默退 2
+    assert "[跳过]" in capsys.readouterr().out
+
+    # 锁放掉后照常：真的写，且报出改了几条
+    assert cli.main(["deadline-audit", "--apply"]) == 0
+    assert _deadline_ts_of(db) is None
+
+
+def test_deadline_audit_dry_run_is_read_only_so_it_does_not_take_the_lock(
+    cli_env, monkeypatch
+):
+    """默认的 `deadline-audit`（dry-run）**不上锁**——这是判断，不是遗漏。
+
+    它是 `read`/`who`/`media`/`groups` 那一族的**人工即时查询**：只有 SELECT
+    和 print。`lock.SingleInstance` 的语义是「同一时刻只许一个**写库**的
+    vigil 进程」（见 `lock.py` 的模块 docstring）；给只读检查上锁会凭空造出
+    一个**假拒绝**（rc=2），而 2 的约定含义是「已经有实例在写」。
+
+    所以锁**只在 `--apply` 那一刻**取，理由写在 `cmd_deadline_audit` 里。
+
+    变异「把 `with lock.SingleInstance():` 提到函数开头（dry-run 也上锁）」
+    → 本条红（rc 会变成 2）。
+    """
+    from vigil import lock
+
+    db = cli_env / "export.db"
+    ts = _seed_unverifiable_deadline(db)
+    monkeypatch.setattr(cli, "_load_config_only", lambda: _config(cli_env))
+    monkeypatch.setattr(cli, "_require_export_db", lambda config: db)
+
+    with lock.SingleInstance(lock.LOCK_PATH):
+        assert cli.main(["deadline-audit"]) == 0, (
+            "只读的核验被锁挡住了——那不是「有人在写」，是假拒绝"
+        )
+    assert _deadline_ts_of(db) == ts, "dry-run 一个字都不许改库"

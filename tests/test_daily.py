@@ -505,3 +505,49 @@ def test_broken_real_emit_never_yields_an_ok_report(wired, logdir, monkeypatch, 
     assert "全部成功" not in capsys.readouterr().out, (
         "日志写不进去却印了「全部成功」——这正是审查实测到的修前行为"
     )
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# 无人值守路径的 token 预算（M4 终审 I-3）
+#
+# `vigil refine` 的 `--budget` 只存在于 CLI，而 `daily.run` 是**没人看着跑**
+# 的那条路。不传 ⇒ `refine()` 的预算护栏（只在 `budget_tokens is not None`
+# 时生效）形同不存在 ⇒ 首次挂机或断更积压时，08:00 那次会在无人看管下把
+# 全部积压跑完，时长与花费都无上界（`StartWhenAvailable` 还会把错过的补跑）。
+# ─────────────────────────────────────────────────────────────────────────
+
+
+def test_unattended_refine_gets_a_token_budget(monkeypatch):
+    """⭐⭐ `daily.run` 传给 `refine` 的 `budget_tokens` **不许是 None**。
+
+    断言两件，缺一不可：
+
+    * **不是 None** —— 护栏真的能生效（`refine()` 的闸是
+      `if budget_tokens is not None and stats.total_tokens >= budget_tokens`）；
+    * **就是那个具名常量** —— 不许顺手写死另一个数；取值依据（实测锚点、
+      正常日/爆量日/全史积压各是多少）写在 `daily.DAILY_BUDGET_TOKENS` 上面那段。
+
+    变异「删掉 `budget_tokens=DAILY_BUDGET_TOKENS` 这个实参」→ 第一条断言红。
+    变异「把它改成 `refine_mod.DEFAULT_MODEL` 之类的别的值」→ 第二条红。
+    """
+    seen = _stages_recording_kwargs(monkeypatch)
+    report = daily.run(config=_FakeConfig(), key="k", llm_key="l",
+                       day="2026-09-16", on_progress=lambda *_: None)
+
+    assert report.ok
+    budget = seen["refine"].get("budget_tokens")
+    assert budget is not None, (
+        "无人值守那条路没有预算上限：`refine()` 的护栏只在 budget_tokens 不是 None "
+        "时生效，不传 = 首次挂机/断更积压会在无人看管下把全部积压跑完"
+    )
+    assert budget == daily.DAILY_BUDGET_TOKENS
+
+    # 下界（不是把 300,000 这个选择钉死，只防「有人悄悄改小到卡死日常」）：
+    # 已验收的三篇日报是 151 / 514 / 536 条，按每条扫描消息 ≈15 token
+    # （M1 的 1,050 条窗口实跑 13,520 输入 token + 输出折算）⇒ 最吵的那天
+    # ≈8,000 token。留 10 倍余量。
+    busiest_recorded_day = 536 * 15
+    assert budget >= busiest_recorded_day * 10, (
+        f"预算 {budget:,} 离「最吵的一天」{busiest_recorded_day:,} token 太近——"
+        f"宁可宽松也不要卡死日常（依据见 daily.DAILY_BUDGET_TOKENS 的注释）"
+    )

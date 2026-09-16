@@ -150,9 +150,20 @@ def _read_group(src_factory, gid: int) -> GroupRead:
                 (gid,),
             )
         ]
-    except Exception:  # noqa: BLE001 — 连索引都读不到，整群放弃
+    except Exception:  # noqa: BLE001 — 连索引都读不到，整群读不到
+        # ⚠️ **不许**在这里 `return GroupRead([], [])` 当作"这个群读完了"。
+        # 那个返回值与「这个群本来就没消息」**完全同形**：调用方会把它记进
+        # `per_group`（0 条）、**不进 `failed_groups`** ⇒ `cmd_export` 退 0、
+        # `daily` 的「export 失败 ⇒ 跳过 digest」判据失效 ⇒ **日报照写**——
+        # 而那篇日报会以「这天很安静」的口气，叙述一个整个群没读进来的日子。
+        # （M4 终审在副本里实测过：`✓ 100 班级群：0 条` / `report.ok=True` / 退出码 0。）
+        #
+        # 抛出去，让调用方（`export()` 里 per-group 的 `except Exception`）
+        # 把它记进 `failed_groups` —— **整群读不到本来就是失败**。
+        # ⚠️ 只有这一条路要改：坏页那条（`skipped_ranges`）是**已上报的降级**，
+        # 不是静默——它进 `skipped_by_group`，CLI 会照实报出来。
         src.close()
-        return GroupRead([], [])
+        raise
     src.close()
 
     rows_out: list[tuple] = []

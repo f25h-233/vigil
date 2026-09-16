@@ -165,3 +165,116 @@ def test_media_local_counts_really_present_files(env):
 
     assert stats.media_total == 2
     assert stats.media_local == 2, "两张图都在缓存里，本地可取就该是 2 而不是 0"
+
+
+# ── 「整群读不到」不许长得像「这个群本来就没消息」（M4 终审 C-1/U-1）────
+#
+# 旧形状：分块回退里那条「取该群全部 rowid」的索引查询失败时
+# `return GroupRead([], [])`——它与「这个群本来就没消息」**完全同形**：
+# 调用方把它记进 `per_group`（0 条）、**不进 `failed_groups`** ⇒ `cmd_export`
+# 退 0 ⇒ `daily` 的「export 失败 ⇒ 跳过 digest」判据失效 ⇒ **日报照写**，
+# 而那篇日报会以「这天很安静」的口气，叙述一个整个群没读进来的日子。
+#
+# 终审在副本里实测到的形态就是这个：`✓ 100 班级群：0 条` / `report.ok=True` /
+# 退出码 0。而 `tests/test_cli.py` 那些判据全是**手造的 `ExportStats`**，
+# 够不着 `export()` 内部——所以这里是唯一能抓住它的地方。
+
+EMPTY_GROUP_ID = 200
+EMPTY_GROUP_NAME = "新生群"
+
+
+class _UnreadableGroup:
+    """真 sqlite 连接的替身：**只有那一个群**的查询抛，其余照常。
+
+    ⚠️ 群号必须参与判定：另一个群（`EMPTY_GROUP_ID`）要**一切正常**——它正是
+    「本来就没消息」那一半判据。不分群号一律抛的话，两条判据就成了同一件事，
+    「读不到 vs 本来就没有」的区别一点都没钉住（而区别正是本条的全部价值）。
+
+    ⚠️ 抛的位置与实测同形：坏页让**带索引/整表扫**的查询直接抛。快路径
+    （`SELECT *`）也一并抛——只有它先失败，代码才走得到那条分块回退的索引查询。
+    """
+
+    def __init__(self, conn: sqlite3.Connection, gid: int) -> None:
+        self._conn = conn
+        self._gid = gid
+
+    def execute(self, sql, params=(), *rest):
+        if f"FROM {export_mod.TABLE} " in sql and params and params[0] == self._gid:
+            raise sqlite3.OperationalError("database disk image is malformed")
+        return self._conn.execute(sql, params, *rest)
+
+    def close(self) -> None:
+        self._conn.close()
+
+
+def _two_group_config(tmp_path) -> Config:
+    """两个群：一个（`GROUP_ID`）里面有消息，另一个（`EMPTY_GROUP_ID`）一条都没有。"""
+    return Config(
+        qq_db_dir=tmp_path / "qq",
+        output_db=tmp_path / "export.db",
+        groups=(
+            Group(id=GROUP_ID, name=GROUP_NAME),
+            Group(id=EMPTY_GROUP_ID, name=EMPTY_GROUP_NAME),
+        ),
+    )
+
+
+def _unreadable_first_group(path, _key):
+    return _UnreadableGroup(sqlite3.connect(str(path)), GROUP_ID)
+
+
+def test_unreadable_group_is_a_failure_not_an_empty_group(env, monkeypatch):
+    """⭐⭐ 整群读不到 ⇒ 进 `failed_groups`，**不进** `per_group`。
+
+    ⚠️ 与下一条（`…_empty_group_stays_a_success`）是**一对**：只钉这一条的话，
+    「把 0 条一律当失败」那种过度修正照样全绿——那同样是假话，只是方向相反
+    （天天报一个不存在的故障，让真故障淹没在噪声里）。
+
+    断言四件：进 `failed_groups`、**理由非空**、**不进** `per_group`、进度行里
+    不许出现 `✓`（`✓ 100 班级群：0 条` 正是终端上骗人的那一半）。
+
+    变异「把 `export.py` 的 `raise` 改回 `return GroupRead([], [])`」→
+    第一条断言红（实测 `[] == [100]`），后三条同因也红。
+    """
+    monkeypatch.setattr(export_mod.qqdb, "open_encrypted", _unreadable_first_group)
+    lines: list[str] = []
+
+    stats = export_mod.export(_two_group_config(env), "k-db", on_progress=lines.append)
+
+    assert [gid for gid, _ in stats.failed_groups] == [GROUP_ID], (
+        "整群读不到没有进 failed_groups ⇒ cmd_export 会退 0、daily 会照写日报"
+    )
+    assert stats.failed_groups[0][1], "失败理由必须非空——空的理由等于没说"
+    assert GROUP_ID not in [gid for gid, _, _ in stats.per_group], (
+        "★ 读不到的群出现在 per_group 里 = 它被记成了「读成功、0 条」，"
+        "与「这个群本来就没消息」再也分不开"
+    )
+    assert not any(f"✓ {GROUP_ID} " in m for m in lines), (
+        f"进度行不许给它打 ✓（终端上那一半假话）：{[m for m in lines if m.startswith('  ')]!r}"
+    )
+
+
+def test_a_group_with_no_messages_stays_a_success(env, monkeypatch):
+    """⭐ 真的一条消息都没有的群，**照常算读成功**（`per_group` 里 0 条）。
+
+    这是上一条的**对照**：`_read_group` 的修法（索引查询失败 ⇒ 抛）最容易的
+    过度修正是「0 条一律当失败」——那会把每个安静的小群天天报成故障，
+    真故障反而淹在噪声里。所以「读不到」与「本来就没有」必须**两个方向**都不许同形。
+
+    ⚠️ 源库里真的没有这个群的行、查询一切正常——这正是现实里「刚加群、
+    还没同步」的形状。
+
+    变异「让 `export()` 把 0 条也记进 `failed_groups`」（实测写法：
+    `if not result.rows: failed_groups.append(...); continue`）→ 本条红。
+    """
+    lines: list[str] = []
+
+    stats = export_mod.export(_two_group_config(env), "k-db", on_progress=lines.append)
+
+    assert (EMPTY_GROUP_ID, EMPTY_GROUP_NAME, 0) in stats.per_group, (
+        "真没消息的群必须照常进 per_group——否则「读不到」与「本来就没有」"
+        "只是换了个方向同形"
+    )
+    assert EMPTY_GROUP_ID not in [gid for gid, _ in stats.failed_groups]
+    assert any(f"✓ {EMPTY_GROUP_ID} " in m for m in lines)
+    assert stats.failed_groups == []
