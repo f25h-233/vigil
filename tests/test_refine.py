@@ -1059,3 +1059,29 @@ def test_to_item_keeps_future_deadline(msg_factory):
         known_kinds=frozenset({"notice"}),
     )
     assert it.deadline_ts is not None
+
+
+def test_to_item_place_evidence_must_come_from_the_source_message(msg_factory):
+    """⚠️ 补的守卫（偏差，见报告「偏差」第 8 条）：place 的依据**只许来自那一条**源消息。
+
+    brief 的 Step 7 专门警告过「**不要**把 `sources_text` 写成整个 batch 的正文拼接……
+    跨消息拼接凭空造出证据」，但它给的 4 条接线用例**全是单消息批次**——
+    实测把 `sources_text` 改成整批正文之后**全量 439 条一条都不红**（变异 M7）。
+    即：这条警告当前**零守护**，正是 M4「记下来了 ≠ 派下去了」的同族。
+
+    这条用例是唯一能把两种写法分开的形状：摘录命中 msg 1，而 place 只出现在 msg 2。
+      · 依据只取源消息（正确）→ msg 1 里没有「立德楼1阶」的任何 2 字子串 → 清掉
+      · 依据取整批（错误）→ msg 2 的正文给了它背书 → 保留（本用例变红）
+    """
+    batch = [
+        msg_factory(1, "西太湖连隔板", uid="u_1"),
+        msg_factory(2, "公告：立德楼1阶今天停电", uid="u_2"),
+    ]
+    it = refine._to_item(
+        {"quote": "西太湖连隔板", "kind": "notice", "title": "澡堂隔板",
+         "place": "立德楼1阶", "confidence": 0.9},
+        batch,
+        known_kinds=frozenset({"notice"}),
+    )
+    assert it is not None
+    assert it.place is None, "依据只许来自源消息；跨消息拼接会凭空造出证据"
