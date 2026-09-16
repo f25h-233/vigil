@@ -818,3 +818,98 @@ def test_prompt_sanitizes_fullwidth_quotes(seeded, monkeypatch):
     assert "“" not in sent["user"] and "”" not in sent["user"], \
         "全角引号必须被 sanitize_for_llm 换掉"
     assert "「明天交作业」" in sent["user"]
+
+
+def test_quote_with_fullwidth_quotes_still_matches_its_source():
+    """⭐ 源文**自己**含全角引号时，摘录整句仍要匹配回来源。
+
+    这是 M2-3 修复**引入的回归**的判据：`sanitize_for_llm` 把 `“”` 换成 `「」`
+    送出去，模型照抄回来的是 `「」`，而源文里躺着 `“”`。只剥 `「」` 不剥 `“”`
+    的话两侧归一化不对称，**整句摘录的子串对不上 ⇒ 那条 item 丢掉来源**。
+    修之前这些消息是匹配得上的（两侧都是 `“”`），所以这是净回归。
+    实测全库 ~25/47,719 命中。
+
+    ⚠️ 修法是让 `refine._PUNCT` 与 `digest._PUNCT` **逐字一致**（那边早就有
+    这组引号，理由与这边同源：一侧出网时换过字符、另一侧没有）。
+    """
+    from vigil.store import PendingMessage
+
+    batch = [
+        PendingMessage(msg_id=9, group_id=1, ts=1, sender_uid="u", sender="x",
+                       content="他说“明天交作业”了"),
+    ]
+
+    # ① 模型按**净化后**的提示词逐字摘录（提示词里是 「」）→ 必须命中（回归本体）
+    assert refine._match_source("他说「明天交作业」了", batch) is not None
+    # ② 模型照抄库内原文（“”）→ 也要命中：两个方向靠同一张表兜住
+    assert refine._match_source("他说“明天交作业”了", batch) is not None
+    # ③ 反面：不相干的摘录照样不命中——剥引号不许把「不同的句子」也放进来
+    assert refine._match_source("他说「后天交作业」了", batch) is None
+    assert refine._match_source("他说明天交体育作业了", batch) is None
+
+
+def test_stripping_quote_characters_does_not_manufacture_wild_attribution():
+    """反向阳性对照：多剥一组引号，会不会**制造假匹配 / 误归属**？
+
+    ⚠️ 这是 `_PUNCT` 加 `“”`、`"` 之后必须回答的问题（比丢来源更糟的那种错）。
+    分三层钉：
+
+    ① **不许把只差一个字的句子混起来**（真正的鉴别力还在）：两条消息
+       「明天交作业」/「后天交作业」只差一个字，摘录必须落回**对的那条**。
+       剥引号若伤到正文，两条会归一化成同一个串，先到先得就会误归属。
+    ② **不许跨到真正不同的消息上**：批里的无关消息永远不许被认成来源。
+    ③ **同文异引号之间确实是歧义**，且这是**既有的**、不是本次改动引入的：
+       实测（改 `_PUNCT` 之前跑同一份探针）「A 的净化形摘录」就已经会落到 B 上
+       ——因为 `sanitize_for_llm` 抹掉的那两个字符，模型**本来就没看见**，
+       两条消息对模型本来就不可区分。改后修复的方向（净化形摘录）反而开始
+       落回真来源 A。所以这里只断言「返回的那条在文字上支持这条摘录」，
+       不假装它总能挑对双胞胎。
+    """
+    from vigil.store import PendingMessage
+
+    def m(mid: int, content: str) -> store.PendingMessage:
+        return PendingMessage(msg_id=mid, group_id=1, ts=mid, sender_uid="u",
+                              sender="x", content=content)
+
+    # ① 只差一个字：剥引号之后仍必须分得开
+    tomorrow = m(1, "他说“明天交作业”了")
+    dayafter = m(2, "他说“后天交作业”了")
+    assert refine._match_source(
+        "他说「后天交作业」了", [tomorrow, dayafter]
+    ).msg_id == 2, "剥引号不许把「明天/后天」也归一化掉"
+    assert refine._match_source(
+        "他说「明天交作业」了", [tomorrow, dayafter]
+    ).msg_id == 1
+
+    # ② 真正不同的消息绝不能被认成来源
+    unrelated = m(3, "数学作业截止到9月7号")
+    assert refine._match_source(
+        "数学作业截止到9月7号", [tomorrow, dayafter, unrelated]
+    ).msg_id == 3
+    assert refine._match_source("他说「明天交作业」了", [unrelated]) is None
+
+    # ③ 双胞胎（同文异引号）：返回的那条必须在**文字上支持**这条摘录
+    twin_raw = m(1, "他说“明天交作业”了")
+    twin_plain = m(2, "他说明天交作业了")
+    for quote in ("他说「明天交作业」了", "他说“明天交作业”了", "他说明天交作业了"):
+        src = refine._match_source(quote, [twin_raw, twin_plain])
+        assert src is not None, quote
+        assert refine._normalize(quote) in refine._normalize(src.content), (
+            f"来源不支持这条摘录：{quote!r} -> {src.content!r}"
+        )
+
+    # ④ **表格的边界：只许剥标点/空白，不许碰正文。**
+    #    这是「剥多了会不会误归属」的真答案，分两句说：
+    #    · 剥掉**标点**不会直接制造误归属——归一化两侧都做，被剥的字符在
+    #      摘录与源文里**同时**消失，所以它只能让「只差那些被剥字符」的消息
+    #      变得不可区分（③ 就是那个等价类，且它**先于**本次改动就存在）。
+    #    · 危险的是**剥到正文**：那才会把内容不同的句子变成同一条，让摘录
+    #      落到错误的来源上。这条直接钉住表格边界——往 `_PUNCT` 里加任何
+    #      正文汉字（哪怕只加一个「天」）都会立刻变红。
+    #    ⚠️ 也就是说：**这条断言是反向对照的牙齿**，①②③ 单凭自身抓不住
+    #    「表格被写宽了」（实测：只加「天」时 ①②③ 全绿）。
+    assert refine._normalize("明天交作业") == "明天交作业", \
+        "_PUNCT 只许剥标点/空白：剥到正文就会把不同的句子变成同一条"
+    assert refine._normalize('他说“明天交作业”了') == "他说明天交作业了", \
+        "全角引号（本次新增的那组）必须被剥掉"
+    assert refine._normalize("　（640）\t") == "640", "标点/空白照旧剥掉（既有语义不变）"
