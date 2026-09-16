@@ -8,9 +8,11 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import sqlite3
 import time
+from collections.abc import Iterator
 from dataclasses import dataclass
 
 STATUS_OK = "ok"
@@ -239,6 +241,32 @@ def pending_messages(
     return [PendingMessage(*row) for row in conn.execute(sql, params)]
 
 
+@contextlib.contextmanager
+def transaction(conn: sqlite3.Connection) -> Iterator[None]:
+    """把一段写操作圈成一个事务：正常退出 commit，出异常 rollback 后原样抛出。
+
+    ⚠️ 存在的唯一理由是**关掉一个窗口**：`save_items` 与 `record_run` 各自
+    commit 一次，两步之间崩掉（断电/重启/任务被杀）会留下「items 落库了、
+    消息没标记」的状态——下次 `pending_messages` 把同一批消息再抽一遍，
+    **产出重复 items 且全程无声**（`items` 表没有任何唯一键，唯一防重复的
+    机制就是 `refine_runs` 的记账跟得上）。写进一个事务后要么两件事都成、
+    要么都不成，重抽是干净的。
+
+    ⚠️ 捕 `BaseException` 而不是 `Exception`：`KeyboardInterrupt` 与
+    `SystemExit` 也必须 rollback，否则 Ctrl-C 会留下半个批次。
+
+    ⚠️ **不可重入**：不要在 `with transaction(conn)` 里面再开一层——
+    sqlite3 的嵌套提交会让内层先落盘，窗口就回来了。
+    """
+    try:
+        yield
+    except BaseException:
+        conn.rollback()
+        raise
+    else:
+        conn.commit()
+
+
 def save_items(
     conn: sqlite3.Connection,
     items: list[ExtractedItem],
@@ -246,8 +274,13 @@ def save_items(
     model: str,
     prompt_ver: str,
     now: int | None = None,
+    commit: bool = True,
 ) -> int:
-    """写 items 与它们的来源，返回写入条数。"""
+    """写 items 与它们的来源，返回写入条数。
+
+    ⚠️ `commit=False` 用于把本函数并入外层 `transaction()` —— 调用方有责任
+    用 `with transaction(conn):` 圈住，否则写的东西永远不会落盘。
+    """
     stamp = int(time.time()) if now is None else now
     for item in items:
         cur = conn.execute(
@@ -276,7 +309,8 @@ def save_items(
             "INSERT OR IGNORE INTO item_sources (item_id, msg_id) VALUES (?, ?)",
             [(cur.lastrowid, mid) for mid in item.src_msg_ids],
         )
-    conn.commit()
+    if commit:
+        conn.commit()
     return len(items)
 
 
@@ -289,8 +323,13 @@ def record_run(
     item_count: int = 0,
     err: str | None = None,
     now: int | None = None,
+    commit: bool = True,
 ) -> None:
-    """记账。用 REPLACE 保证重跑时是更新而非重复插入。"""
+    """记账。用 REPLACE 保证重跑时是更新而非重复插入。
+
+    ⚠️ `commit=False` 用于把本函数并入外层 `transaction()` —— 调用方有责任
+    用 `with transaction(conn):` 圈住，否则写的东西永远不会落盘。
+    """
     if not msg_ids:
         return
     stamp = int(time.time()) if now is None else now
@@ -300,7 +339,8 @@ def record_run(
         " VALUES (?,?,?,?,?,?)",
         [(mid, stamp, status, item_count, prompt_ver, err) for mid in msg_ids],
     )
-    conn.commit()
+    if commit:
+        conn.commit()
 
 
 def window_items(
@@ -420,34 +460,47 @@ def save_digest(
     prompt_ver: str,
     item_ids: list[int],
     now: int | None = None,
+    commit: bool = True,
 ) -> int:
     """写一篇日报，返回 digest_id。同一个窗口**替换**而不是追加。
 
-    先删旧的 digest_items 再删 digests：不删关联行的话，重跑一次就会在
-    digest_items 里留下指向前一版日报的孤儿行。
+    ⚠️ 三步（删 digest_items → 删 digests → 插新行）**必须在同一个事务里**。
+    分开提交的话，崩在中间会让当天日报凭空消失——而 `docs/digests/` 的
+    文件还在，归档不变量（文件集合 == 库里的窗口日期集合）当场破掉，
+    且没有任何东西会报错。
+
+    ⚠️ `commit=False` 时**不自己开事务**，由调用方用 `transaction()` 圈住——
+    这样「写库」与「落文件」能进同一个事务（见 `digest._persist`）。
     """
     stamp = int(time.time()) if now is None else now
-    conn.execute(
-        "DELETE FROM digest_items WHERE digest_id IN"
-        " (SELECT digest_id FROM digests WHERE window_from=? AND window_to=?)",
-        (window_from, window_to),
-    )
-    conn.execute(
-        "DELETE FROM digests WHERE window_from=? AND window_to=?",
-        (window_from, window_to),
-    )
-    cur = conn.execute(
-        "INSERT INTO digests (window_from, window_to, body_md, model,"
-        " prompt_ver, created_at) VALUES (?,?,?,?,?,?)",
-        (window_from, window_to, body_md, model, prompt_ver, stamp),
-    )
-    digest_id = int(cur.lastrowid or 0)
-    conn.executemany(
-        "INSERT OR IGNORE INTO digest_items (digest_id, item_id) VALUES (?,?)",
-        [(digest_id, iid) for iid in item_ids],
-    )
-    conn.commit()
-    return digest_id
+
+    def _write() -> int:
+        # 不删关联行的话，重跑一次就会在 digest_items 里留下指向前一版日报的孤儿行
+        conn.execute(
+            "DELETE FROM digest_items WHERE digest_id IN"
+            " (SELECT digest_id FROM digests WHERE window_from=? AND window_to=?)",
+            (window_from, window_to),
+        )
+        conn.execute(
+            "DELETE FROM digests WHERE window_from=? AND window_to=?",
+            (window_from, window_to),
+        )
+        cur = conn.execute(
+            "INSERT INTO digests (window_from, window_to, body_md, model,"
+            " prompt_ver, created_at) VALUES (?,?,?,?,?,?)",
+            (window_from, window_to, body_md, model, prompt_ver, stamp),
+        )
+        new_id = int(cur.lastrowid or 0)
+        conn.executemany(
+            "INSERT OR IGNORE INTO digest_items (digest_id, item_id) VALUES (?,?)",
+            [(new_id, iid) for iid in item_ids],
+        )
+        return new_id
+
+    if commit:
+        with transaction(conn):
+            return _write()
+    return _write()
 
 
 def item_sources_text(

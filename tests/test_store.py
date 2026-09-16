@@ -1018,3 +1018,110 @@ def test_list_digests_is_newest_window_first():
     assert got[0] == store.DigestSummaryRow(
         digest_id=2, window_from=200, window_to=250, created_at=1, item_count=1
     )
+
+
+# ── M4 T5：写入原子性 ──────────────────────────────────────────────
+
+
+def _make_item(conn: sqlite3.Connection, *, msg_id: int) -> ExtractedItem:
+    """造一条 ExtractedItem，来源挂在 ``msg_id`` 上。
+
+    ⚠️ 偏差（逃逸舱）：brief 里这一行是 ``_make_item(memdb, msg_id=1)``，
+    并注明「用本文件既有的构造夹具」——**本文件没有这个夹具**。既有的
+    ``_insert_item`` / ``_seed_items`` 都是**直接 SQL 插行**、不返回对象，
+    而 ``save_items`` 收的是 ``ExtractedItem``；本文件既有的「造对象」写法是
+    **内联构造**（见 ``test_save_items_writes_sources``）。这里只是把同一形状
+    收成一个函数，字段清单与那条既有用例逐字对齐。
+    """
+    _ensure_message_tables(conn)
+    return ExtractedItem(
+        kind="activity",
+        title="西太湖报告厅有讲座",
+        detail=None,
+        event_ts=1000,
+        deadline_ts=None,
+        group_id=100,
+        actor_uid="u_a",
+        place="西太湖报告厅",
+        links=(),
+        amount=None,
+        confidence=0.9,
+        src_msg_ids=(msg_id,),
+    )
+
+
+def test_transaction_rolls_back_on_exception(memdb):
+    """事务里抛异常 → 之前的写全部不见。"""
+    store.ensure_schema(memdb)
+    item = _make_item(memdb, msg_id=1)          # 用本文件既有的构造夹具
+
+    with pytest.raises(RuntimeError):
+        with store.transaction(memdb):
+            store.save_items(memdb, [item], model="m", prompt_ver="v1", commit=False)
+            raise RuntimeError("模拟崩在两步之间")
+
+    assert memdb.execute("SELECT count(*) FROM items").fetchone()[0] == 0
+    assert memdb.execute("SELECT count(*) FROM item_sources").fetchone()[0] == 0
+
+
+def test_transaction_commits_on_success(memdb):
+    store.ensure_schema(memdb)
+    item = _make_item(memdb, msg_id=1)
+    with store.transaction(memdb):
+        store.save_items(memdb, [item], model="m", prompt_ver="v1", commit=False)
+        store.record_run(memdb, [1], status=store.STATUS_OK,
+                         prompt_ver="v1", commit=False)
+    assert memdb.execute("SELECT count(*) FROM items").fetchone()[0] == 1
+    assert memdb.execute("SELECT count(*) FROM refine_runs").fetchone()[0] == 1
+
+
+class _InsertIntoDigestsFails(sqlite3.Connection):
+    """写日报时让 ``INSERT INTO digests`` 抛 sqlite3.OperationalError。
+
+    ⚠️ 偏差（逃逸舱）：brief 原版注入的是 ``memdb.execute = boom``——**做不到**，
+    实测 ``AttributeError: 'sqlite3.Connection' object attribute 'execute' is
+    read-only``（C 类型的实例属性只读，Python 3.13 / 本机实测）。
+    改成**子类覆盖**：``factory=`` 让连接自带这个行为。注入点与 brief 想注入的
+    位置完全一致（三步里的第三步 ``INSERT INTO digests``），抛的也仍是 brief
+    指定的 ``sqlite3.OperationalError``（对照组：用触发器 ``RAISE(ABORT)`` 注入
+    抛的是 ``IntegrityError``，与 brief 写死的异常类型对不上）。
+    """
+
+    fail_insert = False
+
+    def execute(self, sql, *args):  # type: ignore[override]
+        if self.fail_insert and sql.strip().startswith("INSERT INTO digests"):
+            raise sqlite3.OperationalError("模拟写库失败")
+        return super().execute(sql, *args)
+
+
+def test_save_digest_is_atomic():
+    """⭐ DELETE 与 INSERT 之间崩掉，**旧日报必须还在**。
+
+    `save_digest` 是 先删 digest_items、再删 digests、最后 INSERT。
+    三步不在一个事务里的话，崩在中间会让**当天日报凭空消失**——
+    而 docs/digests/ 的文件还在，归档不变量（文件集合 == 窗口日期集合）
+    当场破掉，且没有任何东西会报错。
+
+    ⚠️ 这条不用 ``memdb`` 夹具：注入点需要 ``factory=`` 的子类连接
+    （见 ``_InsertIntoDigestsFails`` 的说明），``memdb`` 给的是普通连接。
+    连接本身仍是 ``sqlite3.connect(":memory:")``——与夹具同一个形状。
+    """
+    conn = sqlite3.connect(":memory:", factory=_InsertIntoDigestsFails)
+    store.ensure_schema(conn)
+    first = store.save_digest(conn, window_from=10, window_to=20,
+                              body_md="第一版", model="m", prompt_ver="v1",
+                              item_ids=[])
+    assert conn.execute("SELECT count(*) FROM digests").fetchone()[0] == 1
+
+    conn.fail_insert = True
+    try:
+        with pytest.raises(sqlite3.OperationalError):
+            store.save_digest(conn, window_from=10, window_to=20,
+                              body_md="第二版", model="m", prompt_ver="v1",
+                              item_ids=[])
+    finally:
+        conn.fail_insert = False
+
+    rows = conn.execute("SELECT digest_id, body_md FROM digests").fetchall()
+    assert rows == [(first, "第一版")], "崩在 INSERT 时旧日报必须原样还在"
