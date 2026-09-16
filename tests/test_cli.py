@@ -59,17 +59,15 @@ def _config(tmp_path):
 def cli_env(monkeypatch, tmp_path):
     """把 export / refine / digest 的外部依赖全接上（不含 `daily`，见 `daily_env`）。
 
-    ⚠️ **锁的路径也要接到 tmp_path**：三个 `cmd_*` 现在各上一次锁（M4 审 F4），
-    不接的话每次测试都会去动仓库里**真实的** `data/vigil.lock`——测试污染工作区，
-    而且一旦用户那边真有实例在跑，这些测试会莫名其妙地拿到退出码 2。
-    注意这里换的是**路径**不是锁本身：真 `SingleInstance` 的拿锁/放锁逻辑照跑。
+    ⚠️ **锁的路径由 `conftest.py` 的 autouse 夹具统一挪到 `tmp_path`**
+    （三个 `cmd_*` 现在各上一次锁，见 M4 审 F4）。本夹具不再自己换一次——
+    换的是**路径**不是锁本身，真 `SingleInstance` 的拿锁/放锁逻辑照跑。
     """
     cfg = _config(tmp_path)
     monkeypatch.setattr(cli, "_load_or_die", lambda: (cfg, "k-db"))
     monkeypatch.setattr(cli, "_load_config_only", lambda: cfg)
     monkeypatch.setattr(cli, "_require_export_db", lambda config: tmp_path / "export.db")
     monkeypatch.setattr("vigil.config.load_llm_key", lambda *a, **k: "k-llm")
-    monkeypatch.setattr("vigil.lock.LOCK_PATH", tmp_path / "vigil.lock")
     return tmp_path
 
 
@@ -394,7 +392,7 @@ def test_export_returns_2_when_another_instance_holds_the_lock(cli_env, monkeypa
         lambda *a, **kw: ran.append("export") or ExportStats(),
     )
 
-    with lock.SingleInstance(cli_env / "vigil.lock"):      # 「另一个实例」持着锁
+    with lock.SingleInstance(lock.LOCK_PATH):   # 「另一个实例」持着同一把锁
         assert cli.main(["export"]) == 2
     assert ran == []                                      # 没真的跑管线
     assert cli.main(["export"]) == 0                      # 锁放掉后照常
@@ -413,7 +411,7 @@ def test_refine_returns_2_when_another_instance_holds_the_lock(cli_env, monkeypa
         lambda *a, **kw: ran.append("refine") or _refine_stats(),
     )
 
-    with lock.SingleInstance(cli_env / "vigil.lock"):
+    with lock.SingleInstance(lock.LOCK_PATH):   # 与代码**同一把锁**
         assert cli.main(["refine"]) == 2
     assert ran == []
     assert cli.main(["refine"]) == 0
@@ -433,7 +431,7 @@ def test_digest_returns_2_when_another_instance_holds_the_lock(cli_env, monkeypa
         lambda *a, **kw: ran.append("digest") or DigestStats(day="2026-09-13"),
     )
 
-    with lock.SingleInstance(cli_env / "vigil.lock"):
+    with lock.SingleInstance(lock.LOCK_PATH):   # 与代码**同一把锁**
         assert cli.main(["digest", "--date", "2026-09-13"]) == 2
     assert ran == []
     assert cli.main(["digest", "--date", "2026-09-13"]) == 0
