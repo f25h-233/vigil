@@ -24,7 +24,7 @@ export   →   refine   →   digest
 |---|---|
 | `docs/digests/<昨天>.md` | 日报正文 |
 | `data/logs/vigil-YYYY-MM-DD.log` | 本次运行的完整日志 |
-| `data/logs/LAST-ERROR.txt` | **只在失败时出现**；每次运行开始前会被先删掉 |
+| `data/logs/LAST-ERROR.txt` | **只在 `vigil daily` 失败时出现**；每次 daily 开始前会被先删掉（人工单跑的单条命令不写它，见§六） |
 
 **为什么是早上 08:00**：`vigil digest` 的默认日期是**昨天**。早上跑，昨天已经是一个
 完整的、不会再变的窗口；若放在深夜 23:00 跑，"昨天"指的是前天，会重复处理一个
@@ -140,8 +140,12 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/register-task.ps1 -R
 
 `-RepoPath` 指向哪儿，任务就指向那儿的 `scripts\vigil-daily.cmd`；而那个 `.cmd` 会**从自己所在的位置**
 推出仓库根（不硬编码路径），所以整条链跟着走——搬完仓库不用再改第三处。
-（实测：把仓库复制到另一个路径、用 `-RepoPath` 注册，任务指向副本的 `.cmd`；跑那个副本，
-它读写的是副本自己的 `data\logs\`，原仓库一个字没动。）
+（实测：把**整个仓库**复制到另一个路径、用 `-RepoPath` 注册，任务指向副本的 `.cmd`；跑那个副本，
+原仓库的 `data\logs\` 一个字没动。
+⚠️ 前提是**复制整个仓库**——`REPO_ROOT` 只有在副本是**完整工程**（有自己的 venv/editable）时才解析成
+副本；只复制 `scripts\` 不成立，`uv run` 在那种目录下找不到项目会先失败，而 `.cmd` 的兜底句恰好也写到
+副本的 `data\logs\`。所以那次反证**没有**单独证明「跑副本时它读写的是副本自己的 `data\logs\`」，
+它证明的是 `.cmd` 的路径推导 + 「原仓库一个字没动」。）
 
 ---
 
@@ -169,12 +173,19 @@ Get-Content data/logs/vigil-*.log -Tail 40
 先看 `data/logs/LAST-ERROR.txt`：**第一行是失败摘要，后面附日志尾部**。
 再看 `data/logs/vigil-*.log` 的尾部。
 
+> ⚠️ **`LAST-ERROR.txt` 只由 `vigil daily` 维护**（开跑前删、失败时写，两处都在 `cmd_daily` 里）。
+> 所以**人工单跑** `vigil export` / `refine` / `digest` / `deadline-audit` 拿到非 0 时，
+> **不要去读它**：它要么没被更新、里面是**上一次 daily 留下的旧错误**，要么压根不存在。
+> 人工命令看 stdout 与退出码（`echo $?` / `%ERRORLEVEL%`）就够了——这是有意的取舍
+> （人工跑的时候 stderr、屏幕都在你眼前，不需要文件留痕）。
+> 换句话说：`LAST-ERROR.txt` 的语义**只对 `vigil daily` 成立**，与人工单跑的命令无关。
+
 **退出码含义表：**
 
 | 退出码 | 含义 |
 |---|---|
 | `0` | 三阶段全过 |
-| `1` | 有阶段失败或不完整（见 `LAST-ERROR.txt`） |
+| `1` | 有阶段失败或不完整，**或参数/配置错误**（见 `LAST-ERROR.txt`） |
 | `2` | 已有实例在跑，本次直接退出（**不是错误**，见§七） |
 | 其它 | 看日志；若连日志都没有，说明 Python 没起来（`.cmd` 的英文兜底句就是这种情况） |
 
