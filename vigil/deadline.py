@@ -101,3 +101,74 @@ def unverified_item_ids(
         if deadline_ts and not deadline_supported(deadline_ts, sources.get(item_id, "")):
             out.append(item_id)
     return frozenset(out)
+
+
+def _bigrams(text: str) -> frozenset[str]:
+    """去掉分隔符与空白后的全部 2 字子串。
+
+    分隔符按实测数据里真出现过的集合取（item 271 用顿号、item 137 用全角竖线）。
+    """
+    cleaned = _PLACE_SEP.sub("", text)
+    return frozenset(cleaned[i : i + 2] for i in range(len(cleaned) - 1))
+
+
+_PLACE_SEP = re.compile(r"[\s、,，/｜|·]+")
+
+
+def place_supported(place: str | None, sources: str) -> bool:
+    """源文里能不能找到这个地点的依据。
+
+    ⚠️ **判据刻意做得宽**（任一 2 字子串命中即算有依据），因为 place 与 deadline
+    的性质不同：deadline 驱动「⏰ 别忘」，错了会让人误事；place 只是显示提示。
+    实测：整串匹配太严会误杀「西太湖校区 ← 源文『西太湖连隔板』」这类。
+
+    ⚠️ **短于 2 字的 place 判据不适用 ⇒ 返回 True**。真实数据里 item 295 的
+    place 是单字「湖」，bigram 对它恒为空集——写成 False 会静默误清，
+    且没有任何测试会因此变红（M2「多分支判据必须多分支守卫」）。
+    """
+    if not place:
+        return True
+    grams = _bigrams(place)
+    if not grams:
+        return True
+    return bool(grams & _bigrams(sources))
+
+
+def deadline_sane(deadline_ts: int | None, event_ts: int) -> bool:
+    """截止日不早于消息当天——`deadline` 字段的语义是**需要行动的截止日**。
+
+    ⚠️ 这不是"幻觉检测"（那由 `deadline_supported` 负责）。item 83 的
+    `档案袋封口时间：5 月 6 日` 在源文里**找得到**、抽取也没错，它是**过去的既成事实**——
+    但它不满足「需要行动」这个语义，所以不该占着「⏰ 别忘」那一节。
+
+    判据按**本地日**比较（与 `_day_start` 的口径一致）：同一天不过夜 ⇒ 放行。
+    """
+    if deadline_ts is None:
+        return True
+    day_start = _day_start_of(event_ts)
+    return deadline_ts >= day_start
+
+
+def _day_start_of(ts: int) -> int:
+    """某个 epoch 秒**所在的本地日**的 00:00（epoch 秒）。
+
+    ⚠️ **偏差（逃逸舱第 1 种形状，见报告「偏差」第 3 条）**：brief 只有前两行，
+    而它在 Windows 上会**抛**——``datetime(1970,1,1).timestamp()`` 是负 epoch，
+    本机抛 ``OSError [Errno 22]``（与 `_parse_deadline` 的 docstring 同一条限制：
+    1970-01-03 之前的本地时间转不成 unix 秒，本机实测 ``fromtimestamp(-28800)``
+    同样抛）。后果**不是"测试红"而是静默丢数据**：调用点在 `_to_item` 里，而它
+    的外层是 `refine()` 每批的 ``try/except``——一个超前/畸形的 `event_ts` 会让
+    **整批**的 items 一条都不落库，只留一行 error。既有夹具 ts=1000（1970）正好
+    命中它，实测把 `test_refine_parses_deadline` 与
+    `test_refine_wires_the_deadline_drop_end_to_end` 打红，这条路才被发现。
+
+    ⇒ 正常路径**逐字保留** brief 的写法（结果与 `api._day_start` 同口径），
+    只在它抛的那一格补一个**纯算术**回退：`fromtimestamp` 拿到的本地墙钟减去
+    「当日已过的秒数」就是本地午夜，全程不再对负 epoch 调 `timestamp()`。
+    中国无夏令时，本机两条路径逐秒一致；跨 DST 时区时回退路径的口径要重新裁决。
+    """
+    d = dt.datetime.fromtimestamp(ts)
+    try:
+        return int(dt.datetime.combine(d.date(), dt.time.min).timestamp())
+    except (OSError, OverflowError):  # Windows：1970-01-03 之前的本地时间
+        return ts - (d.hour * 3600 + d.minute * 60 + d.second)

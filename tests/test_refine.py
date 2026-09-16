@@ -1000,3 +1000,62 @@ def test_system_prompt_discards_commercial_promo():
     # 反例必须出现在 prompt 里：它们正是 D13 判据的由来（实测误杀样本）
     assert "打电话办卡的都别信" in prompt
     assert "最早9.5" in prompt
+
+
+# ── Task 2：两道闸门接进 _to_item ─────────────────────────────────
+
+
+def test_to_item_drops_place_without_evidence(msg_factory):
+    """源文里没有地点 ⇒ place 降级为 None，**条目本身保留**（与 deadline 同一取舍）。"""
+    batch = [
+        msg_factory(
+            1,
+            "大概这周会有面试 到时候具体时间通知大家",
+            uid="u_1",
+        )
+    ]
+    it = refine._to_item(
+        {"quote": "到时候具体时间通知大家", "kind": "notice",
+         "title": "面试通知", "place": "立德楼1阶", "confidence": 0.9},
+        batch,
+        known_kinds=frozenset({"notice"}),
+    )
+    assert it is not None          # ⚠️ 条目必须还在
+    assert it.place is None        # ⚠️ 只有 place 被降级
+
+
+def test_to_item_keeps_place_with_evidence(msg_factory):
+    batch = [msg_factory(1, "西太湖连隔板", uid="u_1")]
+    it = refine._to_item(
+        {"quote": "西太湖连隔板", "kind": "notice", "title": "澡堂隔板",
+         "place": "西太湖校区", "confidence": 0.9},
+        batch,
+        known_kinds=frozenset({"notice"}),
+    )
+    assert it.place == "西太湖校区"
+
+
+def test_to_item_drops_past_deadline(msg_factory):
+    """item 83 的形状：死线早于消息日。"""
+    # ⚠️ ts 是本机实算值（1785902400 = 2026-08-05 12:00 本地时，见报告「偏差」）
+    batch = [msg_factory(1, "档案袋封口时间：5 月 6 日", ts=1785902400, uid="u_1")]
+    it = refine._to_item(
+        {"quote": "档案袋封口时间：5 月 6 日", "kind": "notice",
+         "title": "档案袋封口", "deadline": "2026-05-06", "confidence": 0.9},
+        batch,
+        known_kinds=frozenset({"notice"}),
+    )
+    assert it is not None
+    assert it.deadline_ts is None
+
+
+def test_to_item_keeps_future_deadline(msg_factory):
+    # ⚠️ ts 是本机实算值（1789531200 = 2026-09-16 12:00 本地时，见报告「偏差」）
+    batch = [msg_factory(1, "9月20日前交表", ts=1789531200, uid="u_1")]
+    it = refine._to_item(
+        {"quote": "9月20日前交表", "kind": "notice", "title": "交表",
+         "deadline": "2026-09-20", "confidence": 0.9},
+        batch,
+        known_kinds=frozenset({"notice"}),
+    )
+    assert it.deadline_ts is not None
