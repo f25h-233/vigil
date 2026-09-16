@@ -164,15 +164,17 @@ def attach_readonly(conn: sqlite3.Connection, path: pathlib.Path | None = None) 
     if any(r[1] == "ov" for r in conn.execute("PRAGMA database_list")):
         return
     target = path or OVERRIDES_DB
+    created = False
     if not target.is_file():
         try:
             ensure_schema(target)
+            created = True
         except (OSError, sqlite3.Error) as exc:
-            # ── 情形②（裁决 R8）：库**本来就不存在**，而且**建不出来** ──────
-            # （`data/` 不可写、路径非法……）这时"没有任何干预存在"是**确定的**
-            # ——文件都没有。所以语义上降级成"无干预"是**正确**的，
-            # 而不是把它当成错误。⚠️ 但必须**响亮**：静默降级会让真正的
-            # 部署问题（不可写的 data/）表现成「我的干预全没了」。
+            # ── 降级分支。「**谁**失败」才是判据，不是「文件在不在」（R8-bis）──
+            # `ensure_schema` 失败 = **根本碰不到文件** ⇒ 此时"没有任何干预
+            # 存在"是**确定的**，降级成"无干预"语义正确、不是掩盖错误。
+            # ⚠️ 但必须**响亮**：静默降级会让真正的部署问题（不可写的 data/）
+            # 表现成「我的干预全没了」。
             _attach_empty_overlay(conn)
             _log.warning(
                 "overlay 库不存在且建不出来（%s）：本连接降级为「无干预」（内存空库）。人工改过的分类与软删在这一进程里看不到。原因：%s",
@@ -182,13 +184,25 @@ def attach_readonly(conn: sqlite3.Connection, path: pathlib.Path | None = None) 
     try:
         conn.execute(f"ATTACH DATABASE 'file:{target.as_posix()}?mode=ro' AS ov")
     except sqlite3.OperationalError as exc:
-        # ── 情形①（裁决 R8）：文件**存在**但挂不上 ⇒ **绝不降级** ──────────
-        # 文件里**可能有墓碑**：降级 = 被软删的条目悄悄复活 + 改过的类目回退，
-        # 直接违反 D15。宁可这个请求响亮地失败，也不许给出"看似正常的旧数据"。
+        # ── 响亮失败分支：`ensure_schema` 成功（或文件本来就在）但 ATTACH 失败 ──
+        # **绝不降级**，哪怕库是刚建出来的空库（`created`）：
+        # ① T4 把「新连接忘带 `uri=True` ⇒ 抛 `OverlayError`，**响亮**、不是静默
+        #    降级」写成了**刻意设计**；按"库是刚建的空库、里面肯定没有干预"去
+        #    降级，就把 R4 的那部分价值退了回去。
+        # ② 文件已存在时更不许降级：里面**可能有墓碑**，降级 = 被软删的条目
+        #    悄悄复活 + 改过的类目回退，直接违反 D15。
         raise OverlayError(
-            "overlay 已存在但只读挂载失败（**不降级**：降级会让软删的条目复活）。常见原因：本连接不是 sqlite3.connect(..., uri=True) 打开的"
-            "（四条生产连接见 task-4-report.md / task-5-report.md）；或 data/ 不可写导致 WAL 的 -shm/-wal 无法重建。"
-            f"原始错误：{exc}"
+            "overlay 只读挂载失败（**不降级**）。常见原因：本连接不是"
+            " sqlite3.connect(..., uri=True) 打开的（四条生产连接见"
+            " task-4-report.md / task-5-report.md）；或 data/ 不可写导致 WAL 的"
+            " -shm/-wal 无法重建。"
+            + (
+                "⚠️ 本次的库是**刚建出来的空库**（里面确定没有干预），但照样不降级"
+                "——否则「新连接忘带标志」就会变成静默降级。"
+                if created
+                else "库是**已存在**的：它可能带着墓碑。"
+            )
+            + f"原始错误：{exc}"
         ) from exc
 
 
