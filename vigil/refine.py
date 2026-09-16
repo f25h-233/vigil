@@ -540,11 +540,6 @@ def refine(
                 # ⚠️ 只有事务真的提交了才动 stats——回滚了还记账，账目会说谎
                 stats.deadlines_dropped += dropped
                 stats.items_saved += saved
-
-                on_progress(
-                    f"[refine] 批次 {index}/{len(batches)}：{len(batch)} 条 → "
-                    f"{len(produced)} 条 item"
-                )
             except Exception as exc:
                 # 捕 `Exception` 而不是某个具体类型：设计意图是「单批失败不中断
                 # 整轮」，捕窄一类，下一个未知异常类型会**再次**掀掉整轮——
@@ -559,6 +554,21 @@ def refine(
                 ):
                     stats.errors.append(f"第 {index} 批 {extra}")
                 continue
+
+            # ⚠️ 成功话术**必须放在 try/except 之外**（计划 §8.5）：
+            # 它炸了要**冒出去**，不许被上面那个 `except Exception` 接住——
+            # 接住的话 `_record_error` 会把**刚提交成功**的这批消息
+            # `INSERT OR REPLACE` 改记成 `error` ⇒ 下轮 `pending_messages`
+            # 重抽它们 ⇒ **重复 items 且无声**。这正是 M4 要消灭的形状，
+            # 而它只在「事务已提交、报进度失败」这个夹缝里触发：
+            # 提交**之前**炸会被 rollback（安全），提交**之后**炸才毒化账目。
+            # 541/542 是纯内存累加、不会抛，所以移走这一句就关掉了整条链。
+            # `produced` 在这里一定已绑定：try 里它先于任何可能抛的语句赋值，
+            # 而 try 失败会 `continue`、根本到不了这行。
+            on_progress(
+                f"[refine] 批次 {index}/{len(batches)}：{len(batch)} 条 → "
+                f"{len(produced)} 条 item"
+            )
 
         return stats
     finally:
