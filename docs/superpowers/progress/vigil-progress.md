@@ -1,171 +1,125 @@
-# VIGIL 进度接力 — M4 完成 / M5 待启动
+# VIGIL 进度接力 — **M5 计划已就绪，待执行**
 
-> **钩子：新会话先读此文件，再读 `docs/superpowers/specs/2026-09-13-vigil-product-layer-design.md`（§8.1 与 §9）。**
-> 最后更新：2026-09-16　｜　M4 模式：SDD **wave**（三波 3/2/3，p 全 0）　｜　仓库：`https://github.com/f25h-233/vigil`（private）
+> **钩子：新会话先读本文件，然后读这两个（顺序别反）：**
+> 1. **spec**：`docs/superpowers/specs/2026-09-16-vigil-m5-m7-design.md`（M5–M7 设计，七条裁定 D10–D16）
+> 2. **计划**：`docs/superpowers/plans/2026-09-16-vigil-m5-correctness.md`（**3917 行，含完整代码**）
+>
+> ⚠️ **第一版 spec（`2026-09-13-…-design.md`）只覆盖 M1–M4，已冻结，不要照它做 M5。**
+>
+> 最后更新：2026-09-16 深夜　｜　M5 模式：**SDD pipeline**　｜　仓库：`https://github.com/f25h-233/vigil`（private）
 
 ---
 
 ## 一句话
 
-**M4「自动化」完成——spec §5 三条出口标准 ①②③ 全部通过**（②③ 由 PC 侧实测；① 的「产出日报」与「无人干预」都实测通过，
-**只有「连续 24 小时」标 ⏸ 待你确认**）。下一步按 spec 走 **M5**：**前端可编辑 + 多维筛选**（范围见 §四）。
+**M5 的 spec 与计划都写完了、都提交了（`d7f99e9` / `579b2da`），但一个任务都还没派。**
+新会话要做的第一件事是**按 pipeline 派 Task 1**，不是重新规划。
+
+**⚠️ M5 的范围在 2026-09-16 晚被用户扩大过一次**——从 4 条功能变成 **12 条功能、拆成 M5/M6/M7 三个里程碑**。
+本文件 §四 里的「M5 范围」是**旧的**，**以新 spec 为准**。
 
 ---
 
-## 当前工作区的真实状态（**以「快照时刻」那一行为准——下面的计数每天自己变**）
+## 一、当前工作区状态（**只放关系式，不放会漂的计数**）
 
-> ⚠️ **M4 之后，「库里的计数」不再是恒等式，而是**时间戳快照**。
-> 任务计划每天 08:00 自己跑一次，`messages`/`items`/`digests` **每天自己涨**。
-> **别拿下面这些数去对账**——要用就用 `vigil` 现查。
-> （M4 收尾时就踩过一次：接力文件写的时候是 5 篇，写完 40 分钟后跑了一轮变成 6 篇，
-> 而文件里自称「以此为准，别凭印象」。**「以此为准」的只有那些关系式，不是计数。**）
+> ⚠️ **M4 起每日管线每天 08:00 自己跑**，`messages`/`items`/`digests` **每天自己涨**。
+> 本文件**刻意不写任何计数**——M4 收尾就踩过一次（写完 40 分钟就过期）。
+> 要用就现查：`uv run vigil ...` 或 `sqlite3 file:data/vigil.db?mode=ro`。
 
 ```
-快照时刻   2026-09-16 21:57
-HEAD      9e4b2ee（已推 origin/master，与远端同步）—— ⚠️ 下面这行之后又有过一次运行，见文末
-tests     422 passed（M3 收尾时是 328）
-data/vigil.db（**快照**）
-  messages     49,548      items      328      refine_runs 49,548    item_sources 328
-  digests           6      digest_items 66
-docs/digests/  2026-08-08 / 09-11 / 09-12 / 09-13 / 09-15 / **09-16**
-data/logs/     vigil-2026-09-16.log（LAST-ERROR.txt 已被成功运行清掉）
-任务计划       VIGIL每日管线 · Next Run 2026/9/17 08:00 · Status Ready
-真库备份       data/vigil.db.bak-m4-smoke-20260916-165727
+HEAD          579b2da（M5 计划）—— 在 master 上，未推 origin
+tests         uv run pytest -q      （M4 收尾时 422 passed；M5 未动代码，应当不变）
+任务计划       VIGIL每日管线 · 每日 08:00（`schtasks /query /tn "VIGIL每日管线" /v /fo LIST`）
+
+不随时间漂的三条关系式：
+  ① 归档不变量：docs/digests/ 的文件集合 == 库里 digests 的窗口日期集合，且逐字节相等
+     （`.gitattributes` 给 docs/digests/*.md 定了 text eol=lf —— 这条对 git 免疫）
+  ② Web 侧不写 data/vigil.db（M3 立，M5 的 D11 把它**精确化**为「可写 config/ 与
+     data/overrides.db，不可写 data/vigil.db」）
+  ③ M5 之后新增：`items` 的可见集合 = 库里的行 − overlay 里软删的（见 §三）
 ```
 
-**唯一不随时间漂的是下面这条关系式**：
+---
 
-**归档不变量**（M4 起每天追加，这是「归档是否完整」的唯一机械判据）：
+## 二、⏭ 现在该做什么（**按顺序，别跳**）
 
-> **`docs/digests/` 的文件集合 == 库里 `digests` 的窗口日期集合，且文件与 `body_md` 逐字节相等。**
+1. **读** `docs/superpowers/specs/2026-09-16-vigil-m5-m7-design.md` 的 §1（现状实测）与 §2（七条裁定）
+2. **读** `docs/superpowers/plans/2026-09-16-vigil-m5-correctness.md` 的**头部**（Global Constraints 10 条 + File Structure）与**尾部**（自审三件套 + §执行方式）
+3. **确认 ledger 还在**：`.superpowers/sdd/2026-09-16-vigil-m5-correctness/progress.md`
+   ——⚠️ **它在 `.superpowers/` 下，是 git-ignored 的本地文件**。若不存在，重建一个（内容看计划尾部即可，**不必重读 3917 行**）
+4. **`/SDD pipeline`**，从 **Task 1** 开始：`task-brief` → implementer → `review-package` → reviewer 双裁决 → 裁决 → fix → scoped re-review
 
-⚠️ **这条对 git 免疫了**（`.gitattributes` 给 `docs/digests/*.md` 定了 `text eol=lf`，M4 终审 U-6）。
+**计划里已写死、新会话不许改的四件事：**
 
-### 文末补记：一次「写完之后又动了一次」的真实记录
-
-**交接文件写完之后我又跑了 `vigil daily --date 2026-09-16`**（用户要求"现在就跑个日报出来"），
-于是上面那份快照当场过期了几处，已就地更正。**这次事件本身值得记一笔**：
-
-- 它证明 M4 的产物**真的在自动改变仓库状态**（库、归档目录、日志）
-- ⇒ **交给下一棒的"状态快照"必须带时刻**，否则它就是本项目记过的「过期快照会烂掉」
-- ⇒ 那条命令的开销（供下次预估）：**114 条待处理 / 3 批 / 28 秒**；
-  对比首次全量那轮：1,664 条 / 21 批 / **6.3 分钟**
+- **模式是 pipeline 不是 wave**。理由（写者表）：`vigil/store.py` 被 **T3 / T5 / T8 / T9 四个任务**写，
+  且 T5 改 `_ITEM_COLS`/`_ITEM_JOINS`、T8 紧接着在同一批函数上加列 ⇒ **T8 必须在 T5 之后**。
+- **Task 9 Step 7 是全程最危险的一步**：`vigil repass` 干跑出的清单里若出现
+  **item 14 / 84 / 86 / 111 / 143**，**立刻停下报告**——那是 prompt v3 没吃住 D13 的信号。
+  计划里写死了：**不许自行调 prompt 消化**。
+- **三个不许跳过的变异反证点**：Task 6（墓碑，两遍：变异 + 阳性对照）、
+  Task 8 Step 10（D11 守卫反向验证）、Task 2 的四条闸门分支。
+- **CRLF 纪律**（Global Constraint 4）：工作区所有源码是 **CRLF**（`store.py` 882/882 全是）。
+  变异脚本做文本替换**必须先断言"替换生效"**再跑测试，否则会得到 M4 终审那种
+  「四条全『符合预期』」的假绿。
 
 ---
 
-## 一、M4 交付了什么
+## 三、M5 会交付什么（一句话版）
 
-| 命令 / 产物 | 说明 |
-|---|---|
-| `vigil daily` | **每日管线入口**：`export → refine → digest` 一条命令；逐阶段记账、失败继续、返回最坏状态 |
-| `scripts/vigil-daily.cmd` | 任务计划的入口（ASCII-only；含"Python 没起来"的兜底） |
-| `scripts/register-task.ps1` | 幂等注册任务（`VIGIL每日管线`，每日 08:00） |
-| `vigil/logs.py` | 日志：按日轮转文件 + `LAST-ERROR.txt` + `emit`（stdout 原文 + 文件带时间戳） |
-| `vigil/lock.py` | 单实例锁（OS 级字节范围锁，**强杀后由内核回收**） |
-| 退出码契约 | `0` 成功 / `1` 失败或参数配置错误 / **`2` 已有实例在跑（不是错误）** |
-| 写入原子化 | `items`+`refine_runs` 同一事务；`save_digest` 的 DELETE/INSERT 同一事务 |
+**让 `items` 是对的、且可控。**
 
-**出口证据全文**：`.superpowers/sdd/2026-09-16-vigil-m4-automation/smoke-report.md`
-（每格注明**证据形态**；`review-final.md` 是终审报告）。
-
----
-
-## 二、⏭ 带进 M5 的遗留（**按优先级**）
-
-### 1. ⭐ **`items` 无批内去重**（用户裁定「记进 M5，本轮不动」）
-
-真库 325 条 items 里有 **1 组重复**：`item 290` 与 `item 296` **同标题、同 `event_ts`、同群**，
-`created_at` **同秒** ⇒ 同一次 `save_items` ⇒ **同一批**，且**来源是同一条消息**
-（`7685735400902931272`）。
-
-> **机理**：模型在一次响应里把同一条消息抽了两遍，而 `save_items` 没有批内去重。
-> `items` 表按设计没有唯一键（防重复**完全**靠 `refine_runs` 记账跟得上）。
-
-**不是 M4 引入的**（M1 时代的缺失），**也不是 spec §4.8 要的「幂等」**（那条验的是"三次**跑**"，已通过）。
-**修法方向**：`produced` 落库前按 `(title, event_ts, group_id)` 批内去重（~3 行）；
-或给 `items` 加唯一约束——**会与「抽取是视图、不是加工后销毁原件」的既有设计冲突，需权衡**。
-
-### 2. **终审 triage 的「留在下一个里程碑」11 条**
-
-详见 `.superpowers/sdd/.../review-final.md` §四。最值得先做的三条：
-
-| 项 | 说明 |
-|---|---|
-| **U-4 `groups` 与 `export` 共用 `data/cache/nt_msg_clear.db`** | 两侧都不拥有那个文件；`qqdb.strip_fake_header` 是**就地截断重写**（无临时文件/无原子改名/无锁）。**最坏后果**：导出中途读到被替换的库 ⇒ 分块回退把失败算成 `skipped_count` ⇒ **那部分消息静默消失，还被报告成「QQ 库物理坏页」** |
-| **`_MIME` 守卫里 `.lower()` 无判据**（`api.py`） | 现行代码正确，缺的是"大小写变体"的判据 |
-| **文档退出码表**与 §三 3.4 的措辞对齐 | 已在终审修复 B 里改过一轮，复核一轮 |
-
-### 3. **⏸ 两条没取到直接证据的**
-
-- **`StartWhenAvailable` 的「睡眠错过 → 唤醒补跑」**：设置值已核实（`<StartWhenAvailable>true</StartWhenAvailable>`），
-  **行为未验**（要真让机器睡过触发时刻再唤醒）
-- **「连续 24 小时无人干预」**：短触发器自触发已实测通过，连续 24h 待你确认
-
-### 4. **M2/M3 的老清单**：M4 动了 M3-1 / M3-2 / M2-3 / M2-4 / M2-7，其余原样带过来（见 M3 接力）
-
----
-
-## 三、⭐ M4 最贵的五条教训（**都已进 `vigil-sdd-lessons` 记忆**）
-
-### 1. **「记下来了」不等于「派下去了」——计划的「发现」节必须与「任务」节双向覆盖**
-
-M4 唯一那条 **Critical**（`export.py` 的整群静默消失）**在规划期就被发现、写进了计划 §二 发现 3**，
-然后……**它没有变成任何任务**，§7.1 的 spec 覆盖对照表里也没有它。
-
-> 后果：`cmd_export` 退 0、`daily` 跳过 digest 的判据失效、**日报照写**——
-> 以「这天很安静」的口气叙述一个**整个群没读进来**的日子，而出口标准①的全部判据都会通过。
-
-**⇒ 下次写计划时：「发现」节里每一条要么有归属任务，要么显式标注"本里程碑不做且因为 X"。**
-（这与记忆里那条「已记录的教训不会自动执行」是同族。）
-
-### 2. ⭐ **「判据本身不可信」的五个形态**（本轮一次收齐）
-
-| 形态 | 实例 |
-|---|---|
-| 变异**存活** | 删掉 `_MIME[".js"]` 后旧测试照样绿（M3-1） |
-| **测试装置自带的行为替代了被测行为** | pytest 9.1.1 的 `LogCaptureHandler.handleError` **就是 `raise`** ⇒ 判据单跑红、整文件跑绿（T1 重开） |
-| **成功路径根本不调那个东西** | emit 替身测试在成功路径上从不触发 ⇒ 假绿（T8） |
-| **变异脚本写错行** | `15 failed` 看着"很有牙"，其实根本没改到目标（T6） |
-| **文本替换静默失效** | 在 CRLF 文本里做替换 ⇒ 四条全"符合预期"（终审修复 A） |
-
-**⇒ 纪律升级**：**变异之后、跑测试之前，必须有"替换生效"的锚点断言**——
-**光是"打印被改的那几行"不够**（打印出来的东西看着像改了、其实没改）。
-
-### 3. **错的论证留在代码里，比没有论证更危险**
-
-同一条论证我犯了三次：M2-3 的"对称剥离所以不会误归属"**逻辑上被推翻**（反例可构造且实跑成立），
-只是**在真实语料上恰好安全**（全库 47,719 条，新增歧义簇 = 0）。
-⇒ 裁定结果站得住，但**理由必须换成"实测"，并写明"日后扩大字符集必须重跑同一测量"**。
-
-### 4. **「设置写对了」≠「行为对了」**（T2 的电源设置那条）
-
-`<StartWhenAvailable>true</StartWhenAvailable>` 是**设置正确**；
-「睡眠错过之后真的会补跑」是**行为正确**。**两件事要分开取证**——
-前者 `/xml` 一读就有，后者要真睡一夜。
-
-### 5. **为了并发安全而加的锁，会把测试变成环境相关的**
-
-F4 给人工命令也上了锁之后，`cli_env` 那批用例**碰到了真实的 `data/vigil.lock`**。
-后果：**"恰好有实例在跑"时那些测试会拿到退出码 2 而莫名变红**，
-且红的 5 条名字里全写着"退出码""密钥"——**看着像产品缺陷**。
-已由 `tests/conftest.py` 的 autouse 夹具挡住（并把 `LOCK_PATH` 指向 `tmp_path`）。
-
----
-
-## 四、M5 范围（**用户 2026-09-16 口头裁定，规划期第一件事是确认**）
-
-| # | 功能 | 需要先定的 |
+| # | 交付 | 关键点 |
 |---|---|---|
-| 1 | 前端「**新增监视群号**」 | **会打破 M3 的机械不变量**（"绝不让 Web 侧写 `data/vigil.db`"，靠 `mode=ro`）。要回答"Web 侧能写什么"——写 `config/groups.toml` 是最省的（可不碰 DB）。<br>⚠️ **实际后果**：下次 `export` 会拉一整批新群的历史 → 慢、走 LLM、可能整群读不到。**M4 的日志/LAST-ERROR/非零退出正是让这件事看得见的东西** |
-| 2 | 前端「**新增监视人物**」 + 「按人物筛选」 | ✅ **语义已裁定**：`items.actor_uid` = 源消息发信人（`refine.py:234`）= **发布人**，不是"信息是关于谁的"。用户明确接受 ⇒ **零重抽成本** |
-| 3 | 类目**多选**（维度内并集） | 设计已清楚：`kind IN (...)` |
-| 4 | 人物维度**跨维度交集** | `kind IN (...) AND actor_uid IN (...)`——维度内并集、维度间交集，不与类目体系冲突 |
-
-**API 现状**：`/api/items` 的 `kind` 是**单值** `str | None`，要改成多值。
+| T1 | prompt v3 | 加「商业推广 → 不入库」，**判据看消息目的不看词** |
+| T2 | 两道要素闸门 | `place` 证据（**2 字子串**）+ `deadline` 时序（不早于消息当天） |
+| T3 | `items` 批内去重 | `(title, event_ts, group_id)` 同键合并，**来源取并集** |
+| T4 | **人工干预层** | `data/overrides.db`：append-only 事件日志 + 物化 `item_state` |
+| T5 | overlay 接 5 处读路径 | **收敛在 `store.py` 查询函数里**，不在消费方打补丁 |
+| T6 | 墓碑阻复活 | `refine` 读 overlay，软删条目**永不被 `--redo` 复活** |
+| T7 | `config/persons.toml` | **uin 主键**（QQ 号），拒绝匿名哨兵 `uin=0`，原子写 |
+| T8 | API 多值 + 人物 + 写端点 | **维度内并集 × 维度间交集**；写端点**只写 overlay** |
+| T9 | `vigil repass` | 存量重判，**只删不换** + 字段降级；默认只出清单 |
+| T10 | 前端 | 多选类目 / 人物筛选 / 改分类 / 删除 / 撤销 |
 
 ---
 
-## 五、已经铺好的路：怎么跑 / 怎么重启
+## 四、M5 之后（**M6 / M7 的范围，别再问用户**）
+
+用户 2026-09-16 已裁定拆三个里程碑：**M5 正确性 → M6 配置 → M7 外观**。
+M6/M7 的完整范围在 spec §4.2 / §4.3 与 §5。要点：
+
+**M6「配置从文件走到界面」**：统一配置层 + 导入导出（#6）、LLM 配置（#5）、
+群号管理（#3）、**类目编辑 + 撤销 + 重排**（用户追加）、U-4 遗留。
+
+> ⚠️ **M6 有一个必须在计划期就处理的雷**（spec §1.6 实测）：
+> `vigil groups` 列群列表靠 `qqdb.strip_fake_header(...)`，它**就地截断重写
+> `data/cache/nt_msg_clear.db`**——那正是遗留缺陷 **U-4**，且**与 `export` 共用同一个文件**。
+> Web 端点直接复用它 = ① 从后门打破「Web 不写 `data/`」；② 与正在跑的 `export` 抢文件，
+> 最坏后果是**部分消息静默消失、还被报告成「QQ 库物理坏页」**。
+> **裁定：群列表必须走只读路径，且必须与 U-4 同批解决。**
+
+**M7「外观」**：五套主题（默认 / material design / 粗野主义 / 蒸汽波 / 毛玻璃）。
+
+---
+
+## 五、⭐ 规划期实测推翻的假设（**别再凭印象重来**）
+
+这些是 2026-09-16 写 spec/计划时，用真库与真代码量出来的。**新会话不需要重测，直接采信**：
+
+| # | 我以为是 | 实测是 |
+|---|---|---|
+| 1 | 噪声是"要加个过滤功能" | **是 spec §4.3 已被违反**：328 条 items 里 46 条（14.0%）来自办卡号；7 月 26% / 8 月 28%。机理：`prefilter.py` 的保留关键词里有「办理」⇒ 单条广告被**保送**进 LLM |
+| 2 | 屏蔽那 4 个办卡号就行 | ⛔ **实测否决**：那是**真学生**，还贡献 15 条好条目（早自习时间 / 住宿费 / 抢课通知 / **诈骗提醒**——是卡王本人发的）。**误杀率 1:2** ⇒ D13：**禁止 uid 维度过滤** |
+| 3 | `place` 闸门用整串匹配 | 会**误杀 item 40**（源文 `西太湖连隔板` 里有「西太湖」）。改为 **任一 2 字子串命中**：保留 58 / 清掉 8。且**单字 place（item 295 的「湖」）判据不适用 ⇒ 保留** |
+| 4 | 真读 `items` 的路径有 8 处 | **5 处**。且 **`digest.py` 根本不直接读 `items`**（走 `store.window_items`）⇒ overlay 的 apply **收敛在 `store.py`**，这是设计改进不是妥协 |
+| 5 | `tests/test_refine.py` 要自己造夹具 | **已有** `FakeLLM` / `StubConfig` / `seeded`。`tests/test_api.py` **已有** `db_path` / `client`。**别造第二套** |
+| 6 | `search_items(kind=)` 调用点"到处都是" | **只有 2 处**：`vigil/api.py:170`、`tests/test_store.py:842` |
+| 7 | 重抽会打断日报引用（R9） | **实测收窄**：46 条广告**零条**被 `digest_items` 引用 ⇒ 删它们安全。但另有 66 条**是**被引用的 ⇒ **不能整批替换**，语义定为「**只删不换**」 |
+| 8 | （M6）群列表可以复用 `vigil groups` | ⛔ 见 §四 的雷 |
+
+---
+
+## 六、怎么跑 / 怎么重启
 
 ```bash
 cd D:/github/VIGIL && uv run vigil serve --host 127.0.0.1 --port 8787   # 后端 + 前端静态托管
@@ -175,71 +129,86 @@ tailscale serve --bg 8787                                               # 手机
 uv run vigil daily          # 手动跑一次完整管线（任务计划跑的是 scripts/vigil-daily.cmd）
 Get-ScheduledTaskInfo -TaskName "VIGIL每日管线" | Format-List LastRunTime,LastTaskResult,NextRunTime
 tail -40 data/logs/vigil-$(date +%Y-%m-%d).log
+
+cd web && npm run build     # ⚠️ 前端改完**必须构建**，serve 托管的是 web/dist
 ```
 
-**Tailscale 的坑**：`tailscale serve --bg 8787` 会**静默挂死 90 秒**（默认 HTTPS、卡在等证书）。
+**Tailscale 的坑**：`tailscale serve --bg 8787` 会**静默挂死 90 秒**（卡在等证书）。
 诊断：`tailscale cert f15h.tail324373.ts.net`（回 `does not support getting TLS certs`）。
 解法：<https://login.tailscale.com/admin/dns> → HTTPS Certificates → Enable（**已于 2026-09-16 开启**）。
 
 **⚠️ 任务计划的两个坑**（M4 实测）：
 1. **`schtasks /change /tn … /st HH:MM` 会弹密码提示并挂死**（实测卡死 180s）。
-   可用替代：`Set-ScheduledTask -Trigger`，且 **`StartBoundary` 必须设未来时间**
+   替代：`Set-ScheduledTask -Trigger`，且 **`StartBoundary` 必须设未来时间**
    （`StartWhenAvailable=true` 会让过去时刻立刻补跑一次完整管线）。
 2. **含中文的 `.ps1` 必须 UTF-8 BOM**——无 BOM 时任务名被**静默**注册成乱码，且**伪装成"注册成功"**。
 
 ---
 
-## 六、SDD 执行方式（**M5 直接沿用**）
+## 七、SDD 执行方式（M5 沿用）
 
-- **模式按任务边界算**：M4 用 wave 三波（3/2/3），**p 全为 0、零越界**。
-  但**真实并行度只由写者表决定**——M4 三波分别只有 3/2/3 条道，不是"wave 更好"。
-  **M5 若只有 Python 一条链或有共享文件，就回 pipeline。**
-- **每任务 = brief → implementer → 审查 → 裁决 → fix → scoped re-review → 波级同步点**。
-- **派发时必带**（M1–M4 血泪，前 13 条见 M3 接力，M4 新增）：
+- **模式按写者表算，不按愿望**。M4 用 wave（三波 3/2/3，p 全 0），**M5 回 pipeline**（理由见 §二）。
+- **每任务 = brief → implementer → 审查 → 裁决 → fix → scoped re-review**。
+- **派发时必带**（M1–M4 血泪，逐条都有实测事件）：
 
-  14. ⭐ **「打印被改的那几行」不够**——必须有**可判定的锚点断言**（"替换生效"），
-      否则打印出来的东西看着像改了、其实没改
-  15. ⭐ **副本里跑测试只设 `PYTHONPATH` 不够**：`sys.path[0]=''`（cwd）**优先于**它。
-      **先 `cd` 进副本**并**断言 `vigil.<模块>.__file__` 的父目录就是副本根**，不满足就停
-  16. ⭐ **计划里的「发现」节必须与「任务」节双向覆盖**（见 §三 教训 1）
-  17. **brief 里的变异也要能在真实代码上跑起来**——写变异前先看目标函数的实际形状
-  18. **controller 给的代码片段/判据本身也会错**——M4 实测 **6 次**：
-      假绿判据、会削弱覆盖的替换片段、自相矛盾的约束、与冻结接口不符的要求……
-      **implementer 按实际修正并报告 = 正解，不记偏差**
+  1. **变异之后、跑测试之前，必须有「替换生效」的锚点断言**——光打印不够
+  2. **取对象按类型不按位置**（`handlers[0]` 拿到过 pytest 自己的 handler）
+  3. **修正一句"声称"时，先证伪旧的、再证实新的**
+  4. **「设置对了」与「行为对了」分开取证**，取不到就标 ⏸
+  5. **碰到真实全局资源的测试必须有 autouse 夹具 + 反向验证**（`data/overrides.db` 同此例）
+  6. **计划里的「发现」节必须与「任务」节双向覆盖**——M4 的 Critical 就是在规划期
+     被发现、写进计划、然后**没有任何任务拥有它**
+  7. **副本里跑测试只设 `PYTHONPATH` 不够**：`sys.path[0]=''`（cwd）优先于它。
+     先 `cd` 进副本并**断言 `vigil.<模块>.__file__` 的父目录就是副本根**
+  8. **controller 给的代码片段/判据本身也会错**（M4 实测 6 次）——
+     implementer **按实际修正并报告 = 正解，不记偏差**
+  9. **若需求自相矛盾 → 停下报告，不许挑一半照做**（把"驳回 + 出证据"记为**高质量行为**）
 
-- **模型分配实测**：转录型 implementer 用 haiku/sonnet；**小 fix diff 的 scoped 复审用 haiku 足够**
-  （M4 实测产出不逊 sonnet，还做了 AST 证明与数字核对）；**最终全分支审查用 opus**。
+- **模型分配**：转录型 implementer 用 haiku/sonnet；小 fix 的 scoped 复审 haiku 够用；
+  **最终全分支审查用 opus**。
 
 ---
 
-## 七、关键文件地图
+## 八、关键文件地图
 
 | 路径 | 内容 |
 |---|---|
-| `vigil/daily.py` | **M4 主体**：三阶段编排 + `RunReport`（失败语义见其 docstring） |
-| `vigil/logs.py` | 日志。**`emit` 的契约是「写不进就抛」**，靠 `handleError` 裸 `raise` 实现 |
-| `vigil/lock.py` | 单实例锁。**锁偏移是 `1_000_000` 不是 0**（Windows 强制锁会让另一句柄**读不了**被锁字节） |
-| `vigil/cli.py` | 四个写库命令**各持锁**；退出码 `0/1/2` |
-| `scripts/` | 任务计划三件套 |
+| **`docs/superpowers/specs/2026-09-16-vigil-m5-m7-design.md`** | **M5–M7 设计（七条裁定 D10–D16）。这是 M5 之后的权威。** |
+| **`docs/superpowers/plans/2026-09-16-vigil-m5-correctness.md`** | **M5 计划，3917 行含完整代码** |
+| `.superpowers/sdd/2026-09-16-vigil-m5-correctness/` | ledger + brief + 报告（**git-ignored，本地过程记忆**） |
+| `docs/superpowers/specs/2026-09-13-…-design.md` | **第一版 spec，只覆盖 M1–M4，已冻结** |
+| `vigil/daily.py` | M4 主体：三阶段编排 + `RunReport` |
+| `vigil/logs.py` | **`emit` 的契约是「写不进就抛」** |
+| `vigil/lock.py` | 单实例锁。**锁偏移是 `1_000_000` 不是 0** |
+| `vigil/store.py` | `transaction()`（**`commit()` 在 `try` 里**）；M5 的 T3/T5/T8/T9 都要改它 |
+| `vigil/refine.py` | 批次写入同一事务；**成功话术在 `try` 之外** |
+| `vigil/prefilter.py` | 规则预筛。**保留关键词里有「办理」——这就是噪声的机理** |
+| `vigil/deadline.py` | `deadline_supported`；M5 的 T2 在这里加 `place_supported` / `deadline_sane` |
+| `.gitattributes` | `docs/digests/*.md text eol=lf` —— 归档不变量的免疫层 |
 | `docs/SETUP-自动化.md` | 安装/验证/排障 |
-| `vigil/store.py` | `transaction()`（**`commit()` 在 `try` 里**）+ `save_*` 的 `commit=` 参数 |
-| `vigil/refine.py` | 批次写入同一事务；**成功话术在 `try` 之外**（否则报进度失败会把 ok 改记成 error） |
-| `.gitattributes` | `docs/digests/*.md text eol=lf` —— **归档不变量的免疫层** |
-| `.superpowers/sdd/2026-09-16-vigil-m4-automation/` | ledger（R1–R85）+ `review-final.md` + **`smoke-report.md`**（本地过程记忆，不入库） |
-| `docs/superpowers/plans/2026-09-16-vigil-m4-automation.md` | M4 计划。**§八 是执行期增补与作废表——读它，别照抄计划里的代码块** |
 
 ---
 
-## 八、未尽事项
+## 九、未尽事项
 
-- §二 的 M5 遗留（1 条数据缺陷 + 11 条 triage + 2 条 ⏸）
+- §四 的 M6 雷（`vigil groups` 写 `data/cache/`）与 U-4
+- M4 终审 triage 的「留在下一个里程碑」11 条（最值得先做的三条见 M4 接力记录）
+- ⏸ 两条没取到直接证据的：`StartWhenAvailable` 的「睡眠错过→唤醒补跑」；
+  「连续 24 小时无人干预」
 - `.superpowers/` 与 `_smoke/` 均**不入库**，是本地过程记忆
-- `/tmp` 下累积了 M1–M4 的过程产物（约数百 MB，含几个 71–217 MB 的临时 db）；
-  **C 盘紧张时值得清**，但**删之前先确认不是某个在跑的实验的输入**
+- `/tmp` 下累积了 M1–M5 的过程产物（数百 MB）；**C 盘紧张时值得清**，
+  但**删之前先确认不是某个在跑的实验的输入**
 
 ---
 
-## 九、方法论沉淀（详见记忆 `vigil-sdd-lessons`，已含 M1–M4）
+## 十、方法论沉淀
 
-**M4 最贵的五条**见 §三。其中**最值得记住的是第 1 条**——
-它说明「审查层」也有结构性的盲区：**没有哪个任务拥有它，就没有任何审查会看它**。
+**M1–M4 的完整教训在记忆 `vigil-sdd-lessons`（含 M4 五条）。**
+M5 规划期新增两条，值得单独记：
+
+1. **「计划写好了」≠「有人知道它在哪」。**
+   接力文件的钩子是唯一入口；新文件若不被它指向，等于不存在。
+   **写完 spec/计划要立刻更新钩子，不要等收尾。**（M4「记下来了 ≠ 派下去了」的入口版。）
+2. **测试夹具要先读再写，不能先写后验。**
+   规划期我为 Task 6/8 自造了 `_cfg()` / `_client()`，读完真实测试后整段重写——
+   约 400 行白写。**"我以为测试长什么样"和"测试长什么样"之间的差距，是纯浪费。**
