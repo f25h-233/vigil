@@ -1236,3 +1236,53 @@ def test_save_items_writes_deduped_rows(memdb):
     )
     assert n == 1
     assert memdb.execute("SELECT COUNT(*) FROM items").fetchone()[0] == 1
+
+
+# ── Task 3 补的守卫（变异 G1/G2 实测：上面 6 条全绿也拦不住这两个坏实现）──
+# 与 T2 的 482e5e9 同族：**计划写进 docstring 的约束，得有东西在执行它**。
+
+
+def test_dedupe_batch_union_has_no_duplicate_ids():
+    """⚠️ 并集是**集合**，来源重叠时不许留重复 id。
+
+    库里有 `INSERT OR IGNORE` 兜着，重复 id 落不了盘——所以这条只在对象层
+    看得出，正因如此才容易被改坏而无人知（变异 G1：改成 `(*a, *b)` 全量全绿）。
+    """
+    out = store._dedupe_batch([_item(src=(11, 22)), _item(src=(22, 33))])
+    assert len(out) == 1
+    assert out[0].src_msg_ids == (11, 22, 33)
+
+
+def test_dedupe_batch_keeps_the_earliest_payload():
+    """同键时留下**最早**那一条的正文（docstring 明写，变异 G2 实测零守护）。
+
+    `kind` 是用户可见的（筛选、日报都读它）——同键两条若模型给了不同类目，
+    「留哪条」不能是偶然。
+    """
+    from dataclasses import replace
+
+    first = _item(kind="notice")
+    second = replace(_item(kind="job", src=(22,)), detail="后一条的正文",
+                     confidence=0.1)
+    out = store._dedupe_batch([first, second])
+    assert len(out) == 1
+    assert out[0].kind == "notice", "留下的该是最早那条的类目"
+    assert out[0].detail is None and out[0].confidence == 0.9
+    assert out[0].src_msg_ids == (1, 22), "并集照旧"
+
+
+def test_save_items_writes_sources_of_every_duplicate(memdb):
+    """去重后那一条要带上**全部**来源行——M1「可回溯到原文」的落点。
+
+    计划给的第 6 条只数了 `items` 的行数，`item_sources` 一行没数；
+    而「合并而不是丢弃」的全部意义就在这张表里（变异 M7：静默丢来源时它红）。
+    """
+    store.ensure_schema(memdb)
+    n = store.save_items(
+        memdb, [_item(src=(11,)), _item(src=(22,))],
+        model="m", prompt_ver="v3",
+    )
+    assert n == 1
+    assert memdb.execute(
+        "SELECT msg_id FROM item_sources ORDER BY msg_id"
+    ).fetchall() == [(11,), (22,)]
