@@ -846,7 +846,7 @@ def test_search_filters_by_kind_and_window():
     store.ensure_schema(conn)
     _insert_item(conn, 1, kind="academic", event_ts=100)
     _insert_item(conn, 2, kind="job", event_ts=200)
-    assert store.search_items(conn, kind="job")[1] == 1
+    assert store.search_items(conn, kinds=["job"])[1] == 1
     assert store.search_items(conn, since=150)[1] == 1
     assert store.search_items(conn, until=150)[1] == 1
 
@@ -935,7 +935,7 @@ def test_get_item_maps_every_column_or_none():
 
     assert store.get_item(conn, 1) == store.ApiItem(
         item_id=1, kind="job", title="招兼职", detail="周末两小时", event_ts=1700,
-        deadline_ts=1800, group_id=100, actor="张三", place="三教",
+        deadline_ts=1800, group_id=100, actor="张三", actor_uin=111, place="三教",
         amount="200/天", links=("http://a",), source_count=1,
     )
     assert store.get_item(conn, 999) is None
@@ -1356,8 +1356,8 @@ def test_kind_filter_uses_effective_kind(memdb):
     overrides.set_kind(ov, item_id=iid, kind="academic")
     ov.close()
 
-    assert store.search_items(memdb, kind="academic", limit=50, offset=0)[1] == 1
-    assert store.search_items(memdb, kind="notice", limit=50, offset=0)[1] == 0
+    assert store.search_items(memdb, kinds=["academic"], limit=50, offset=0)[1] == 1
+    assert store.search_items(memdb, kinds=["notice"], limit=50, offset=0)[1] == 0
 
 
 def test_soft_deleted_item_disappears_from_window(memdb):
@@ -1465,3 +1465,78 @@ def test_digest_item_count_agrees_with_digest_items_when_one_is_deleted(memdb):
     assert store.list_digests(memdb)[0].item_count == 2, (
         "`/api/digests` 的 item_count 与 `/api/digests/{id}` 的 items 打架（R9）"
     )
+
+
+# ── Task 8：多值与人物维度 ────────────────────────────────────────
+
+
+def _seed_with_sender(conn, *, title, kind, ts, group_id=100, uid="u_1", uin=111):
+    from vigil.store import ExtractedItem
+
+    # ⚠️ plan 的 `_seed_with_sender` 少了这一行，实测的 RED 因此是
+    # `sqlite3.OperationalError: no such table: sender_names`（不是 Expected 文本）。
+    # `sender_names` 是 export.py 的产物，`store.ensure_schema` **不建它**
+    # （本文件顶部第 22 行的注释早就写着这件事）——补上已有的幂等助手。
+    _ensure_message_tables(conn)
+    conn.execute(
+        "INSERT OR REPLACE INTO sender_names (group_id, uid, group_nick, qq_nick, uin)"
+        " VALUES (?,?,?,?,?)",
+        (group_id, uid, "昵称", "QQ昵称", uin),
+    )
+    conn.execute(
+        "INSERT INTO items (kind, title, detail, event_ts, deadline_ts, group_id,"
+        " actor_uid, place, links, amount, confidence, model, prompt_ver, created_at)"
+        " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (kind, title, None, ts, None, group_id, uid, None, "[]", None, 0.9, "m", "v3", ts),
+    )
+    return conn.execute("SELECT MAX(item_id) FROM items").fetchone()[0]
+
+
+def test_search_items_accepts_multiple_kinds(memdb):
+    store.ensure_schema(memdb)
+    _seed_with_sender(memdb, title="甲", kind="notice", ts=1)
+    _seed_with_sender(memdb, title="乙", kind="academic", ts=2)
+    _seed_with_sender(memdb, title="丙", kind="life", ts=3)
+
+    _, total = store.search_items(memdb, kinds=["notice", "academic"], limit=50, offset=0)
+    assert total == 2
+
+
+def test_search_items_multiple_persons_is_union(memdb):
+    """维度内是**并集**。"""
+    store.ensure_schema(memdb)
+    _seed_with_sender(memdb, title="甲", kind="notice", ts=1, uid="u_a", uin=111)
+    _seed_with_sender(memdb, title="乙", kind="notice", ts=2, uid="u_b", uin=222)
+    _seed_with_sender(memdb, title="丙", kind="notice", ts=3, uid="u_c", uin=333)
+
+    _, total = store.search_items(memdb, actor_uins=[111, 222], limit=50, offset=0)
+    assert total == 2
+
+
+def test_kinds_and_persons_are_intersection(memdb):
+    """⭐ 维度**间**是**交集**——这是 spec §四 #4 的原始要求，别写成并集。"""
+    store.ensure_schema(memdb)
+    _seed_with_sender(memdb, title="甲", kind="notice", ts=1, uid="u_a", uin=111)
+    _seed_with_sender(memdb, title="乙", kind="academic", ts=2, uid="u_a", uin=111)
+    _seed_with_sender(memdb, title="丙", kind="notice", ts=3, uid="u_b", uin=222)
+
+    _, total = store.search_items(
+        memdb, kinds=["notice"], actor_uins=[111], limit=50, offset=0
+    )
+    assert total == 1
+
+
+def test_actor_uin_exposed_on_api_item(memdb):
+    store.ensure_schema(memdb)
+    _seed_with_sender(memdb, title="甲", kind="notice", ts=1, uid="u_a", uin=111)
+    items, _ = store.search_items(memdb, limit=50, offset=0)
+    assert items[0].actor_uin == 111
+
+
+def test_actor_uin_is_none_for_anonymous(memdb):
+    """匿名消息（sender_uid 为空）不该匹配任何人物筛选。"""
+    store.ensure_schema(memdb)
+    _seed_with_sender(memdb, title="甲", kind="notice", ts=1, uid="", uin=None)
+    items, _ = store.search_items(memdb, limit=50, offset=0)
+    assert items[0].actor_uin is None
+    assert store.search_items(memdb, actor_uins=[111], limit=50, offset=0)[1] == 0

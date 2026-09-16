@@ -22,6 +22,7 @@ import logging
 import pathlib
 import sqlite3
 import time
+from collections.abc import Sequence
 
 from .config import REPO_ROOT
 
@@ -34,6 +35,12 @@ _log = logging.getLogger(__name__)
 ACTION_SET_KIND = "set_kind"
 ACTION_SET_FIELD = "set_field"
 ACTION_DELETE = "delete"
+
+# 墓碑行（T8/E7）：它记的是「这条源消息属于一个**最终态被软删**的 item」。
+# ⚠️ 它对 `item_state` **完全惰性**（`rebuild_state` / `_apply_to_state` 都不认它），
+# 因此它只经 `deleted_msg_ids` 那一次折叠起作用——**"垫在 delete 行之前"是承重的**，
+# 理由写在 `delete_item` 的 docstring 里（undo 只删一条事件）。
+ACTION_TOMBSTONE = "tombstone"
 
 _TABLES_DDL = """
 CREATE TABLE IF NOT EXISTS item_edits (
@@ -246,14 +253,40 @@ def set_kind(
 
 
 def delete_item(
-    conn: sqlite3.Connection, *, item_id: int, msg_id: int | None, actor: str = "web",
+    conn: sqlite3.Connection, *, item_id: int, msg_id: int | None,
+    extra_msg_ids: Sequence[int] = (), actor: str = "web",
     now: int | None = None,
 ) -> int:
     """软删（D15）。`msg_id` 是「永不被重抽复活」的键——**能不传就一定要传**。
 
     ⚠️ 不知道 `msg_id` 时传 None 是允许的（界面仍然会隐藏它），
     但那条源消息将来 `--redo` 时**就会复活**。调用方有责任尽量带上。
+
+    ⚠️ **`extra_msg_ids` = 同一个 item 的其余源消息**（T8 的 E7）：批内去重的
+    来源是**并集**（`store.py` 的 `_dedupe_batch`），所以一个 item 可以有 ≥2 条
+    源消息。只墓碑化第一条的话，`refine --redo` 重抽兄弟消息会让条目
+    **以新 item_id 复活**（直接违反 D15）⇒ **每一条源消息都要落一条墓碑行**。
+
+    ⚠️ **顺序是承重的：墓碑行垫在 delete 行之前**，且 delete 行必须落在尾部。
+    因为 `undo` 只删**一条**事件（`DELETE FROM item_edits WHERE edit_id = ?`）：
+    若把 N 条源消息都写成 `delete` 行，撤掉最近那条之后 `item_state.deleted`
+    仍是 1 ⇒ **条目照旧隐藏、undo 却报成功**（用户看到「撤销没用」）。
+    墓碑行对 `item_state` 惰性，于是：
+      · 撤掉末尾那条 delete ⇒ 重放出的最终态里没有 delete ⇒ 条目**复活**；
+      · 复活后墓碑行**自动失效**（`deleted_msg_ids` 按**最终态** JOIN item_state），
+        与 `test_delete_then_set_kind_last_wins` 的语义一致。
+    ⚠️ 这同时**显式承认**了 T4 记下的那条契约放宽：**非 delete 事件带 `msg_id`、
+    且所属 item 最终态 `deleted=1` 时，该 msg 也会被墓碑化**（今天是唯一可观测处）。
+
+    ⚠️ 逐行 `_append`（各自 commit），**刻意不做批量写**：`undo` 的「成功」路径
+    仍会 `conn.commit()`（T4 fix 记的 FIX 2 同族），调用方自己开着的未提交事务
+    会被它一起冲掉。这里不给自己造那个窗口。
     """
+    for extra in extra_msg_ids:
+        _append(
+            conn, item_id=item_id, msg_id=extra, action=ACTION_TOMBSTONE,
+            field=None, old_value=None, new_value=None, actor=actor, now=now,
+        )
     return _append(
         conn, item_id=item_id, msg_id=msg_id, action=ACTION_DELETE, field=None,
         old_value=None, new_value=None, actor=actor, now=now,

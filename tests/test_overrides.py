@@ -446,3 +446,36 @@ def test_attach_readonly_fails_loudly_when_the_file_was_just_provisioned(tmp_pat
         assert target.is_file(), "ensure_schema 应当已经把空库建出来了（这才是分界）"
     finally:
         conn.close()
+
+
+def test_delete_with_extra_sources_tombstones_every_message(ov):
+    """⭐ E7/T8 裁决：一个 item 的**每一条**源消息都要落墓碑，**且 undo 要真救得回来**。
+
+    形状的由来：`store.save_items` 的批内去重**来源取并集**（`store.py:307`），
+    所以一个 item 可以有 ≥2 条源消息；`api_delete_item` 若只把 `srcs[0]` 落墓碑，
+    `refine --redo` 重抽兄弟消息就会让条目**以新 item_id 复活**（违反 D15）。
+
+    ⚠️ 判据必须**两个方向一起**：
+    ① 删完：每条源 msg 都在墓碑集里（否则重抽复活）；
+    ② undo 之后：条目复活 **且** 墓碑**全部消失**。
+    只有 ① 的话，把 N 条源消息都写成 `delete` 事件也能过——而那种写法下
+    `undo` 只删一条事件，`item_state.deleted` 仍是 1 ⇒ 条目**照旧隐藏**、
+    undo 却报成功（用户看到「撤销没用」）。
+    """
+    eid = overrides.delete_item(ov, item_id=9, msg_id=555, extra_msg_ids=[556, 557])
+
+    assert overrides.deleted_msg_ids(ov) == frozenset({555, 556, 557}), (
+        "有源消息没被墓碑化——refine --redo 会把它重抽出来，条目以新 item_id 复活"
+    )
+    # 末尾那条事件必须是 delete 本身（undo 缺省撤的是它）
+    assert overrides.last_edit(ov) == (eid, 9, "delete"), (
+        "delete 事件不在尾部：墓碑行垫后的话 undo 撤掉的是墓碑行，条目仍被隐藏"
+    )
+
+    assert overrides.undo(ov, edit_id=eid) is True
+    assert overrides.deleted_msg_ids(ov) == frozenset(), (
+        "undo 之后墓碑还在——条目复活了，兄弟消息却被永久冻结"
+    )
+    assert ov.execute(
+        "SELECT COUNT(*) FROM item_state WHERE item_id=9"
+    ).fetchone()[0] == 0, "undo 之后条目仍被隐藏：这就是「撤销报成功、界面毫无反应」"
