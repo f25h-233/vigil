@@ -57,12 +57,19 @@ def _config(tmp_path):
 
 @pytest.fixture
 def cli_env(monkeypatch, tmp_path):
-    """把 export / refine / digest 的外部依赖全接上（不含 `daily`，见 `daily_env`）。"""
+    """把 export / refine / digest 的外部依赖全接上（不含 `daily`，见 `daily_env`）。
+
+    ⚠️ **锁的路径也要接到 tmp_path**：三个 `cmd_*` 现在各上一次锁（M4 审 F4），
+    不接的话每次测试都会去动仓库里**真实的** `data/vigil.lock`——测试污染工作区，
+    而且一旦用户那边真有实例在跑，这些测试会莫名其妙地拿到退出码 2。
+    注意这里换的是**路径**不是锁本身：真 `SingleInstance` 的拿锁/放锁逻辑照跑。
+    """
     cfg = _config(tmp_path)
     monkeypatch.setattr(cli, "_load_or_die", lambda: (cfg, "k-db"))
     monkeypatch.setattr(cli, "_load_config_only", lambda: cfg)
     monkeypatch.setattr(cli, "_require_export_db", lambda config: tmp_path / "export.db")
     monkeypatch.setattr("vigil.config.load_llm_key", lambda *a, **k: "k-llm")
+    monkeypatch.setattr("vigil.lock.LOCK_PATH", tmp_path / "vigil.lock")
     return tmp_path
 
 
@@ -364,6 +371,94 @@ def test_daily_clears_last_error_before_running(daily_env, monkeypatch):
     assert calls == ["clear", "run"]
 
 
+# ── F4：人工命令也要上锁（M4 独立审查）─────────────────────────
+#
+# 审查 AST 核过：全文件此前**只有 `cmd_daily` 引用 `lock`** ⇒ 人工跑
+# `export`/`refine`/`digest` 与任务计划撞车时完全不受保护。而
+# `docs/SETUP-自动化.md` §七 给退出码 2 写的理由**正是**这个场景
+# （「用户手动又跑一次」），spec §4.8 的「幂等可重入」也只堵了一半：
+# 两个 refine 并发会各读同一批待处理消息 ⇒ 抽两遍、烧两份 token。
+
+
+def test_export_returns_2_when_another_instance_holds_the_lock(cli_env, monkeypatch):
+    """⭐ 人工 `export` 撞上正在跑的实例 ⇒ **2**，且管线一行没跑。
+
+    变异「去掉 `cmd_export` 的 `with lock.SingleInstance():`」→ 本条红。
+    """
+    from vigil import lock
+    from vigil.export import ExportStats
+
+    ran: list[str] = []
+    monkeypatch.setattr(
+        "vigil.export.export",
+        lambda *a, **kw: ran.append("export") or ExportStats(),
+    )
+
+    with lock.SingleInstance(cli_env / "vigil.lock"):      # 「另一个实例」持着锁
+        assert cli.main(["export"]) == 2
+    assert ran == []                                      # 没真的跑管线
+    assert cli.main(["export"]) == 0                      # 锁放掉后照常
+
+
+def test_refine_returns_2_when_another_instance_holds_the_lock(cli_env, monkeypatch):
+    """⭐ 人工 `refine` 撞车 ⇒ **2**，且没调模型、没写库。
+
+    变异「去掉 `cmd_refine` 的 `with lock.SingleInstance():`」→ 本条红。
+    """
+    from vigil import lock
+
+    ran: list[str] = []
+    monkeypatch.setattr(
+        "vigil.refine.refine",
+        lambda *a, **kw: ran.append("refine") or _refine_stats(),
+    )
+
+    with lock.SingleInstance(cli_env / "vigil.lock"):
+        assert cli.main(["refine"]) == 2
+    assert ran == []
+    assert cli.main(["refine"]) == 0
+
+
+def test_digest_returns_2_when_another_instance_holds_the_lock(cli_env, monkeypatch):
+    """⭐ 人工 `digest` 撞车 ⇒ **2**，且没生成日报。
+
+    变异「去掉 `cmd_digest` 的 `with lock.SingleInstance():`」→ 本条红。
+    """
+    from vigil import lock
+    from vigil.digest import DigestStats
+
+    ran: list[str] = []
+    monkeypatch.setattr(
+        "vigil.digest.digest",
+        lambda *a, **kw: ran.append("digest") or DigestStats(day="2026-09-13"),
+    )
+
+    with lock.SingleInstance(cli_env / "vigil.lock"):
+        assert cli.main(["digest", "--date", "2026-09-13"]) == 2
+    assert ran == []
+    assert cli.main(["digest", "--date", "2026-09-13"]) == 0
+
+
+def test_lock_is_released_when_a_locked_command_exits_via_sys_exit(cli_env, monkeypatch,
+                                                                   capsys):
+    """`sys.exit`（**SystemExit**）也必须释放锁。
+
+    三个 `cmd_*` 的配置/参数错误分支都是 `sys.exit(...)`，而它们现在都在
+    `with lock.SingleInstance():` 里面。**SystemExit 不是 Exception 是
+    BaseException**——`with` 仍会调 `__exit__`，但这条链必须实测：判错了就是
+    「一次参数错误把锁永远攥在自己手里」，此后所有人工命令与任务计划
+    全会拿到 2，而原因完全看不出来。
+
+    变异「`__exit__` 里不解锁 / 只在 `except Exception` 上解锁」→ 本条红。
+    """
+    # `--since` 非法 ⇒ `reader._to_epoch` 抛 ValueError ⇒ `cmd_refine` 的 sys.exit
+    with pytest.raises(SystemExit):
+        cli.main(["refine", "--since", "2026-13-45"])
+
+    monkeypatch.setattr("vigil.refine.refine", lambda *a, **kw: _refine_stats())
+    assert cli.main(["refine"]) == 0        # 锁已放掉：能跑进管线（0），不是 2
+
+
 # ── §8.5：能吞异常的只有「打扫类」失败 ─────────────────────────
 
 
@@ -397,7 +492,10 @@ def test_daily_log_write_failure_never_ends_in_success(daily_env, monkeypatch):
     """
     from vigil.config import ConfigError
 
+    seen: list[str] = []
+
     def boom(msg):
+        seen.append(msg)
         raise OSError("日志写不进去")
 
     def config_dies(*a, **kw):
@@ -409,6 +507,11 @@ def test_daily_log_write_failure_never_ends_in_success(daily_env, monkeypatch):
     monkeypatch.setattr(cli, "load_config", config_dies)
 
     assert _exit_code_of(["daily"]) != 0
+    # ⚠️ 这两半都要钉（M4 审 F2）。只断言「抛了不报成功」是不够的：把该分支的
+    # `logs.emit(...)` 换成 `pass`，那条断言**照样全绿**——它对这个分支到底有没有
+    # 留痕不敏感。所以这里同时断言 emit 真的被调用过、且带的是配置错误那句话。
+    assert seen, "该失败分支必须经过 logs.emit"
+    assert "配置" in seen[0]
 
 
 def test_daily_last_error_write_failure_never_ends_in_success(daily_env, monkeypatch):

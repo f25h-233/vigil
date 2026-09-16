@@ -103,40 +103,53 @@ def cmd_groups(args) -> int:
 
 
 def cmd_export(args) -> int:
-    config, key = _load_or_die()
-    logs.emit(f"导出 {len(config.enabled_groups)} 个群 → {config.output_db}")
+    # ⚠️ **人工跑也要上锁**（M4 独立审查 F4）：`docs/SETUP-自动化.md` §七 给退出码 2
+    # 写的理由就是「用户手动又跑一次」这个场景，而此前只有 `cmd_daily` 上锁 ⇒
+    # 人工命令与任务计划撞车时**完全不受保护**——spec §4.8 的「幂等可重入」
+    # 只堵了一半（两个 refine 并发会各读同一批待处理消息 ⇒ 抽两遍、烧两份 token）。
+    # ⚠️ 不会与 `cmd_daily` 重入：`daily.run()` 调的是库函数（`export_mod.export`
+    # 等）而不是 `cmd_*`，而锁**刻意不做重入**（见 `lock.py` 的 docstring）。
+    try:
+        with lock.SingleInstance():
+            config, key = _load_or_die()
+            logs.emit(f"导出 {len(config.enabled_groups)} 个群 → {config.output_db}")
 
-    stats = export_mod.export(config, key, on_progress=logs.emit)
-    logs.emit("-" * 60)
-    logs.emit(f"完成：{len(stats.per_group)} 个群，共 {stats.total_rows:,} 条消息")
+            stats = export_mod.export(config, key, on_progress=logs.emit)
+            logs.emit("-" * 60)
+            logs.emit(f"完成：{len(stats.per_group)} 个群，共 {stats.total_rows:,} 条消息")
 
-    if stats.skipped_by_group:
-        logs.emit(f"\n[注意] 有 {stats.total_skipped:,} 条消息因 QQ 数据库坏页读不到：")
-        for gid, gname, n in stats.skipped_by_group:
-            logs.emit(f"  {gid} {gname}：{n:,} 条")
-        logs.emit("  这是 QQ 数据库自身的物理坏页，非导出错误；同群其余消息不受影响。")
+            if stats.skipped_by_group:
+                logs.emit(f"\n[注意] 有 {stats.total_skipped:,} 条消息因 QQ 数据库坏页读不到：")
+                for gid, gname, n in stats.skipped_by_group:
+                    logs.emit(f"  {gid} {gname}：{n:,} 条")
+                logs.emit("  这是 QQ 数据库自身的物理坏页，非导出错误；同群其余消息不受影响。")
 
-    if stats.failed_groups:
-        logs.emit(f"\n[失败] {len(stats.failed_groups)} 个群整群读不到：")
-        for gid, err in stats.failed_groups:
-            logs.emit(f"  {gid}: {err}")
+            if stats.failed_groups:
+                logs.emit(f"\n[失败] {len(stats.failed_groups)} 个群整群读不到：")
+                for gid, err in stats.failed_groups:
+                    logs.emit(f"  {gid}: {err}")
 
-    if stats.media_total:
-        pct = stats.media_local / stats.media_total * 100
-        logs.emit(
-            f"\n图片引用：{stats.media_total:,} 张，本地可取 "
-            f"{stats.media_local:,} 张（{pct:.0f}%）"
-        )
-        logs.emit(
-            "  取不到的并非「对不上号」，而是 QQ 没有缓存该图（见 vigil/media.py）。"
-        )
-    if stats.failed_groups:
-        # ⚠️ 非零退出码是 M4 自动化的报警信号——别吞掉。旧版这里无条件
-        # return 0，于是「N 个群整群读不到」在任务计划看来是**成功**。
-        # 坏页（skipped_by_group）**不算失败**：那是 QQ 库的物理损坏，
-        # 已知、非致命、且同群其余消息不受影响，上面已经照实报了。
-        return 1
-    return 0
+            if stats.media_total:
+                pct = stats.media_local / stats.media_total * 100
+                logs.emit(
+                    f"\n图片引用：{stats.media_total:,} 张，本地可取 "
+                    f"{stats.media_local:,} 张（{pct:.0f}%）"
+                )
+                logs.emit(
+                    "  取不到的并非「对不上号」，而是 QQ 没有缓存该图（见 vigil/media.py）。"
+                )
+            if stats.failed_groups:
+                # ⚠️ 非零退出码是 M4 自动化的报警信号——别吞掉。旧版这里无条件
+                # return 0，于是「N 个群整群读不到」在任务计划看来是**成功**。
+                # 坏页（skipped_by_group）**不算失败**：那是 QQ 库的物理损坏，
+                # 已知、非致命、且同群其余消息不受影响，上面已经照实报了。
+                return 1
+            return 0
+    except lock.AlreadyRunning as exc:
+        # 与 `cmd_daily` 同一语义：2 不是 1——「上一次还没跑完」等着就行，
+        # 「这次跑失败了」才要人来看（计划 §三 3.4）。
+        logs.emit(f"[跳过] {exc}")
+        return 2
 
 
 def cmd_read(args) -> int:
@@ -219,168 +232,194 @@ def cmd_media(args) -> int:
 
 def cmd_refine(args) -> int:
     """抽取：把消息变成结构化条目。"""
-    from . import refine as refine_mod
-    from .config import load_llm_key
-
-    config = _load_config_only()
-    db = _require_export_db(config)
-
-    api_key = load_llm_key()
-    if not api_key and not args.dry_run:
-        sys.exit(
-            "[配置错误] 没有 LLM 密钥。\n"
-            "  请在仓库根目录的 .env 里写入：SILICONFLOW_API_KEY=sk-...\n"
-            "  （--dry-run 不需要密钥）"
-        )
-
+    # ⚠️ **人工跑也要上锁**（M4 独立审查 F4）：`docs/SETUP-自动化.md` §七 给退出码 2
+    # 写的理由就是「用户手动又跑一次」这个场景，而此前只有 `cmd_daily` 上锁 ⇒
+    # 人工命令与任务计划撞车时**完全不受保护**——spec §4.8 的「幂等可重入」
+    # 只堵了一半（两个 refine 并发会各读同一批待处理消息 ⇒ 抽两遍、烧两份 token）。
+    # ⚠️ 不会与 `cmd_daily` 重入：`daily.run()` 调的是库函数（`export_mod.export`
+    # 等）而不是 `cmd_*`，而锁**刻意不做重入**（见 `lock.py` 的 docstring）。
     try:
-        since_ts = reader._to_epoch(args.since)
-        until_ts = reader._to_epoch(args.until)
-    except ValueError as exc:
-        sys.exit(f"[参数错误] {exc}")
+        with lock.SingleInstance():
+            from . import refine as refine_mod
+            from .config import load_llm_key
 
-    # refine() 会对 --redo/--limit 的非法组合抛 ValueError。不接的话用户看到的是
-    # 裸 traceback，而不是一行可读的参数错误——与 other 子命令的既有风格不一致。
-    try:
-        stats = refine_mod.refine(
-            config,
-            api_key=api_key,
-            db_path=db,
-            since=since_ts,
-            until=until_ts,
-            limit=args.limit,
-            redo=args.redo,
-            batch_size=args.batch,
-            context=args.context,
-            budget_tokens=args.budget,
-            # --model 不给时是 None，而 None 会绕过 refine() 的默认值，所以这里兜底
-            model=args.model or refine_mod.DEFAULT_MODEL,
-            enable_thinking=args.think,
-            prompt_ver=args.prompt_ver,
-            dry_run=args.dry_run,
-            on_progress=logs.emit,
-        )
-    except ValueError as exc:
-        sys.exit(f"[参数错误] {exc}")
+            config = _load_config_only()
+            db = _require_export_db(config)
 
-    logs.emit("-" * 60)
-    # ⚠️ 三个数必须**自洽**：本地筛掉 + 送模型 == 扫描。
-    # ⚠️ **不许用「其中」**连接「规则硬丢弃」与「本地筛掉」——两者**不是**
-    # 包含关系：`prefilter.expand_context` 取 ±2 邻居时不看那条消息有没有
-    # 被硬规则判死，所以被判死的消息照样可能作为上下文出网
-    # （`digest.py:713-720` 的 docstring 记着这条，并且正是因此把"硬丢弃"
-    # 计数从日报文案里删掉了）。旧版写「（其中硬丢弃 N 条）」——实测在真库上
-    # 是假话。这里改用「；」并列，两个数各自独立。
-    #
-    # dry-run 时要报**计划**批数：实际批数必然是 0，显示「0 批」会让人
-    # 以为什么都没准备好（Task 7 fix 实测指出）。
-    shown_batches = stats.batches_planned if args.dry_run else stats.batches
-    logs.emit(
-        f"完成：扫描 {stats.scanned:,} 条 → 本地筛掉 "
-        f"{stats.scanned - stats.sent_messages:,} 条"
-        f" → 送模型 {stats.sent_messages:,} 条（{shown_batches:,} 批）"
-        f"（候选 {stats.candidates:,} 条；规则硬丢弃 {stats.discarded_local:,} 条）"
-    )
-    logs.emit(f"产出条目：{stats.items_saved:,} 条")
-    if not args.dry_run:
-        logs.emit(f"token 用量：输入 {stats.input_tokens:,} / 输出 {stats.output_tokens:,}")
-    if stats.budget_hit:
-        # 报「实际跑了多少」而不是计划数——预算 break 后两者会差很多
-        logs.emit(
-            f"[注意] 达到预算上限提前停止：实际跑了 {stats.batches} 批，"
-            f"计划 {stats.batches_planned} 批。剩余消息留待下次（或调大 --budget）"
-        )
-    if stats.deadlines_dropped:
-        # 降级必须看得见——静默丢掉一个日期和静默编造一个日期同样有害
-        logs.emit(
-            f"[注意] {stats.deadlines_dropped} 条截止日在源消息里找不到字面依据，"
-            f"未落库（条目本身仍照常出现）"
-        )
-    if stats.errors:
-        logs.emit(f"\n[失败] {len(stats.errors)} 批出错：")
-        for e in stats.errors[:5]:
-            logs.emit(f"  {e}")
-    if args.dry_run:
-        logs.emit("（--dry-run：未调用模型、未写库）")
-        return 0
-    # ⚠️ 非零退出码是 M4 自动化的报警信号——别吞掉。旧版无条件 return 0，
-    # 于是「3 批出错」在任务计划看来是成功。
-    return 1 if stats.errors else 0
+            api_key = load_llm_key()
+            if not api_key and not args.dry_run:
+                sys.exit(
+                    "[配置错误] 没有 LLM 密钥。\n"
+                    "  请在仓库根目录的 .env 里写入：SILICONFLOW_API_KEY=sk-...\n"
+                    "  （--dry-run 不需要密钥）"
+                )
+
+            try:
+                since_ts = reader._to_epoch(args.since)
+                until_ts = reader._to_epoch(args.until)
+            except ValueError as exc:
+                sys.exit(f"[参数错误] {exc}")
+
+            # refine() 会对 --redo/--limit 的非法组合抛 ValueError。不接的话用户看到的是
+            # 裸 traceback，而不是一行可读的参数错误——与 other 子命令的既有风格不一致。
+            try:
+                stats = refine_mod.refine(
+                    config,
+                    api_key=api_key,
+                    db_path=db,
+                    since=since_ts,
+                    until=until_ts,
+                    limit=args.limit,
+                    redo=args.redo,
+                    batch_size=args.batch,
+                    context=args.context,
+                    budget_tokens=args.budget,
+                    # --model 不给时是 None，而 None 会绕过 refine() 的默认值，所以这里兜底
+                    model=args.model or refine_mod.DEFAULT_MODEL,
+                    enable_thinking=args.think,
+                    prompt_ver=args.prompt_ver,
+                    dry_run=args.dry_run,
+                    on_progress=logs.emit,
+                )
+            except ValueError as exc:
+                sys.exit(f"[参数错误] {exc}")
+
+            logs.emit("-" * 60)
+            # ⚠️ 三个数必须**自洽**：本地筛掉 + 送模型 == 扫描。
+            # ⚠️ **不许用「其中」**连接「规则硬丢弃」与「本地筛掉」——两者**不是**
+            # 包含关系：`prefilter.expand_context` 取 ±2 邻居时不看那条消息有没有
+            # 被硬规则判死，所以被判死的消息照样可能作为上下文出网
+            # （`digest.py:713-720` 的 docstring 记着这条，并且正是因此把"硬丢弃"
+            # 计数从日报文案里删掉了）。旧版写「（其中硬丢弃 N 条）」——实测在真库上
+            # 是假话。这里改用「；」并列，两个数各自独立。
+            #
+            # dry-run 时要报**计划**批数：实际批数必然是 0，显示「0 批」会让人
+            # 以为什么都没准备好（Task 7 fix 实测指出）。
+            shown_batches = stats.batches_planned if args.dry_run else stats.batches
+            logs.emit(
+                f"完成：扫描 {stats.scanned:,} 条 → 本地筛掉 "
+                f"{stats.scanned - stats.sent_messages:,} 条"
+                f" → 送模型 {stats.sent_messages:,} 条（{shown_batches:,} 批）"
+                f"（候选 {stats.candidates:,} 条；规则硬丢弃 {stats.discarded_local:,} 条）"
+            )
+            logs.emit(f"产出条目：{stats.items_saved:,} 条")
+            if not args.dry_run:
+                logs.emit(f"token 用量：输入 {stats.input_tokens:,} / 输出 {stats.output_tokens:,}")
+            if stats.budget_hit:
+                # 报「实际跑了多少」而不是计划数——预算 break 后两者会差很多
+                logs.emit(
+                    f"[注意] 达到预算上限提前停止：实际跑了 {stats.batches} 批，"
+                    f"计划 {stats.batches_planned} 批。剩余消息留待下次（或调大 --budget）"
+                )
+            if stats.deadlines_dropped:
+                # 降级必须看得见——静默丢掉一个日期和静默编造一个日期同样有害
+                logs.emit(
+                    f"[注意] {stats.deadlines_dropped} 条截止日在源消息里找不到字面依据，"
+                    f"未落库（条目本身仍照常出现）"
+                )
+            if stats.errors:
+                logs.emit(f"\n[失败] {len(stats.errors)} 批出错：")
+                for e in stats.errors[:5]:
+                    logs.emit(f"  {e}")
+            if args.dry_run:
+                logs.emit("（--dry-run：未调用模型、未写库）")
+                return 0
+            # ⚠️ 非零退出码是 M4 自动化的报警信号——别吞掉。旧版无条件 return 0，
+            # 于是「3 批出错」在任务计划看来是成功。
+            return 1 if stats.errors else 0
+    except lock.AlreadyRunning as exc:
+        # 与 `cmd_daily` 同一语义：2 不是 1——「上一次还没跑完」等着就行，
+        # 「这次跑失败了」才要人来看（计划 §三 3.4）。
+        logs.emit(f"[跳过] {exc}")
+        return 2
 
 
 def cmd_digest(args) -> int:
     """日报：把 items 写成一天一页 Markdown。"""
-    from . import digest as digest_mod
-    from .config import load_llm_key
-
-    config = _load_config_only()
-    db = _require_export_db(config)
-
-    api_key = load_llm_key()
-    if not api_key and not args.dry_run:
-        sys.exit(
-            "[配置错误] 没有 LLM 密钥。\n"
-            "  请在仓库根目录的 .env 里写入：SILICONFLOW_API_KEY=sk-...\n"
-            "  （--dry-run 不需要密钥）"
-        )
-
-    day = args.date or digest_mod.yesterday()
+    # ⚠️ **人工跑也要上锁**（M4 独立审查 F4）：`docs/SETUP-自动化.md` §七 给退出码 2
+    # 写的理由就是「用户手动又跑一次」这个场景，而此前只有 `cmd_daily` 上锁 ⇒
+    # 人工命令与任务计划撞车时**完全不受保护**——spec §4.8 的「幂等可重入」
+    # 只堵了一半（两个 refine 并发会各读同一批待处理消息 ⇒ 抽两遍、烧两份 token）。
+    # ⚠️ 不会与 `cmd_daily` 重入：`daily.run()` 调的是库函数（`export_mod.export`
+    # 等）而不是 `cmd_*`，而锁**刻意不做重入**（见 `lock.py` 的 docstring）。
     try:
-        since, until = digest_mod.day_window(day)
-    except ValueError as exc:
-        sys.exit(f"[参数错误] {exc}")
+        with lock.SingleInstance():
+            from . import digest as digest_mod
+            from .config import load_llm_key
 
-    stats = digest_mod.digest(
-        config,
-        api_key=api_key,
-        db_path=db,
-        since=since,
-        until=until,
-        day_label=day,
-        # --model 不给时是 None，而 None 会绕过 digest() 的默认值，所以这里兜底
-        model=args.model or digest_mod.DEFAULT_MODEL,
-        enable_thinking=args.think,
-        write_file=not args.no_write,
-        dry_run=args.dry_run,
-        on_progress=logs.emit,
-    )
+            config = _load_config_only()
+            db = _require_export_db(config)
 
-    logs.emit("-" * 60)
-    # ⚠️ 失败**不再提前 return**：提前返回会让日志里只有一句「[失败]」，
-    # 而没有本次的计数——事后根本判断不出这轮跑到哪、抓到几条。所以先报错，
-    # 汇总照打，最后由这一处统一给退出码。
-    for err in stats.errors:
-        logs.emit(f"[失败] {err}")
+            api_key = load_llm_key()
+            if not api_key and not args.dry_run:
+                sys.exit(
+                    "[配置错误] 没有 LLM 密钥。\n"
+                    "  请在仓库根目录的 .env 里写入：SILICONFLOW_API_KEY=sk-...\n"
+                    "  （--dry-run 不需要密钥）"
+                )
 
-    logs.emit(
-        f"完成：{stats.day} 窗口内 {stats.groups} 个群 {stats.messages:,} 条消息"
-        f" → {stats.items} 条 item → 日报 {stats.lines} 行"
-    )
-    if stats.mechanical:
-        # 不为 0 就说明模型漏写了条目，是提示词该改的信号——必须显眼
-        logs.emit(
-            f"[注意] 其中 {stats.mechanical} 行是程序补的（模型没写到），"
-            f"读起来会生硬——这通常意味着提示词该调了"
-        )
-    if stats.deadlines_dropped:
-        # 静默丢弃截止日是另一种失败——降级必须看得见
-        logs.emit(
-            f"[注意] {stats.deadlines_dropped} 条截止日在源消息里找不到字面依据，"
-            f"未进「别忘」（条目本身仍照常出现）——已保留 {stats.deadlines_kept} 条"
-        )
-    if stats.unmatched_quotes:
-        logs.emit(f"[注意] 有 {stats.unmatched_quotes} 处摘录没匹配上条目，已丢弃")
-    if args.dry_run:
-        logs.emit("（--dry-run：未调用模型、未写库、未落文件）")
-        return 0
+            day = args.date or digest_mod.yesterday()
+            try:
+                since, until = digest_mod.day_window(day)
+            except ValueError as exc:
+                sys.exit(f"[参数错误] {exc}")
 
-    logs.emit(f"token 用量：输入 {stats.input_tokens:,} / 输出 {stats.output_tokens:,}")
-    if stats.output_path:
-        logs.emit(f"日报文件：{stats.output_path}")
-    else:
-        logs.emit("（--no-write：只入库，未落文件）")
-    # ⚠️ 非零退出码是 M4 自动化的报警信号——别吞掉
-    return 1 if stats.errors else 0
+            stats = digest_mod.digest(
+                config,
+                api_key=api_key,
+                db_path=db,
+                since=since,
+                until=until,
+                day_label=day,
+                # --model 不给时是 None，而 None 会绕过 digest() 的默认值，所以这里兜底
+                model=args.model or digest_mod.DEFAULT_MODEL,
+                enable_thinking=args.think,
+                write_file=not args.no_write,
+                dry_run=args.dry_run,
+                on_progress=logs.emit,
+            )
+
+            logs.emit("-" * 60)
+            # ⚠️ 失败**不再提前 return**：提前返回会让日志里只有一句「[失败]」，
+            # 而没有本次的计数——事后根本判断不出这轮跑到哪、抓到几条。所以先报错，
+            # 汇总照打，最后由这一处统一给退出码。
+            for err in stats.errors:
+                logs.emit(f"[失败] {err}")
+
+            logs.emit(
+                f"完成：{stats.day} 窗口内 {stats.groups} 个群 {stats.messages:,} 条消息"
+                f" → {stats.items} 条 item → 日报 {stats.lines} 行"
+            )
+            if stats.mechanical:
+                # 不为 0 就说明模型漏写了条目，是提示词该改的信号——必须显眼
+                logs.emit(
+                    f"[注意] 其中 {stats.mechanical} 行是程序补的（模型没写到），"
+                    f"读起来会生硬——这通常意味着提示词该调了"
+                )
+            if stats.deadlines_dropped:
+                # 静默丢弃截止日是另一种失败——降级必须看得见
+                logs.emit(
+                    f"[注意] {stats.deadlines_dropped} 条截止日在源消息里找不到字面依据，"
+                    f"未进「别忘」（条目本身仍照常出现）——已保留 {stats.deadlines_kept} 条"
+                )
+            if stats.unmatched_quotes:
+                logs.emit(f"[注意] 有 {stats.unmatched_quotes} 处摘录没匹配上条目，已丢弃")
+            if args.dry_run:
+                logs.emit("（--dry-run：未调用模型、未写库、未落文件）")
+                return 0
+
+            logs.emit(f"token 用量：输入 {stats.input_tokens:,} / 输出 {stats.output_tokens:,}")
+            if stats.output_path:
+                logs.emit(f"日报文件：{stats.output_path}")
+            else:
+                logs.emit("（--no-write：只入库，未落文件）")
+            # ⚠️ 非零退出码是 M4 自动化的报警信号——别吞掉
+            return 1 if stats.errors else 0
+    except lock.AlreadyRunning as exc:
+        # 与 `cmd_daily` 同一语义：2 不是 1——「上一次还没跑完」等着就行，
+        # 「这次跑失败了」才要人来看（计划 §三 3.4）。
+        logs.emit(f"[跳过] {exc}")
+        return 2
 
 
 def cmd_daily(args) -> int:
@@ -440,6 +479,8 @@ def cmd_daily(args) -> int:
         # 「这次跑失败了」才要人来看。详见计划 §三 3.4。
         logs.emit(f"[跳过] {exc}")
         return 2
+
+
     except Exception as exc:  # noqa: BLE001 — 顶层兜底，必须留痕
         logs.emit(f"[失败] daily 未预期地抛出：{exc!r}")
         logs.write_last_error(f"daily 未预期异常：{exc!r}")
