@@ -64,8 +64,12 @@ export default function Categories({
         <p className="text-sm text-white/40">接口没有返回任何类目。</p>
       ) : (
         <>
+          {/* 数字**由实际数据推导**，不写死：配置文件主动教用户加类目，
+              加完第八个，上一版的「七个类目」当场变成假话——而正确数字
+              就在手边的 cats 里。走到这里 cats.length >= 1 恒成立
+              （空列表与 null 两个分支在上面） */}
           <p className="mb-3 text-xs text-white/40">
-            七个类目 · 点一个看该类全部条目
+            {cats.length} 个类目 · 点一个看该类全部条目
           </p>
           <div className="grid grid-cols-2 gap-3">
             {cats.map((c) => (
