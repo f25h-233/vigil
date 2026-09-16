@@ -39,6 +39,7 @@ class RefineStats:
 
     scanned: int = 0
     discarded_local: int = 0
+    skipped_deleted: int = 0     # 因软删墓碑而被跳过的消息数（D15）
     candidates: int = 0          # 通过预筛的候选数（= prefilter.ScreenStats.kept）
     sent_messages: int = 0
     batches_planned: int = 0  # 计划要跑多少批
@@ -171,6 +172,25 @@ def _record_error(
     except Exception as inner:  # noqa: BLE001 — 见 docstring：返回而非抛出
         return f"error 记账也失败了: {inner}"
     return None
+
+
+def _tombstoned_msg_ids() -> frozenset[int]:
+    """读人工干预层的墓碑（软删事件对应的源消息 id）。
+
+    ⚠️ 读不到一律返回空集——overlay 缺失**不该**让 refine 跑不起来。
+    最坏后果只是"这次重抽把某条复活了"，用户再删一次即可；
+    而在这里抛异常会让整条每日管线停摆，代价大得多。
+    """
+    from . import overrides
+
+    try:
+        conn = overrides.connect()
+        try:
+            return overrides.deleted_msg_ids(conn)
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return frozenset()
 
 
 def _parse_deadline(value: object) -> int | None:
@@ -406,6 +426,21 @@ def refine(
         messages = store.pending_messages(
             conn, since=since, until=until, limit=limit, redo=redo
         )
+
+        # D15：被软删条目的源消息**永不被重抽复活**。
+        #
+        # ⚠️ 只在重抽路径上起作用：非 redo 时 `pending_messages` 只返回没有 ok 记录的
+        # 消息，而被软删的条目本来就抽过（有 ok 记录）⇒ 本来就不在集合里。
+        # 会复活它们的**只有** `--redo`，以及将来任何重抽已处理消息的路径。
+        #
+        # ⚠️ **刻意不碰 `refine_runs`**：那些行的 ok 记录是**既有事实**，
+        # 把它改写成 discarded 会篡改 M1 出口标准赖以成立的账目。
+        tombstones = _tombstoned_msg_ids()
+        if tombstones:
+            kept = [m for m in messages if m.msg_id not in tombstones]
+            stats.skipped_deleted = len(messages) - len(kept)
+            messages = kept
+
         stats.scanned = len(messages)
         if not messages:
             on_progress("[refine] 没有待处理的消息")
@@ -434,6 +469,10 @@ def refine(
             f"{stats.scanned - stats.sent_messages:,} 条"
             f" → 送模型 {stats.sent_messages:,} 条（候选 {stats.candidates:,} 条）"
         )
+        if stats.skipped_deleted:
+            on_progress(
+                f"[refine] 其中 {stats.skipped_deleted:,} 条已软删，跳过重抽（D15 墓碑）"
+            )
 
         # 没进候选的一律记账为 discarded，其中既含硬丢弃也含「没命中保留规则」。
         # 记账必须做全：refine_runs 覆盖不到的消息会让增量同步永远重扫它们。
