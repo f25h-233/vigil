@@ -62,9 +62,9 @@
         ↓
 波 1   T1 日志模块（Python 新文件）  ∥  T2 任务计划三件套（无 Python）  ∥  T3 _MIME 守卫（api.py）
         ↓ 同步点：全量测试 + 机械越界检查 + 波级窄审查
-波 2   T4 单实例锁（Python 新文件）  ∥  T5 写入原子化（store.py+refine.py）  ∥  T6 日志口径（digest.py）
+波 2   T4 单实例锁（Python 新文件）  ∥  T5 写入原子化（store.py+refine.py）
         ↓ 同步点
-波 3   T7 daily 批命令（新文件）     ∥  T8 CLI 接线 + 退出码（cli.py）
+波 3   T6 日报落盘一致性（digest.py）∥  T7 daily 批命令（新文件）∥  T8 CLI 接线 + 退出码（cli.py）
         ↓ 同步点
 波 4   冒烟 = M4 出口证据（串行，controller + 真进程 + 真任务计划）
         ↓
@@ -88,8 +88,8 @@
 | `vigil/refine.py` | T5 | 2 | |
 | `tests/test_store.py` | T5 | 2 | |
 | `tests/test_refine.py` | T5 | 2 | |
-| `vigil/digest.py` | T6 | 2 | |
-| `tests/test_digest.py` | T6 | 2 | |
+| `vigil/digest.py` | T6 | **3** | |
+| `tests/test_digest.py` | T6 | **3** | |
 | `vigil/daily.py`（新） | T7 | 3 | |
 | `tests/test_daily.py`（新） | T7 | 3 | |
 | `vigil/cli.py` | T8 | 3 | |
@@ -1979,7 +1979,9 @@ cd D:/github/VIGIL && git add vigil/store.py vigil/refine.py tests/test_store.py
 - Consumes: §三 3.5 的 `store.transaction(conn)` 与 `store.save_digest(..., commit=False)` ——**由 Task 5 同波提供**。签名已冻结；若你拿到的实现与冻结签名不符，**停下报告**。
 - Produces: 无（不改对外签名）
 
-**Dependencies:** Task 5（同波，接口已冻结）
+**Dependencies:** Task 5（**波 2，先落地**）。⚠️ 原计划把 T6 排在波 2、与 T5 同波——**那是错的**（见 §ledger R21）：
+T6 要消费的 `store.transaction` / `save_digest(commit=False)` 由 T5 **产出**，同波开跑时它们还不存在。
+T6 现排在**波 3**，派发时 T5 已闭环。
 **Touches:** `vigil/digest.py`、`tests/test_digest.py`
 
 > ⚠️ **本任务不许改 `vigil/store.py`**。`save_digest` 的原子化归 Task 5；你只消费它。
@@ -3150,7 +3152,34 @@ cd D:/github/VIGIL && WORK=$(mktemp -d) && cp data/vigil.db "$WORK/v.db" && echo
 
 **一句话**：**能吞异常的只有"打扫类"失败（如轮转）。本次运行的记录类失败一律不许吞。**
 
-### 8.6 走查本节的读者请注意
+### 8.6 ⚠️⚠️ **本计划里的代码块已有 5 处被执行期修正取代——照抄会复活缺陷**
+
+T2 的 scoped 复审提出：
+
+> 计划文件 §Task 2 Step 3 仍是含 `schtasks /delete` 的旧版 ps1 代码块，**照抄会复活 F1**。
+
+**这条比它看起来重要**：本计划的写法是「含完整代码、implementer 变转录工」。执行期修了一处，
+计划里的对应代码块就**从资产变成陷阱**——任何人（包括最终终审、以及下一个里程碑的接手者）
+逐字照抄，就会把已经修掉的缺陷原样搬回来。
+**本项目有过先例**（M3 的 `aaa66d3 fix(plan): 附录 A.16/A.17 补作废批注（T6 审查：同源缺陷被逐字照抄，模式第三次出现）`），
+所以处置方式沿用那次：**加作废批注，指向权威版本**。
+
+**权威版本一律是仓库里的实际文件，不是本计划的任何代码块。**
+
+| 计划里已失效的代码块 | 被谁改掉 | 权威版本 | 照抄的后果 |
+|---|---|---|---|
+| **Task 2 Step 3** 的 `scripts/register-task.ps1` 全文 | `d4ab07a`（删 `delete`、加电源设置）/ `5e4a529`（改先读后改）/ `495d75b`（删 `delete` 整块） | `scripts/register-task.ps1` | **最危险**：`delete` 先无条件下手 ⇒ `create` 一失败就**摧毁已有任务**；另外还会丢掉电池/漏跑设置 |
+| **Task 2 Step 1** 的 `scripts/vigil-daily.cmd` | `495d75b`（`REPO` 改从 `%~dp0..` 推导） | `scripts/vigil-daily.cmd` | 硬编码仓库路径 ⇒ `-RepoPath` 是假的 |
+| **Task 1 Step 3** 的 `vigil/logs.py` 全文 | `79c9855`（`_name`→**`_current_path`**；加 `_today()` 缝）/ `25cca4a`（补 docstring） | `vigil/logs.py` | **`_name` 会被 `logging.Handler._name` 遮蔽 ⇒ 跨零点必崩** |
+| **Task 1 Step 1** 的 `tests/test_logs.py` 全文 | `25cca4a`（+3 条判据） | `tests/test_logs.py` | 少三条判据：`clearLastError` 真删 / `_log_tail` 尾部语义 / 写失败必抛 |
+| **Task 3 Step 1** 的测试代码 | `8156d91`（`_MIME` 已上移到**模块级**） | `vigil/api.py` + `tests/test_api.py` | `create_app` 里已无 `_MIME`，`api._MIME` 才存在 |
+
+**执行纪律**：本计划里**尚未执行**的代码块（Task 4–Task 8）在派发时以 brief 为准且**未经真实运行验证**——
+§8.6 前半那份「8 处缺陷」的账已经证明：**这些代码块的主流程大概率是对的，错在边界时刻与异常路径。**
+implementer 遇到「计划与实现不符 / 与真实环境不符」时一律走逃逸舱（按实际修正 + 报告），
+**不许为了对齐计划而写坏代码。**
+
+### 8.7 走查本节的读者请注意
 
 上面**五类增补里有六处**是"计划里的代码在真实环境里根本不工作"，而不是"写得不够好"：
 
