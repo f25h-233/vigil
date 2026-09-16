@@ -185,6 +185,12 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
     跑在写路径上（refine / digest），代价是 O(条目数)，换来「索引不会
     长期停在过期状态」——搜索返回空结果时，那个空结果才真是「库里没有」。
     """
+    # 人工干预层（D14）的文件也在这里就位：`refine` / `digest` 跑过之后，
+    # 服务启动时就不必再建它。⚠️ **不能**放在 `api.py` 的 `connect()` 里——
+    # 那是只读路径。
+    from . import overrides
+
+    overrides.ensure_schema()
     conn.executescript(SCHEMA_DDL)
     rebuild_search_index(conn)
     conn.commit()
