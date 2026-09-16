@@ -421,3 +421,28 @@ def test_attach_readonly_never_degrades_when_the_file_exists(tmp_path):
         conn.close()
     # 文件原样还在（没有因为它挂不上就删/重建）
     assert target.is_file()
+
+
+def test_attach_readonly_fails_loudly_when_the_file_was_just_provisioned(tmp_path):
+    """**R8-bis**：`ensure_schema` **成功**、但 `ATTACH` 失败 ⇒ 响亮失败，**不降级**。
+
+    ⚠️ 判据是「**谁**失败」，不是「文件在不在」：
+    · `ensure_schema` 失败 ⇒ 根本碰不到文件 ⇒ **降级**（上一条测试）；
+    · `ensure_schema` 成功（或文件本来就在）但 `ATTACH` 失败 ⇒ **抛**（本条）。
+
+    ⚠️ 这一格此前**没有任何测试**：降级分支与这一条之间只差「`ensure_schema`
+    成功与否」，而"库是刚建出来的空库、里面肯定没有干预"是个**听起来很合理**的
+    降级理由——按它降级，就把 T4 那句刻意设计（「新连接忘带 `uri=True` ⇒
+    **响亮**失败，不是静默降级」）退回去了。
+    """
+    target = tmp_path / "fresh" / "overrides.db"
+    assert not target.exists()
+    conn = sqlite3.connect(":memory:")  # 刻意不开 uri=True ⇒ ATTACH 必失败
+    try:
+        with pytest.raises(overrides.OverlayError, match="不降级"):
+            overrides.attach_readonly(conn, target)
+        assert "ov" not in {r[1] for r in conn.execute("PRAGMA database_list")}
+        # 与降级分支的分界：这里 `ensure_schema` **是成功**的（空库已建出来）
+        assert target.is_file(), "ensure_schema 应当已经把空库建出来了（这才是分界）"
+    finally:
+        conn.close()
