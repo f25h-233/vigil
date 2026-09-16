@@ -574,7 +574,11 @@ def digest(
 
     owns_conn = conn is None
     if conn is None:
-        conn = sqlite3.connect(str(db_path or config.output_db))
+        # ⚠️ `uri=True` 是 Task 5 加的（裁决 R4）：下面 `store.window_items` 的入口会
+        # ATTACH overlay（`file:...?mode=ro`），而 URI 形式只在连接带
+        # `SQLITE_OPEN_URI` 时才被解析。URI 的 `mode=ro` 是读路径的机械保证，
+        # 不退化成非 URI 挂载。路径不以 `file:` 开头时这个标志不影响行为。
+        conn = sqlite3.connect(str(db_path or config.output_db), uri=True)
     try:
         store.ensure_schema(conn)
         items = store.window_items(conn, since=since, until=until)

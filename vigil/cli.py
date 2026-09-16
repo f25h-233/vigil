@@ -499,7 +499,14 @@ def cmd_deadline_audit(args) -> int:
     config = _load_config_only()
     db = _require_export_db(config)
 
-    conn = sqlite3.connect(str(db))
+    # ⚠️ `uri=True` 是 Task 5 加的（裁决 R4），本处是**一致性**改动而非阻断修复：
+    # 本命令只调 `items_with_deadline` / `item_sources_text`，两者都**没有**
+    # `_ensure_overlay`，所以今天它还走不到 `ATTACH`（真被阻断的是 `digest.py` /
+    # `refine.py` 那两条连接——它们的查询入口会 attach）。补这里是为了不让
+    # "第 4 个没带标志的连接"成为后来者照抄的样板：查询层入口要
+    # `ATTACH 'file:...?mode=ro'`，而 URI 形式只在连接带 `SQLITE_OPEN_URI` 时才被解析。
+    # 路径不以 `file:` 开头时这个标志**不影响行为**（配置里的 db 路径不许以 `file:` 开头）。
+    conn = sqlite3.connect(str(db), uri=True)
     try:
         rows = store.items_with_deadline(conn)
         if not rows:
@@ -515,6 +522,10 @@ def cmd_deadline_audit(args) -> int:
         for item_id, ts in rows:
             if item_id in bad:
                 title = conn.execute(
+                    # ⚠️ 这里**刻意不接 overlay**：`deadline-audit` 是对**底层数据**的
+                    # 核验（"这条 item 的截止日在源文里有没有依据"），不是视图。
+                    # 它就该看真实的 items——包括已软删的那些。
+                    # 这是 spec §3.3 那张"5 处读路径"表里唯一一处「不需要 apply」的。
                     "SELECT title FROM items WHERE item_id = ?", (item_id,)
                 ).fetchone()[0]
                 print(

@@ -95,15 +95,20 @@ def attach_readonly(conn: sqlite3.Connection, path: pathlib.Path | None = None) 
 
     ⚠️ 用 `mode=ro` 挂——读取路径不该有写能力，哪怕只是"顺手"。
     ⚠️ 幂等：已挂过就什么都不做（`sqlite3` 重复 ATTACH 同名会报错）。
+    ⚠️ 文件不存在时**先建一个空的**：读取路径必须能在"从没写过干预"的库上工作。
+    这不违反 D11（overlay 本来就在 Web 的可写范围内），也比"读路径分支 SQL"干净得多
+    ——分支 SQL 会让"忘了处理没 attach 的情况"重新变成一种可能。
 
     ⚠️ **Task 4 实测的平台事实（brief 的写法在本机对部分调用方不可用）**：
     `file:...?mode=ro` 这个 URI 形式**只有连接带 `SQLITE_OPEN_URI` 时才被解析**，
-    也就是必须由 `sqlite3.connect(..., uri=True)` 打开。本仓库里
-    `api.py:110` **是**（`mode=ro` 的读路径），而 `cli.py:502`
-    （`deadline-audit`，spec §3.3 列的 5 条读路径之一）**不是**。
-    连接没带这个标志时，SQLite 把整串当**普通文件名**去开，于是报出极难定位的
+    也就是必须由 `sqlite3.connect(..., uri=True)` 打开。连接没带这个标志时，
+    SQLite 把整串当**普通文件名**去开，于是报出极难定位的
     `OperationalError: unable to open database: file:C:/...?mode=ro`
     （三种 URI 写法全试过，无一可用；见 task-4-report.md）。
+    T5 起**四条生产连接全部带上了这个标志**（`api.py` 原本就有；`cli.py` 的
+    `deadline-audit`、`digest.py`、`refine.py` 三处由 T5 补——controller 裁决 R4）。
+    ⚠️ 将来新增任何走查询层的连接都必须带上它，否则会在 `_ensure_overlay` 上抛
+    `OverlayError`——**响亮**的失败，不是静默降级（这正是设计要的）。
 
     ⚠️ **为什么不"兜底挂一次可写的再 PRAGMA 冻住"**：`PRAGMA ov.query_only=1`
     实测是**连接级**的（主库也一起写不了），而 `digest.py:577` / `refine.py:399`
@@ -112,14 +117,16 @@ def attach_readonly(conn: sqlite3.Connection, path: pathlib.Path | None = None) 
     """
     if any(r[1] == "ov" for r in conn.execute("PRAGMA database_list")):
         return
-    target = (path or OVERRIDES_DB).as_posix()
+    target = path or OVERRIDES_DB
+    if not target.is_file():
+        ensure_schema(target)
     try:
-        conn.execute(f"ATTACH DATABASE 'file:{target}?mode=ro' AS ov")
+        conn.execute(f"ATTACH DATABASE 'file:{target.as_posix()}?mode=ro' AS ov")
     except sqlite3.OperationalError as exc:
-        # 把「怎么修」写进异常里：T5/T6 迟早会踩（cli.py:502 的连接没开 uri=True）。
+        # 把「怎么修」写进异常里——不然踩到的人只会看到一句 SQLite 的文件名报错。
         raise OverlayError(
             "overlay 只读挂载失败：连接需由 sqlite3.connect(..., uri=True) 打开"
-            f"（api.py:110 是，cli.py:502 不是）。原始错误：{exc}"
+            f"（四条生产连接见 task-4-report.md / task-5-report.md）。原始错误：{exc}"
         ) from exc
 
 

@@ -79,8 +79,16 @@ def _isolate_lock_path(tmp_path, monkeypatch):
 
 @pytest.fixture
 def memdb():
-    """内存库。用完即弃，不污染任何真实文件。"""
-    conn = sqlite3.connect(":memory:")
+    """内存库。用完即弃，不污染任何真实文件。
+
+    ⚠️ `uri=True` 是 Task 5 加的，**必须**：查询层入口会
+    `ATTACH 'file:...?mode=ro'`，而 URI 形式**只在连接带 `SQLITE_OPEN_URI`
+    时才被解析**（Task 4 实测、T5 复核）。不带这个标志，每条走查询层的用例都会抛
+    `OverlayError`——而那不是产品缺陷。对 `:memory:` 而言这个标志
+    **不影响任何行为**（路径不以 `file:` 开头时它就是个空开关），
+    与生产侧三处连接的补齐（`cli.py` / `digest.py` / `refine.py`，裁决 R4）是同一件事。
+    """
+    conn = sqlite3.connect(":memory:", uri=True)
     yield conn
     conn.close()
 

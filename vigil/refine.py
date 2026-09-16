@@ -396,7 +396,10 @@ def refine(
 
     owns_conn = conn is None
     if conn is None:
-        conn = sqlite3.connect(str(db_path))
+        # ⚠️ `uri=True` 是 Task 5 加的（裁决 R4）：本连接**既读又写**，其中读的那部分
+        # 会走 `store` 的查询层（入口 ATTACH overlay，URI 形式需要 `SQLITE_OPEN_URI`）。
+        # 不改用 `PRAGMA query_only` 兜底——那是**连接级**的，会把这里的写路径冻住。
+        conn = sqlite3.connect(str(db_path), uri=True)
     try:
         store.ensure_schema(conn)
 
