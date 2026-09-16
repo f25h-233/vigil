@@ -340,11 +340,17 @@ def export(config: Config, key: str, *, on_progress=print) -> ExportStats:
         on_progress(f"发信人姓名：{n_senders:,} 人（来自 group_member3）")
 
         # 本地图片缓存索引：只扫一次，所有群共用。图片是增强项，取不到不拖垮导出。
+        #
+        # ⚠️ `on_progress` **必须留在 try 外面**（计划 §8.5）。它原先和
+        # `index_cache` 挤在同一个 try 里，于是「报进度失败」（比如日志写不进去）
+        # 会被 `except Exception` 吞成 `cache = {}` —— 后果不只是那句话丢了，
+        # 而是 `stats.media_local` 变成 0，汇总行会报出「本地可取 0 张」这个**假数字**。
+        # 能吞的只有「打扫类」失败；**报进度属于本次运行的记录，它的失败必须冒出去**。
         try:
             cache = media.index_cache(config.qq_db_dir.parent / "nt_data" / "Pic")
-            on_progress(f"本地图片缓存：{len(cache):,} 个")
-        except Exception:  # noqa: BLE001
+        except Exception:  # noqa: BLE001 — 图片是增强项，取不到不拖垮导出
             cache = {}
+        on_progress(f"本地图片缓存：{len(cache):,} 个")
 
         try:
             for group in config.enabled_groups:
