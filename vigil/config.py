@@ -203,9 +203,40 @@ def save_persons(persons: Sequence[Person], path: pathlib.Path | None = None) ->
     atomic_write_text(target, "\n".join(lines))
 
 
+# TOML 基本字符串里**必须转义**的字符。实测坏字符集是
+# **U+0000–U+0008、U+000A–U+001F（`\t` 除外）、U+007F**——原样落进引号里会让 tomllib 解析失败；
+# 而 `]` / `#` / `=` / `"""` / U+2028 / C1 / NBSP / BOM 都实测 round-trip 一致，**不必动**
+# （别凭直觉扩大转义集：多转义不会更安全，只会改变正文）。
+_TOML_ESCAPES = {
+    "\\": "\\\\",
+    '"': '\\"',
+    "\n": "\\n",
+    "\r": "\\r",
+    "\t": "\\t",
+}
+
+
 def _toml_str(value: str) -> str:
-    """TOML 基本字符串。只转义反斜杠与双引号——够用且不会引入意外转义。"""
-    return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+    """TOML 基本字符串——**全函数**：任何字符串进去，`save` 的产物都 `load` 得回来。
+
+    ⚠️ 只转义反斜杠与双引号是**不够**的：一个带换行的 label 会写出**解析不了**的 toml，
+    而原子写会让它**永久落盘**——`save` 成功返回、`load` 从此抛 `TOMLDecodeError`，
+    整份人物名单连读都读不出来（实测，见 task-7-report.md）。
+
+    ⚠️ 这里只是**转义**那一半；「名字里不许有换行」的**拒绝**在 API 层——
+    `config/*.toml` 是人手输的，把一个换行静默存进"名字"里、再在界面上错乱显示，
+    比直接报错更不诚实。
+    """
+    out: list[str] = []
+    for ch in value:
+        esc = _TOML_ESCAPES.get(ch)
+        if esc is not None:
+            out.append(esc)
+        elif ch < " " or ch == "\x7f":
+            out.append(f"\\u{ord(ch):04X}")
+        else:
+            out.append(ch)
+    return '"' + "".join(out) + '"'
 
 
 def _read_env(name: str, env_path: pathlib.Path | None = None) -> str:
