@@ -303,9 +303,15 @@ class RunReport:
     @property
     def ok(self) -> bool: ...    # 全部 stage.ok
 
-def run(*, config, key: str, llm_key: str, day: str | None = None,
-        export_on_progress=..., ) -> RunReport
+def run(*, config: Config, key: str, llm_key: str, day: str | None = None,
+        on_progress: Callable[[str], None] | None = None) -> RunReport
 ```
+
+> **⚠️ 已按执行期修正更新（见 §8.6）**：本节原先写的是 `export_on_progress=...`，
+> **实现里没有这个参数**（T7 审查的 F6 指出）。实际签名如上——单一 `on_progress`，
+> 三种失败话术共用一个 sink。另外 `RunReport` **没有 `counters` 字段**：
+> T7 的实现加过它，但审查确认它是**死字段**（除自身外零引用）后已删除；
+> 信息量由 `stages[i].detail` 承载。**权威版本一律是仓库里的 `vigil/daily.py`。**
 
 **`run()` 的失败语义（冻结，不许各写各的）**：
 
@@ -2957,6 +2963,23 @@ Get-ScheduledTaskInfo -TaskName "VIGIL每日管线" | Format-List LastRunTime,La
 **做完必须把 `/st` 改回 `08:00`**，并用 `schtasks /query /xml` 确认改回来了。
 
 ### 6.4 归档不变量 + 幂等三连跑（**M4 最重要的机械判据**）
+
+> ⚠️⚠️ **(a) 跑之前不要做任何 `git checkout` / 切分支 / `git stash`**（终审 U-6，controller 已核）。
+>
+> 这条不变量的「**字节相等**」腿**横跨三方，而没有任何一方拥有它**：
+>
+> | 一方 | 事实 |
+> |---|---|
+> | Python | `digest.py` 以 `newline="\n"` 写出 **LF**，库里的 `body_md` 也是 LF ⇒ 相等 |
+> | `.gitattributes:3` | `* text=auto` |
+> | 本机 git 配置 | **`core.autocrlf = true`**（实测） |
+>
+> ⇒ **任何一次会重新检出 `docs/digests/` 的 git 操作，都会把那几篇已验收日报变成 CRLF**，
+> 于是 (a) 的判据会对它们读出 `False`——**而库里的 `body_md` 一个字都没变**。
+> 那是**假红**，且极难归因（会让人以为归档被破坏）。
+>
+> **若已经做过 git 操作**：先 `vigil digest --date <那天>` 重生成那几篇，再跑 (a)。
+> **现状核对**（终审已测）：4 篇文件 **CRLF 数 = 0**，`raw == body.encode()` 全部 `True`，**不变量此刻成立**。
 
 **(a) 归档不变量**（接力文件原文：「`docs/digests/` 的文件集合 == 库里 `digests` 的窗口日期集合，且文件与 `body_md` 逐字节相等」）:
 

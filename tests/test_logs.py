@@ -273,7 +273,7 @@ def _our_handler() -> logs.DailyFileHandler:
 def test_real_write_failure_propagates_not_swallowed(logdir, monkeypatch):
     """⭐⭐ 真实写失败必须抛，**不许被 logging 吞掉**。
 
-    与 `test_emit_propagates_log_write_failure` 的区别（那条留着，测的是另一层）：
+    与 `test_emit_propagates_handler_exceptions` 的区别（那条留着，测的是另一层）：
       · 那条 monkeypatch 掉了 `handler.emit` 整个方法 —— 绕过了真实写路径
       · 这条让**真实写路径**失败：`logging.StreamHandler.emit` 写流时抛 OSError，
         它会 `except Exception: self.handleError(record)`。**标准实现的 `handleError`
