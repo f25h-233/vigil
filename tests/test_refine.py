@@ -976,3 +976,27 @@ def test_punct_tables_stay_identical():
     """
     from vigil import digest, refine
     assert refine._PUNCT.pattern == digest._PUNCT.pattern
+
+
+# ── Task 1：prompt v3 的商业推广判据 ──────────────────────────────
+
+
+def test_prompt_version_is_v3():
+    """版本号必须跟着提示词一起走。
+
+    ⚠️ 这个断言是**回归锁**，不是行为测试——它只证明"文案改了、版本也改了"。
+    真正的行为测试在 M5 出口判据 2（5 条已知好条目重抽后必须仍在），
+    以及 `tests/test_repass.py` 的误杀守卫。**别把它当成"规则生效了"的证据。**
+    """
+    assert refine.PROMPT_VERSION == "v3"
+
+
+def test_system_prompt_discards_commercial_promo():
+    """prompt 里必须有商业推广的丢弃规则，且必须写明「看目的不看词」。"""
+    from vigil.categories import load_categories
+
+    prompt = refine.build_system_prompt(load_categories())
+    assert "商业推广" in prompt
+    # 反例必须出现在 prompt 里：它们正是 D13 判据的由来（实测误杀样本）
+    assert "打电话办卡的都别信" in prompt
+    assert "最早9.5" in prompt
