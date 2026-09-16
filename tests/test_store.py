@@ -1125,3 +1125,63 @@ def test_save_digest_is_atomic():
 
     rows = conn.execute("SELECT digest_id, body_md FROM digests").fetchall()
     assert rows == [(first, "第一版")], "崩在 INSERT 时旧日报必须原样还在"
+
+
+class _CommitFailsOnce(sqlite3.Connection):
+    """第 1 次 ``commit()`` 抛 sqlite3.OperationalError，之后放行。
+
+    ⚠️ 存在的理由同 `_InsertIntoDigestsFails`：C 类型的实例属性只读，
+    注入只能走 `factory=` 子类。这里注入的是 **commit 本身**失败
+    （磁盘满 / 库被锁死那种），而不是某一条 SQL 失败。
+    """
+
+    fail_next_commit = False
+
+    def commit(self):  # type: ignore[override]
+        if self.fail_next_commit:
+            self.fail_next_commit = False
+            raise sqlite3.OperationalError("模拟 commit 失败")
+        return super().commit()
+
+
+def test_transaction_rolls_back_when_commit_itself_fails():
+    """⭐ commit **自己**失败时也要回滚。
+
+    这是 `else: conn.commit()` 那种写法的洞：commit 在自己的保护圈**外**，
+    它抛了没有任何人 rollback——那批**悬挂的写会留在连接上**，被**下一次**
+    commit 顺手刷出去（真管线里的下一次就是 `_record_error` 的记账），
+    于是「items 落库了、消息却记成 error」⇒ 下轮重抽 ⇒ **重复 items 且无声**。
+    换句话说：`transaction()` docstring 里「要么都成、要么都不成」这句承诺，
+    在 commit 自己失败时**曾经是假的**。
+
+    审查复现的链条就是下面这两步：第 1 次 commit 失败（悬挂）→ 第 2 次成功
+    （把上一批一起刷出去）。
+
+    ⚠️ 与 `test_save_digest_is_atomic` 同因：不用 `memdb` 夹具，
+    因为注入点需要 `factory=` 的子类连接。
+    """
+    conn = sqlite3.connect(":memory:", factory=_CommitFailsOnce)
+    store.ensure_schema(conn)
+    item = _make_item(conn, msg_id=1)
+
+    # ── 第 1 次事务：refine 成功路径的形状（落库 + 记账），但 commit 会炸 ──
+    conn.fail_next_commit = True
+    with pytest.raises(sqlite3.OperationalError):
+        with store.transaction(conn):
+            store.save_items(conn, [item], model="m", prompt_ver="v1", commit=False)
+            store.record_run(conn, [1], status=store.STATUS_OK,
+                             prompt_ver="v1", commit=False)
+
+    # ── 第 2 次事务：模拟 `_record_error` 照常记账（它自己会 commit） ──
+    with store.transaction(conn):
+        store.record_run(conn, [2], status=store.STATUS_ERROR,
+                         prompt_ver="v1", err="boom", commit=False)
+
+    assert conn.execute("SELECT count(*) FROM items").fetchone()[0] == 0, \
+        "commit 失败后悬挂的 items 不许被**下一次** commit 顺手刷出去"
+    assert conn.execute("SELECT count(*) FROM item_sources").fetchone()[0] == 0, \
+        "来源行同理：它和 items 是同一次事务里的"
+    assert [r[0] for r in conn.execute(
+        "SELECT msg_id FROM refine_runs ORDER BY msg_id"
+    ).fetchall()] == [2], \
+        "只该有第 2 次那笔记账——第 1 次那批（msg 1）必须跟着回滚"

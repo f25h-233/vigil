@@ -249,22 +249,28 @@ def transaction(conn: sqlite3.Connection) -> Iterator[None]:
     commit 一次，两步之间崩掉（断电/重启/任务被杀）会留下「items 落库了、
     消息没标记」的状态——下次 `pending_messages` 把同一批消息再抽一遍，
     **产出重复 items 且全程无声**（`items` 表没有任何唯一键，唯一防重复的
-    机制就是 `refine_runs` 的记账跟得上）。写进一个事务后要么两件事都成、
-    要么都不成，重抽是干净的。
+    机制就是 `refine_runs` 的记账跟得上）。写进一个事务后，这一批对库的改动
+    是**全落盘或全丢弃**，重抽是干净的。
 
     ⚠️ 捕 `BaseException` 而不是 `Exception`：`KeyboardInterrupt` 与
     `SystemExit` 也必须 rollback，否则 Ctrl-C 会留下半个批次。
+
+    ⚠️ **`commit()` 必须在保护圈里**。它自己也会失败（磁盘满、库被锁死），
+    而 `else: conn.commit()` 那种写法**抛了没人 rollback**——悬挂的写会留在连接上，
+    被**下一次** commit（比如 `_record_error` 记账那一次）顺手刷出去，于是
+    「items 落库了、消息却记成 error」⇒ 下轮重抽 ⇒ **重复 items 且无声**。
+    `rollback()` 在 commit 失败后也是必要的：sqlite3 的失败 commit 不保证已清事务。
+    （判据：`test_transaction_rolls_back_when_commit_itself_fails`。）
 
     ⚠️ **不可重入**：不要在 `with transaction(conn)` 里面再开一层——
     sqlite3 的嵌套提交会让内层先落盘，窗口就回来了。
     """
     try:
         yield
+        conn.commit()
     except BaseException:
         conn.rollback()
         raise
-    else:
-        conn.commit()
 
 
 def save_items(
