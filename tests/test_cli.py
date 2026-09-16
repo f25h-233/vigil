@@ -220,6 +220,40 @@ def test_refine_still_prints_summary_before_returning_nonzero(cli_env, monkeypat
     assert "[失败] 1 批出错" in out
 
 
+def test_refine_summary_states_the_discard_counts_as_peers_not_a_subset(
+    cli_env, monkeypatch, capsys
+):
+    """⭐⭐ 汇总行里「本地筛掉」与「规则硬丢弃」是**并列**关系，不许写成包含（「其中」）。
+
+    计划 §三 3.6 的第 2 条禁令。M2-4 修的正是这句假话：`prefilter.expand_context`
+    取 ±2 邻居时**不看**那条消息有没有被硬规则判死，所以被判死的消息照样可能作为
+    上下文出网——「本地筛掉」里**不包含**「规则硬丢弃」，写成「（其中硬规则丢弃 N 条）」
+    就是在说两者是父集/子集，在真库上是假话。
+
+    ⚠️ M4 把它改对了，却**没给「它不再回来」上保险**：终审复核实测，把汇总行改回
+    「（其中硬规则丢弃 N 条）」→ **原 404 条测试全绿**。这条断言就是那个保险。
+
+    ⚠️ 断言**只落在 refine 的汇总行上**，不全局搜「其中」——`cli.py` 别处另有一处
+    **合法**的「其中 N 行是程序补的」（digest 的补行计数，那是真的包含关系），
+    全局搜会误伤它。
+
+    变异「`（候选 … 条；规则硬丢弃 … 条）` → `（其中硬规则丢弃 … 条）`」→ 本条红。
+    """
+    monkeypatch.setattr("vigil.refine.refine", lambda *a, **kw: _refine_stats())
+
+    assert cli.main(["refine"]) == 0
+
+    lines = [ln for ln in capsys.readouterr().out.splitlines()
+             if ln.startswith("完成：扫描")]
+    assert len(lines) == 1, f"refine 的汇总行应当恰好一行，实际：{lines!r}"
+    summary = lines[0]
+    assert "本地筛掉" in summary, summary
+    assert "其中" not in summary, (
+        "「其中」把「规则硬丢弃」说成了「本地筛掉」的子集——那不是实情："
+        f"{summary}"
+    )
+
+
 def test_refine_dry_run_returns_zero(cli_env, monkeypatch):
     """`--dry-run` 仍然是 0：它本来就不该有错误，且明确标注了没调模型。"""
     monkeypatch.setattr("vigil.refine.refine", lambda *a, **kw: _refine_stats())

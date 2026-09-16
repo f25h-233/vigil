@@ -213,19 +213,32 @@ def test_log_tail_returns_the_tail_not_the_head(logdir):
     assert "出事了" in body
 
 
-def test_emit_propagates_log_write_failure(logdir, monkeypatch):
-    """⭐ 写不进日志时**必须抛**，不许静默继续。
+def test_emit_propagates_handler_exceptions(logdir, monkeypatch):
+    """`logs.emit` 会**传播** handler 抛出的异常——这是 `emit` 的契约。
+
+    ⚠️ 这条**不是**「写不进日志就抛」的守卫，它测的是**另一层**：handler 抛
+    出来的异常不许被 `emit` 吞掉。它把 `handler.emit` 整个方法**换掉**了，
+    真实写路径（`DailyFileHandler.emit` / `handleError`）一行都跑不到——
+    实测：把 `DailyFileHandler.emit` 掏空成 `pass`，本条**照样绿**。
+    真守卫在 `test_real_write_failure_propagates_not_swallowed`（让**真实
+    写路径**失败），两条合起来才是完整的「写失败必须抛」。
+
+    为什么「抛」这件事仍然要守：无人值守下退出码是唯一还活着的信号（任务计划
+    丢弃 stderr、磁盘满时 LAST-ERROR.txt 也写不出来）。若 `emit` 自己把异常
+    吞了，`handleError` 的重抛也到不了 CLI，于是得到一个 `exit 0 但日志有洞`
+    的运行——**正是 M4 要消灭的形状**。
 
     与 `test_prune_tolerates_missing_dir` 的「吞」是**刻意的不对称**：
       · 轮转失败 = 打扫失败，丢的是历史日志 → 吞掉，不影响本次运行
       · 写日志失败 = **本次运行的记录没了** → 抛
 
-    为什么抛：无人值守下退出码是唯一还活着的信号（任务计划丢弃 stderr、
-    磁盘满时 LAST-ERROR.txt 也写不出来）。这时候静默继续，会得到一个
-    `exit 0 但日志有洞` 的运行——**正是 M4 要消灭的形状**。
+    ⚠️ handler 用 `_our_handler()` 取（定义在本文件下面），**不用 `handlers[0]`**
+    ——原因见那个函数的 docstring（pytest 会往非传播的 logger 上挂自己的
+    `LogCaptureHandler`，而它的 `handleError` 是 `raise`，于是测试会绿在一个
+    **不是我们的** handler 上）。
     """
     logs.setup()
-    handler = logging.getLogger("vigil").handlers[0]
+    handler = _our_handler()
 
     def boom(record):
         raise OSError("模拟磁盘满")
@@ -293,12 +306,15 @@ def test_healthy_stream_is_not_told_to_raise(logdir, monkeypatch):
     """阳性对照：**「写失败就抛」不是「任何情况都抛」**。
 
     与 `test_real_write_failure_propagates_not_swallowed` 只差一件事：
-    这里的流**写得进去**。若那条测试无论流好不好都红（例如有人把
-    `handleError` 写成无条件的 `raise OSError(...)`，或 `emit` 里凭空多抛），
-    这条会立刻把它戳穿——所以两条必须一起在。
+    这里的流**写得进去**。若那条测试无论流好不好都红（例如
+    `DailyFileHandler.emit` 里凭空多抛一次），这条会立刻把它戳穿——所以两条
+    必须一起在。
 
-    还断言了消息**真的走完了格式化+写入**，不是"没抛就完事"：换成
-    BufferingHandler 之类吞掉内容的实现，这条也红。
+    ⚠️ **本对照不覆盖**「`handleError` 写成无条件抛」那种退化（健康流下它
+    根本不会被调用，实测两种写法都过）；它覆盖的是「**内容没真的写下去**」
+    （换成 `BufferingHandler` 之类会红）。
+
+    还断言了消息**真的走完了格式化+写入**，不是"没抛就完事"。
     """
 
     class _GoodStream:

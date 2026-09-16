@@ -964,3 +964,15 @@ def test_progress_failure_after_commit_does_not_poison_the_ledger(seeded, monkey
     # ④ 报告类失败要**响**（计划 §8.5）：它必须冒出去，不许被批次循环的
     #    `except Exception` 吞掉——吞掉的话整轮会带着被毒化的账目继续跑。
     assert raised is not None, "报进度失败必须冒出去"
+
+
+def test_punct_tables_stay_identical():
+    """⭐ 两张 `_PUNCT` 必须逐字一致——一致性只有注释在承重时不叫契约。
+
+    它们必须相同的理由见 `refine.py` 里那段注释：`sanitize_for_llm` 把 `“”` 换成
+    `「」` 送出去、模型照抄回来，而**源文里是 `“”`**；两侧字符集不一致就会
+    一边剥一边不剥 ⇒ **丢来源或误归属**（实测 ~25/47,719）。
+    ⇒ 日后扩大这个字符集，**必须两处同改，且必须重跑包含关系的测量**（见 refine.py 注释）。
+    """
+    from vigil import digest, refine
+    assert refine._PUNCT.pattern == digest._PUNCT.pattern
