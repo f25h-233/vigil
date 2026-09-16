@@ -27,7 +27,7 @@ from .llm import DEFAULT_MODEL, LLMConfig, LLMError, chat_json, sanitize_for_llm
 from .redact import Redactor
 from .store import PendingMessage
 
-PROMPT_VERSION = "v2"
+PROMPT_VERSION = "v3"
 
 # 输出 token 的上限估计，用于把「输出」也算进预算
 _BATCH_TITLE_MAX = 40
@@ -80,6 +80,12 @@ def build_system_prompt(cats: tuple[Category, ...]) -> str:
   只有当消息**给出了答案或明确信息**时才产出
   （例：「30 号就得到学校」是信息，「30 号开学吗」不是）
 * 同学间的感慨、吐槽、附和
+* **商业推广 / 代理招募 / 办卡广告**——流量卡、校园卡、宽带、电话卡的办理与
+  代理招募、开卡返现、找人办卡、转让卡位等**以推销或拉客为目的**的消息。
+  ⚠️ 判据看**这条消息想干什么**，不看它出现了哪个词。同样出现「校园卡」：
+  「校园卡办理，需要的联系我」= 推广，丢掉；
+  「打电话办卡的都别信哦所有人」= 提醒，「最早9.5」= 信息，
+  「住宿费也统一扣1500」= 通知——**这三条都要照常产出**。
 
 输出必须是 JSON 对象，形如 {{"items": [...]}}，其中 items 是数组。
 每个元素的结构：
