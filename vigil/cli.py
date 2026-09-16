@@ -527,7 +527,32 @@ def cmd_deadline_audit(args) -> int:
         if not args.apply:
             print("\n（--dry-run：未写库。确认无误后加 --apply）")
             return 0
-        changed = store.clear_deadlines(conn, sorted(bad))
+
+        # ⚠️ **这是第四个写库命令，也要上锁**（M4 终审 U-3/M-1）：F4 的裁定是
+        # 「人工命令也要上锁」（R71），但实现的是**按名字枚举**的三个
+        # （export/refine/digest）⇒ 终审实测：锁被持有时 `export` 退 2（被保护），
+        # 而 `deadline-audit --apply` 退 **0** 且 `data/vigil.db` **仍被改**。
+        # 拿不到锁 ⇒ 退 2 + 一句「[跳过]」，与那三个同一语义：等着就行，不是失败。
+        #
+        # ⚠️ **只有 `--apply` 上锁，dry-run 不上锁**（判断与理由）：
+        # `lock.SingleInstance` 的语义是「同一时刻只许一个**写库**的 vigil 进程」
+        # （见 `lock.py` 的模块 docstring），而默认那条路只有 SELECT + print——
+        # 它与 `read`/`who`/`media`/`groups` 是同一族的**人工即时查询**
+        # （`tests/test_cli.py::test_query_commands_do_not_write_to_the_log`
+        # 正是这么归类的）。给只读的检查上锁会凭空造出一个**假拒绝**（rc=2），
+        # 而 2 的约定含义是「已经有实例在写」。
+        #
+        # ⚠️ 代价（知情取舍）：审计的那些 SELECT 已经跑完，结果与被写的这一刻之间
+        # 隔了一小段。这是安全的——`clear_deadlines` 只把 `deadline_ts` 置 NULL
+        # （只影响传入的行、可重复执行），而并发的 refine 只**新增** items，
+        # 不改任何已有行的这一列。
+        try:
+            with lock.SingleInstance():
+                changed = store.clear_deadlines(conn, sorted(bad))
+        except lock.AlreadyRunning as exc:
+            # 与其它三个写库命令同一行话术（`logs.emit` 先 print 后写日志）
+            logs.emit(f"[跳过] {exc}")
+            return 2
         print(f"\n已把 {changed} 条的 deadline_ts 置 NULL（其余字段未动）。")
         return 0
     finally:

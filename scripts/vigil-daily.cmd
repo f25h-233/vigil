@@ -30,7 +30,13 @@ cd /d "%REPO%"
 uv run vigil daily
 set "RC=%ERRORLEVEL%"
 
-if not "%RC%"=="0" if not exist "%ERRFILE%" (
+REM Exit code 2 is NOT a failure. It is the frozen meaning of "another instance
+REM already holds the lock, this run exited early" (plan section 3.4; the same
+REM table is in the ops setup doc). Treating it as a failure would write a
+REM FALSE failure marker here and hand out a BACKWARDS diagnosis -- "uv not on
+REM PATH" -- for a run that worked exactly as designed. So: only a non-zero,
+REM non-2 code falls through to the fallback note below.
+if not "%RC%"=="0" if not "%RC%"=="2" if not exist "%ERRFILE%" (
   > "%ERRFILE%" echo [%DATE% %TIME%] vigil daily exited with %RC% but wrote no LAST-ERROR.txt. This usually means Python failed before it started: uv not on PATH, broken venv, or a missing dependency. Run "uv run vigil daily" by hand in %REPO% to see the full error.
 )
 

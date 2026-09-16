@@ -32,6 +32,28 @@ STAGE_EXPORT = "export"
 STAGE_REFINE = "refine"
 STAGE_DIGEST = "digest"
 
+# 无人值守路径的 token 预算上限。**必须有这个数**：`vigil refine` 的 `--budget`
+# 只存在于 CLI，而 `daily` 是没人看着跑的那条路——没有上限就意味着"首次挂机
+# 或断更积压时，08:00 那次会在无人看管下把全部积压跑完"，时长与花费都无上界
+# （`StartWhenAvailable` 还会把错过的补跑）。撞预算**不是失败**（护栏按设计
+# 生效）：`refine` 照常返回、账目照记，日报自己的覆盖率检查会说「仅抽取了 X/Y」。
+#
+# 数怎么来的（锚点全部是实测，不是手感值）：
+#   · **单条扫描消息 ≈ 15 token**：M1 的 1,050 条窗口实跑 13,520 输入 token
+#     （≈12.9/条）；输出按 M1 模型对照那轮的实测比例折算（41 批实跑输出
+#     6,448 token、单批峰值 516，按该轮成本 ¥0.038 反推输入 ≈43,500
+#     ⇒ 输出/输入 ≈15%）≈2/条。**用「扫描条数」而不是「批数」换算**，因为
+#     送模型的比例（预筛 + 扩上下文）会随群的性质变，实测约 11–22%。
+#   · 一天正常增量：已验收的三篇日报是 **151 / 514 / 536 条**（9–10 个群）
+#     ⇒ ≈ 2,300 / 7,700 / 8,000 token。
+#   · 单群爆量日（2026-08-08：1 个群 1,059 条）⇒ ≈ 16,000 token。
+#   · 一次全史积压（47,719 条）⇒ ≈ 72 万 token，与 M1 独立估算的
+#     「全量约 60 万**输入** token」一致；断更一个月（约 1.5 万条）≈ 23 万。
+# 取 **300,000**：≈37 倍正常日、≈19 倍爆量日——**宁可宽松也不要卡死日常**；
+# 同时把"首次挂机就把全史跑完"从 72 万截到 ≤42%，一次跑不完但**有界**，
+# 而 refine 是增量的（跑过的消息记进 `refine_runs`），剩下的第二天接着跑。
+DAILY_BUDGET_TOKENS = 300_000
+
 
 @dataclass(frozen=True)
 class StageResult:
@@ -169,6 +191,10 @@ def run(
             db_path=config.output_db,
             prompt_ver=refine_mod.PROMPT_VERSION,
             model=refine_mod.DEFAULT_MODEL,
+            # ⚠️ **必须传**：不传就是 None，而 `refine()` 的预算护栏只在
+            # `budget_tokens is not None` 时生效 ⇒ 无人值守这条路**一点上限都没有**
+            # （M4 终审 I-3）。取值依据见 `DAILY_BUDGET_TOKENS` 上面那段。
+            budget_tokens=DAILY_BUDGET_TOKENS,
             on_progress=emit,
         )
         if rst.errors:
