@@ -171,3 +171,66 @@ def test_handler_rolls_over_at_midnight(logdir, monkeypatch):
     assert "零点前" not in after, "旧记录不许跟着跑到新文件里"
     assert "零点后" not in logs.log_path(day1).read_text(encoding="utf-8"), \
         "新记录不许再写进前一天的文件"
+
+
+def test_clear_last_error_actually_removes_the_file(logdir):
+    """⭐ `clear_last_error` 必须**真的删**——它是「文件存在 ⟺ 本次跑失败过」的一半。
+
+    另一半（失败时写出来）由 `test_clear_then_write_last_error` 覆盖。
+    审查实测：把本函数变异成 `return None`，原先 12 条**全绿**——
+    因为既有测试都在干净目录里"先清再断言不存在"，no-op 也能过。
+    """
+    logs.clear_last_error()                    # 目录都不存在时也不许抛
+    logs.setup()
+    logs.write_last_error("上次失败了")
+    assert (logdir / logs.LAST_ERROR_NAME).exists()
+
+    logs.clear_last_error()
+
+    assert not (logdir / logs.LAST_ERROR_NAME).exists(), \
+        "clear_last_error 没真的删——于是下次跑成功也会被读成『这次失败了』"
+
+
+def test_log_tail_returns_the_tail_not_the_head(logdir):
+    """⭐ 取的是**尾部**不是头部。
+
+    实测：把 `rows[-lines:]` 改成 `rows[:lines]`，原 12 条全绿——
+    因为唯一碰它的那条测试只写了一行日志，头尾是同一条。
+
+    取成头部的后果：LAST-ERROR.txt 里是本轮开跑时那句
+    『═══ vigil daily 开始 ═══』，而真正有用的出错现场一个字都没有。
+    spec §4.8 的原文要求就是「日志尾部」，所以这条有明确的判据来源。
+    """
+    logs.setup()
+    for i in range(1, 11):
+        logs.emit(f"第{i}行")
+
+    logs.write_last_error("出事了", tail_lines=3)
+
+    body = (logdir / logs.LAST_ERROR_NAME).read_text(encoding="utf-8")
+    assert "第10行" in body and "第9行" in body and "第8行" in body, body
+    assert "第1行" not in body, "取到头部了——那不是『日志尾部』"
+    assert "出事了" in body
+
+
+def test_emit_propagates_log_write_failure(logdir, monkeypatch):
+    """⭐ 写不进日志时**必须抛**，不许静默继续。
+
+    与 `test_prune_tolerates_missing_dir` 的「吞」是**刻意的不对称**：
+      · 轮转失败 = 打扫失败，丢的是历史日志 → 吞掉，不影响本次运行
+      · 写日志失败 = **本次运行的记录没了** → 抛
+
+    为什么抛：无人值守下退出码是唯一还活着的信号（任务计划丢弃 stderr、
+    磁盘满时 LAST-ERROR.txt 也写不出来）。这时候静默继续，会得到一个
+    `exit 0 但日志有洞` 的运行——**正是 M4 要消灭的形状**。
+    """
+    logs.setup()
+    handler = logging.getLogger("vigil").handlers[0]
+
+    def boom(record):
+        raise OSError("模拟磁盘满")
+
+    monkeypatch.setattr(handler, "emit", boom)
+
+    with pytest.raises(OSError):
+        logs.emit("这句写不进去")

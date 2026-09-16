@@ -102,6 +102,19 @@ class DailyFileHandler(logging.FileHandler):
         return str(self._dir / f"vigil-{self._day:%Y-%m-%d}.log")
 
     def emit(self, record: logging.LogRecord) -> None:
+        """跨零点就换文件；**写不进去就抛，不许静默继续**。
+
+        ⚠️ 这与 `prune_old_logs` 的「吞」是**刻意的不对称**，不是不一致：
+
+          · 轮转失败 = **打扫**失败，丢的是历史日志 → 吞掉，影响不到本次运行；
+          · 这里失败 = **本次运行的记录没了** → **抛**。
+
+        为什么抛：无人值守下退出码是唯一还活着的信号（任务计划丢弃 stderr、
+        磁盘满时连 LAST-ERROR.txt 也写不出来）。这时候静默继续，会得到一个
+        `exit 0 但日志有洞` 的运行——**正是 M4 要消灭的那个形状**：
+        「没人看得见」比「这次没跑完」更糟。代价（磁盘满到连 LAST-ERROR.txt
+        都写不出来）是物理约束，接受。
+        """
         today = _today()
         if today != self._day:
             self._day = today
