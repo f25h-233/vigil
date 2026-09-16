@@ -33,11 +33,18 @@ def test_second_instance_raises_already_running(lockfile):
     而"已经有实例在跑"这件事本来就该原样告诉调度器。
     """
     with lock.SingleInstance(lockfile):
-        t0 = time.monotonic()
-        with pytest.raises(lock.AlreadyRunning) as ei:
-            with lock.SingleInstance(lockfile):
-                pass
-        waited = time.monotonic() - t0
+        # ⚠️ 取 N 次的**最小值**，而不是单次测量。
+        # 单次会被瞬时负载污染（杀软扫新建文件、磁盘 I/O 争用）：实测在并发跑多个
+        # agent 的机器上，干净树 3 次跑红了 1 次——而这条断言常态是**毫秒级**
+        # （整份 test_lock.py 跑 5 遍都是 1.1–1.2s）。min 对瞬时尖峰最稳健，
+        # 且它测的**仍是同一件事**：拿不到锁时**立刻**失败。
+        waits = []
+        for _ in range(5):
+            t0 = time.monotonic()
+            with pytest.raises(lock.AlreadyRunning) as ei:
+                with lock.SingleInstance(lockfile):
+                    pass
+            waits.append(time.monotonic() - t0)
         assert str(lockfile) in str(ei.value)
 
     # ⚠️「不等待」得**能量出来**才算数：Windows 上 msvcrt 的**阻塞**版
@@ -47,7 +54,11 @@ def test_second_instance_raises_already_running(lockfile):
     # 当时本文件 4 条判据**全绿**，只是整份慢了，19.34s）。所以这条时间
     # 上限不是点缀，它是"非阻塞"这个冻结语义**唯一**的可观测证据。
     # 上限 2s：正确路径是毫秒级（本文件 5 条跑完约 1s），阻塞路径 9s 起。
-    assert waited < 2.0, f"第二次尝试等了 {waited:.1f}s —— 锁是阻塞的，无人值守下会变成僵尸进程"
+    assert min(waits) < 2.0, (
+        f"第二次尝试最快也等了 {min(waits):.2f}s"
+        f"（5 次分别为 {[round(w, 3) for w in waits]}）"
+        f" —— 锁是阻塞的，无人值守下会变成僵尸进程"
+    )
 
 
 def test_message_names_the_holder(lockfile):
