@@ -915,3 +915,52 @@ def test_stripping_quote_characters_does_not_manufacture_wild_attribution():
     assert refine._normalize('他说“明天交作业”了') == "他说明天交作业了", \
         "全角引号（本次新增的那组）必须被剥掉"
     assert refine._normalize("　（640）\t") == "640", "标点/空白照旧剥掉（既有语义不变）"
+
+
+def test_progress_failure_after_commit_does_not_poison_the_ledger(seeded, monkeypatch):
+    """⭐⭐ 事务**提交之后**报进度失败，**不许**把已成功的批次改记成 error。
+
+    旧形状：成功话术的 `on_progress` 在 `try` **里面** ⇒ 它抛（写日志失败）
+    会被下面那个 `except Exception` 接住 ⇒ `_record_error` 对**整批** `batch_ids`
+    做 `INSERT OR REPLACE` 记 `error` ⇒ **把刚提交的 `ok` 覆盖掉**（`hit_ids ⊆
+    batch_ids`，所以一定被覆盖）⇒ 下轮 `pending_messages` 把那些消息**重新取出来**
+    ⇒ **重复 items 且无声**。
+
+    ⇒ 它是 M4 要消灭的形状，只在「事务已提交、报进度失败」这个**夹缝**里触发：
+    提交之前炸会被回滚（安全），提交之后炸才会毒化账目。
+
+    修法：成功话术必须放在 `try/except` **之外**——报告类失败要**响**（冒出去），
+    不许被那个 `except Exception` 接住。
+    """
+    fake = FakeLLM(lambda user: _scripted(user, deadline=None))
+    monkeypatch.setattr(refine, "chat_json", fake)
+
+    def flaky_progress(msg, *a, **kw):
+        # 只炸**成功话术**那一条（`批次 N/M`）；错误话术（`第 N 批…失败`）不炸——
+        # 炸后者会把 `_record_error` 那条路径也弄坏，就测不出想测的东西了
+        if "批次" in msg:
+            raise RuntimeError("模拟写日志失败")
+        return None
+
+    # ⚠️ 不用 `pytest.raises` 包住整个调用：那样旧代码下会红在「有没有抛」，
+    # 而本条要钉的是**账目有没有被毒化**——账目断言必须排在**最前面**，
+    # 否则「红在正确的那条断言上」这件事就没被证明。
+    raised: RuntimeError | None = None
+    try:
+        refine.refine(StubConfig(), api_key="k", conn=seeded, batch_size=1,
+                      on_progress=flaky_progress)
+    except RuntimeError as exc:
+        raised = exc
+
+    # ① 已提交的那批，账目必须还是 ok——**这条就是本修复的全部意义**
+    assert seeded.execute(
+        "SELECT count(*) FROM refine_runs WHERE msg_id = 1 AND status = 'ok'"
+    ).fetchone()[0] == 1, "提交成功的批次被 _record_error 改记成 error 了"
+    # ② 它**不许**再被当成待处理：重抽 = 重复 items（洞 B 的同一个形状）
+    assert 1 not in [m.msg_id for m in store.pending_messages(seeded)], \
+        "被改记成 error 的消息下轮会被重抽 ⇒ 重复 items 且无声"
+    # ③ 条目数不许因这次失败变多：只有第 1 批提交过，items 就只有它那一条
+    assert seeded.execute("SELECT count(*) FROM items").fetchone()[0] == 1
+    # ④ 报告类失败要**响**（计划 §8.5）：它必须冒出去，不许被批次循环的
+    #    `except Exception` 吞掉——吞掉的话整轮会带着被毒化的账目继续跑。
+    assert raised is not None, "报进度失败必须冒出去"
