@@ -309,6 +309,14 @@ def _dedupe_batch(items: list[ExtractedItem]) -> list[ExtractedItem]:
     return out
 
 
+# ⚠️ 公开别名（M5 Task 9）：`repass._produce` 必须在**算产出计数之前**走同一套
+# 批内去重。写成别名而不是第二份实现——两份实现会漂移，而漂移的方向正是
+# 「存量重判说该留 2 条、refine 只写 1 行」这种两条路径互相矛盾的形态
+# （计划勘误 E4；真库 item 290/296 就是模型对同一条消息重抽两次）。
+# `save_items` 内部走的是同一个函数对象，不是"相似的一段代码"。
+dedupe_batch = _dedupe_batch
+
+
 def save_items(
     conn: sqlite3.Connection,
     items: list[ExtractedItem],
@@ -608,6 +616,124 @@ def clear_deadlines(conn: sqlite3.Connection, item_ids: list[int]) -> int:
     )
     conn.commit()
     return int(cur.rowcount)
+
+
+# ── 存量重判（M5 Task 9 / D10）的四个读写 helper ──────────────────
+#
+# ⚠️ 这四个函数**不 commit**（`delete_items` / `downgrade_item_fields`）：
+# 存量重判是一次不可逆的批量改动，事务边界由调用方（`repass.apply_plan`）
+# 决定——「要么全成要么全废」不能拆成几十次各自落盘。
+# `clear_deadlines` 那种自带 commit 的写法在这里是**错**的：它中途崩掉会
+# 留下「删了一半」的库，而清单已经打印出去了。
+
+
+def items_used_in_digests(
+    conn: sqlite3.Connection, item_ids: Sequence[int]
+) -> frozenset[int]:
+    """这些 item 里，哪些被**任何**一篇日报引用过。
+
+    ⚠️ 存量重判靠它决定"哪些不能删"——删掉被引用的条目会让
+    `digest_items` 留下悬空行，而日报正文里那句话还印着（spec R9 实测：
+    `digest_items` 66 行指向 66 条，整批替换会让它们全部悬空）。
+    """
+    if not item_ids:
+        return frozenset()
+    marks = ",".join("?" * len(item_ids))
+    return frozenset(
+        int(r[0])
+        for r in conn.execute(
+            f"SELECT DISTINCT item_id FROM digest_items WHERE item_id IN ({marks})",
+            list(item_ids),
+        )
+    )
+
+
+def existing_items_for_messages(
+    conn: sqlite3.Connection, msg_ids: Sequence[int]
+) -> dict[int, list[int]]:
+    """源消息 → 它产出过的 item_id 列表（按 item_id 升序）。
+
+    存量重判的第一步：找出"已产出条目的那批源消息"及其产物。
+
+    ⚠️ 一个 item 可以挂在**多条**源消息上（`_dedupe_batch` 的来源取并集），
+    所以同一个 item_id 在返回值里可能出现两次——调用方自己按 item 去重。
+    """
+    if not msg_ids:
+        return {}
+    marks = ",".join("?" * len(msg_ids))
+    out: dict[int, list[int]] = {}
+    for mid, iid in conn.execute(
+        f"SELECT msg_id, item_id FROM item_sources WHERE msg_id IN ({marks})"
+        " ORDER BY msg_id, item_id",
+        list(msg_ids),
+    ):
+        out.setdefault(int(mid), []).append(int(iid))
+    return out
+
+
+def soft_deleted_item_ids(
+    conn: sqlite3.Connection, item_ids: Sequence[int]
+) -> frozenset[int]:
+    """这些 item 里，哪些被用户**软删**过（D15：行仍在、只是不再显示）。
+
+    ⚠️ 存量重判必须问这一句（计划勘误 E6）：软删是「视图层拿掉了」，
+    而 `repass` 做的是 `DELETE FROM items`——**物理删**。删掉之后
+    `item_edits` 里那条 delete 事件还在，`undo` 也照样返回成功，
+    但**没有任何行可以恢复**：用户的"撤销"变成了静默失败。
+
+    ⚠️ 走 `_ensure_overlay` 而不是直接 JOIN——那条路径会**自动挂载** overlay，
+    漏挂时是响亮的 `OverlayError` 而不是「查不到软删 ⇒ 全部照删」的静默错误。
+    """
+    if not item_ids:
+        return frozenset()
+    _ensure_overlay(conn)
+    marks = ",".join("?" * len(item_ids))
+    return frozenset(
+        int(r[0])
+        for r in conn.execute(
+            "SELECT item_id FROM ov.item_state"
+            f" WHERE deleted = 1 AND item_id IN ({marks})",
+            list(item_ids),
+        )
+    )
+
+
+def delete_items(conn: sqlite3.Connection, item_ids: Sequence[int]) -> int:
+    """删条目及其来源行。返回删除条数。
+
+    ⚠️ 必须先删 `item_sources`：`items` 的 FTS 触发器（`items_fts_ad`）挂在
+    `items` 的 DELETE 上，删主行会顺带清索引；而 `item_sources` 没有触发器，
+    不显式删就会留下**指向不存在条目的来源行**。
+
+    ⚠️ **不 commit**——调用方决定事务边界（存量重判要整批要么全成要么全废）。
+    """
+    if not item_ids:
+        return 0
+    marks = ",".join("?" * len(item_ids))
+    conn.execute(f"DELETE FROM item_sources WHERE item_id IN ({marks})", list(item_ids))
+    cur = conn.execute(f"DELETE FROM items WHERE item_id IN ({marks})", list(item_ids))
+    return int(cur.rowcount)
+
+
+def downgrade_item_fields(
+    conn: sqlite3.Connection,
+    updates: Sequence[tuple[int, str | None, int | None]],
+) -> int:
+    """把存量条目的 `place` / `deadline_ts` 改成给定值（通常是把不合格的降为 NULL）。
+
+    `updates` 是 ``(item_id, place, deadline_ts)`` 三元组。
+
+    ⚠️ 这是 UPDATE 不是重建 ⇒ `item_id` 不变 ⇒ 不打断 `digest_items`（D16 的同一条理由）。
+    ⚠️ **不 commit**，理由同 `delete_items`。
+    """
+    n = 0
+    for item_id, place, deadline_ts in updates:
+        cur = conn.execute(
+            "UPDATE items SET place = ?, deadline_ts = ? WHERE item_id = ?",
+            (place, deadline_ts, item_id),
+        )
+        n += int(cur.rowcount)
+    return n
 
 
 # ── 只读查询层：Web 的读侧（M3 Task 2）────────────────────────

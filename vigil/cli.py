@@ -15,6 +15,7 @@ from . import export as export_mod
 from . import lock, logs
 from . import qqdb, reader
 from . import refine as refine_mod
+from . import repass as repass_mod
 from . import store
 from .config import ConfigError, load_config, load_key, load_llm_key
 
@@ -332,6 +333,104 @@ def cmd_refine(args) -> int:
         # 「这次跑失败了」才要人来看（计划 §三 3.4）。
         logs.emit(f"[跳过] {exc}")
         return 2
+
+
+def cmd_repass(args) -> int:
+    """存量重判：让**已有**条目跟上当前提示词与两道要素闸门（M5 D10）。
+
+    ⚠️ 默认**只出清单、不写库**（`--apply` 才写）。存量重判不可逆：删掉的
+    item 没有回收站，而被 `digest_items` 引用的那些一旦删掉，日报正文里
+    那句话还印着、链接却指向一个不存在的条目。
+
+    ⚠️ 写库必须持锁（与 refine / digest / `deadline-audit --apply` 同一套契约，
+    rc=2 = 已有实例在跑）；**只读清单不上锁**——理由与 `deadline-audit` 的
+    dry-run 一字不差：给只读检查上锁会凭空造出一个**假拒绝**。
+
+    ⚠️ 退出码：**0 / 1 / 2**。有批次失败就是 1：失败的那批消息这一轮**没有
+    取得判定**（勘误 E5），于是清单是**不完整**的——这件事需要人来看，
+    不许报成功（M4 的教训：无人值守下退出码是唯一还活着的信号）。
+    """
+    from .config import load_llm_key
+
+    config = _load_config_only()
+    db = _require_export_db(config)
+
+    api_key = load_llm_key()
+    if not api_key:
+        print(
+            "[repass] 缺少 SILICONFLOW_API_KEY（在 .env 或环境变量里）",
+            file=sys.stderr,
+        )
+        return 1
+
+    # --model 不给时是 None，而 None 会绕过 repass() 的默认值，所以这里兜底
+    common = dict(
+        api_key=api_key,
+        db_path=db,
+        batch_size=args.batch,
+        budget_tokens=args.budget,
+        model=args.model or refine_mod.DEFAULT_MODEL,
+        enable_thinking=args.think,
+        on_progress=logs.emit,
+    )
+
+    if not args.apply:
+        plan, stats = repass_mod.repass(config, apply=False, **common)
+        _print_repass_plan(plan, stats)
+        return 1 if stats.errors else 0
+
+    try:
+        with lock.SingleInstance():
+            plan, stats = repass_mod.repass(config, apply=True, **common)
+    except lock.AlreadyRunning as exc:
+        logs.emit(f"[跳过] {exc}")
+        return 2
+    _print_repass_plan(plan, stats)
+    return 1 if stats.errors else 0
+
+
+def _print_repass_plan(plan, stats) -> None:
+    """把清单打出来——**这是本命令存在的意义之一**：不可逆操作事前可见。
+
+    ⚠️ 三只「不删」的桶都要单独报出来，一个都不许并进「保留」里：
+    * `skipped_referenced`——被日报引用，删了会让归档悬空
+    * `skipped_soft_deleted`——用户自己软删过（D15：行仍在）
+    * `unjudged`——这一轮**没判成**的（勘误 E5），清单因此不完整
+    把它们混成一句「保留 N 条」，读的人就分不清「判过了、该留」与
+    「根本没判」——而后者意味着**这次重判的结果不能全信**。
+    """
+    print(
+        f"[repass] 重判源消息 {stats.scanned_msgs} 条，成功 {stats.batches} 批"
+        f"（失败 {stats.failed_batches} 批），token {stats.total_tokens:,}"
+    )
+    print(f"  将删除 {len(plan.to_delete)} 条：")
+    for iid in plan.to_delete:
+        print(f"    - item {iid}")
+    print(f"  保留 {len(plan.to_keep)} 条；字段降级 {len(plan.downgrades)} 条")
+    if plan.skipped_referenced:
+        print(
+            f"  ⚠️ 跳过 {len(plan.skipped_referenced)} 条"
+            f"（被日报引用，删了会让归档悬空）："
+        )
+        for iid in plan.skipped_referenced:
+            print(f"    - item {iid}")
+    if plan.skipped_soft_deleted:
+        print(
+            f"  ⚠️ 跳过 {len(plan.skipped_soft_deleted)} 条"
+            f"（用户软删过，行要留着才撤得回）："
+        )
+        for iid in plan.skipped_soft_deleted:
+            print(f"    - item {iid}")
+    if plan.unjudged:
+        print(
+            f"  ⚠️ {len(plan.unjudged)} 条**没判成**（本轮清单不完整，"
+            f"它们的条目一条都没动）："
+        )
+        for iid in plan.unjudged:
+            print(f"    - item {iid}")
+    if stats.errors:
+        for e in stats.errors:
+            print(f"  [错误] {e}", file=sys.stderr)
 
 
 def cmd_digest(args) -> int:
@@ -656,6 +755,20 @@ def main(argv: list[str] | None = None) -> int:
     )
     p_refine.add_argument("--dry-run", action="store_true", help="只报告不调用模型")
     p_refine.set_defaults(func=cmd_refine)
+
+    p_repass = sub.add_parser(
+        "repass",
+        help="存量重判：让已有条目的来源消息按当前提示词重跑一遍（只删不换）",
+    )
+    p_repass.add_argument(
+        "--apply", action="store_true",
+        help="真的写库；**不给就只出清单**——存量重判不可逆，默认先看清单",
+    )
+    p_repass.add_argument("--batch", type=int, default=30, help="每批消息数")
+    p_repass.add_argument("--budget", type=int, help="token 预算上限")
+    p_repass.add_argument("--model", default=None, help="覆盖默认模型")
+    p_repass.add_argument("--think", action="store_true", help="打开模型思考模式")
+    p_repass.set_defaults(func=cmd_repass)
 
     p_dl = sub.add_parser(
         "deadline-audit", help="截止日核验：源文里找不到依据的一律清掉"

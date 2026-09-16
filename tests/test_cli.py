@@ -876,3 +876,125 @@ def test_soft_deleted_item_still_shows_up_in_deadline_audit(cli_env, monkeypatch
         "deadline-audit 看不到被软删的条目了。它刻意不接 overlay（对底层数据的核验）："
         "软删只是「界面别显示」，源文与截止日的矛盾照样存在"
     )
+
+
+# ── repass：存量重判（默认只出清单；--apply 才写库）────────────────
+#
+# ⚠️ 这一组守的是**退出码与锁的契约**，不是重判逻辑本身
+# （逻辑在 `tests/test_repass.py`）。理由与 export/refine/digest：退出码是
+# 无人值守下唯一还活着的信号，而它是**接线**属性——重判算得再对，
+# 命令返回 0 就等于没报警。
+
+
+def _repass_result(*, errors=(), to_delete=(1, 2), to_keep=(3,)):
+    from vigil.repass import RepassPlan, RepassStats
+
+    return (
+        RepassPlan(to_delete=list(to_delete), to_keep=list(to_keep)),
+        RepassStats(scanned_msgs=10, batches=1, errors=list(errors)),
+    )
+
+
+def test_repass_dry_run_takes_no_lock_and_passes_apply_false(
+    cli_env, monkeypatch, capsys
+):
+    """默认（不 `--apply`）**只出清单**：不上锁，且明确传 `apply=False`。
+
+    ⚠️ 与 `deadline-audit` 的 dry-run 同一取舍：它是人工即时查询那一族的，
+    给只读检查上锁会凭空造出一个**假拒绝**（rc=2），而 2 的约定含义是
+    「已经有实例在写」。
+
+    变异「把 `with lock.SingleInstance():` 提到函数开头（dry-run 也上锁）」
+    → 本条红；变异「默认 `apply=True`」→ 本条红（`seen["apply"]` 是 True）。
+    """
+    from vigil import lock
+
+    seen: dict = {}
+
+    def fake(config, **kw):
+        seen.update(kw)
+        return _repass_result()
+
+    monkeypatch.setattr("vigil.repass.repass", fake)
+
+    with lock.SingleInstance(lock.LOCK_PATH):   # 「另一个实例」持着同一把锁
+        rc = cli.main(["repass"])
+
+    assert rc == 0, "只出清单的重判被锁挡住了——那不是「有人在写」，是假拒绝"
+    assert seen["apply"] is False, "默认必须**只出清单**：存量重判不可逆"
+    out = capsys.readouterr().out
+    assert "item 1" in out and "item 2" in out, "清单要真的打出来给人看"
+
+
+def test_repass_apply_returns_2_and_never_runs_when_the_lock_is_held(
+    cli_env, monkeypatch, capsys
+):
+    """⭐ `repass --apply` 撞车 ⇒ **2**，且**根本没有跑**（更别说写库）。
+
+    ⚠️ 「没跑」和「跑了但没写」是两件事：这里是前者——`repass()` 一次都没被调用。
+    拿到锁之后再跑一次是**阳性对照**：证明 2 来自锁，不是来自「这个命令永远退 2」。
+    """
+    from vigil import lock
+
+    calls: list[dict] = []
+
+    def fake(config, **kw):
+        calls.append(kw)
+        return _repass_result()
+
+    monkeypatch.setattr("vigil.repass.repass", fake)
+
+    with lock.SingleInstance(lock.LOCK_PATH):
+        rc = cli.main(["repass", "--apply"])
+
+    assert (rc, calls) == (2, []), (
+        f"锁被持有时 rc={rc}（应当是 2）、repass() 调用 {len(calls)} 次"
+        f"（应当是 0）——退 0 或照样跑说明这把锁没保护到它"
+    )
+    assert "[跳过]" in capsys.readouterr().out, "为什么没跑要看得见，不许静默退 2"
+
+    assert cli.main(["repass", "--apply"]) == 0
+    assert calls and calls[0]["apply"] is True
+
+
+def test_repass_returns_nonzero_when_a_batch_failed(cli_env, monkeypatch):
+    """⭐ 有批次失败 ⇒ 非零：那一批这一轮**没有取得判定**（勘误 E5），
+    清单因此是**不完整**的——这件事需要人来看，不许报成功。
+
+    变异「`return 1 if stats.errors else 0` → `return 0`」→ 本条红。
+    """
+    monkeypatch.setattr(
+        "vigil.repass.repass",
+        lambda *a, **kw: _repass_result(errors=["第 1 批失败: HTTP 503"]),
+    )
+    assert cli.main(["repass"]) != 0
+
+
+def test_repass_returns_zero_when_no_batch_failed(cli_env, monkeypatch):
+    """阳性对照：一批都没错 ⇒ 0（挡「无条件 return 1」——报警器被无视的第一个原因）。"""
+    monkeypatch.setattr("vigil.repass.repass", lambda *a, **kw: _repass_result())
+    assert cli.main(["repass"]) == 0
+
+
+def test_repass_plan_reports_the_three_safety_buckets_separately(
+    cli_env, monkeypatch, capsys
+):
+    """三只「不删」的桶必须**分开**报出来。
+
+    混成一句「保留 N 条」，读的人就分不清「判过了、该留」与「根本没判」——
+    而后者意味着这次重判的结果**不能全信**（勘误 E5）。
+
+    变异「把 `plan.unjudged` 并进 `to_keep` 的计数里」→ 本条红。
+    """
+    plan, stats = _repass_result()
+    plan.skipped_referenced = [7]
+    plan.skipped_soft_deleted = [8]
+    plan.unjudged = [9]
+    monkeypatch.setattr("vigil.repass.repass", lambda *a, **kw: (plan, stats))
+
+    cli.main(["repass"])
+
+    out = capsys.readouterr().out
+    for iid in (7, 8, 9):
+        assert f"item {iid}" in out, f"item {iid} 没被单独报出来——三只桶被并了"
+    assert "没判成" in out and "软删" in out and "日报引用" in out
