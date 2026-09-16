@@ -2927,6 +2927,33 @@ schtasks /change /tn "VIGIL每日管线" /ri 1 /du 0000:02   # 仅作示例；�
 | 4 | 产出日报 | `docs/digests/<昨天>.md` 存在，且库里有对应的 `digests` 行 |
 | 5 | 磁盘上的文件与库里的 `body_md` **逐字节相等** | 见 6.4 |
 
+### 6.3b `StartWhenAvailable` 的端到端验证（**T2 留下的缺口**）
+
+T2 只证明了「设置写对了」（`<StartWhenAvailable>true</StartWhenAvailable>`，controller 已复读 `/xml` 核实），
+**没有**证明「睡眠错过之后真的会补跑」。这两件事不一样——本项目的纪律是"设置对"与"行为对"要分开取证。
+
+**做法**（能睡就睡，不能睡就标 ⏸）：
+
+```powershell
+# 1) 把触发器改到 3 分钟后
+schtasks /change /tn "VIGIL每日管线" /st (Get-Date).AddMinutes(3).ToString("HH:mm")
+
+# 2) 在触发器**之前**让机器睡眠（合盖 / 开始菜单睡眠，或：）
+#    rundll32.exe powrprof.dll,SetSuspendState 0,1,0
+
+# 3) 等过了触发器时间再唤醒
+# 4) 看它有没有在唤醒后补跑：
+Get-ScheduledTaskInfo -TaskName "VIGIL每日管线" | Format-List LastRunTime,LastTaskResult
+```
+
+**通过判据**：`LastRunTime` 落在**唤醒之后**而不是触发器时刻（说明是"补跑"而不是"准时"），
+且 `data/logs/` 里出现对应时间戳的 `═══ vigil daily 开始`。
+
+**⚠️ 做不到就如实标 ⏸**，并写清未验的是什么（"设置值已核实，补跑行为未取到直接证据"）。
+**不许把"设置写对了"写成"补跑验证通过"。**
+
+**做完必须把 `/st` 改回 `08:00`**，并用 `schtasks /query /xml` 确认改回来了。
+
 ### 6.4 归档不变量 + 幂等三连跑（**M4 最重要的机械判据**）
 
 **(a) 归档不变量**（接力文件原文：「`docs/digests/` 的文件集合 == 库里 `digests` 的窗口日期集合，且文件与 `body_md` 逐字节相等」）:
@@ -3039,6 +3066,104 @@ cd D:/github/VIGIL && WORK=$(mktemp -d) && cp data/vigil.db "$WORK/v.db" && echo
 | 词表（本地筛掉 / 送模型 / 候选 / 规则硬丢弃） | §三 3.6 | T5、T6、T8 | ✓ |
 
 > ⚠️ **T6 与 T5 同波**，所以上表里 `store.transaction` / `save_digest(commit=False)` / `RefineStats.candidates` 三行是**波内跨任务接口**——这是 `Mode: wave` 下唯一允许的形式：接口在计划里冻结、两边逐字照抄。**波级窄审查第一件事就是核这三行。**
+
+---
+
+## 八、计划外增补（**执行期发现，审查驱动；终审请读这一节**）
+
+本计划在执行期被 implementer / reviewer 抓出**多处缺陷**，其中若干导致代码或判据的增补。它们只活在 ledger 与派发消息里的话，终审会撞上"diff 里有、计划里查无"的断层——所以汇总在此。
+
+### 8.1 T1：`logs._today()` 时钟缝 + 跨零点测试（**R1 / R9**）
+
+**计划的缺陷**：`DailyFileHandler` 的跨零点换文件逻辑**零覆盖**——把整个方法体换成 `super().emit(record)`，11 条全绿（给了理由，没给判据）。
+
+**更重的一层**：补上判据后**测试第一次跑就红了**——`self._name()` 抛 `TypeError: 'NoneType' object is not callable`。
+根因：**`logging.Handler.__init__` 里有 `self._name = None`**（`set_name` 的存储），把同名方法**遮蔽**了；
+构造时调得动（那次求值在 `super().__init__` 之前），跨零点再调就是 `None()`。
+而 `logging.Handler.handle` **没有** try/except 包住 `emit` ⇒ 异常一路冒到 `logger.info()`
+⇒ **跨零点第一次写日志就掀掉整轮**。**所以它不是"没覆盖"，是"从来跑不通"。**
+
+**增补**：
+- `logs._today()` —— 把"今天"提取成可替换函数（生产路径一律走它），否则跨零点逻辑没法测
+- `DailyFileHandler._name()` → **`_current_path()`**（避让 `logging.Handler._name`）
+- `tests/test_logs.py::test_handler_rolls_over_at_midnight` —— 换掉 `_today` 跨两个零点
+
+### 8.2 T1：三条 Important 判据 + 一条刻意的不对称（**fix loop 第 1 轮**）
+
+| # | 审查发现（实测变异后仍全绿） | 增补 |
+|---|---|---|
+| F1 | `clear_last_error` 变异成 `return None` → 12 条全绿（既有测试都在干净目录里"先清再断言不存在"，no-op 也过） | `test_clear_last_error_actually_removes_the_file` |
+| F2 | `_log_tail` 的 `rows[-lines:]` → `rows[:lines]` → 12 条全绿（唯一断言它的测试只写一行，头尾同一条） | `test_log_tail_returns_the_tail_not_the_head` |
+| F3 | 跨零点重开文件失败时 `OSError` 掀掉整轮 | **裁定保留行为**（见下），补理由 + `test_emit_propagates_log_write_failure` |
+
+**F3 的裁决（刻意的、非不一致）**：`prune_old_logs` 吞 `OSError` 而 `emit` 抛，**不是矛盾**——
+
+| | 失败意味着什么 | 该怎么办 |
+|---|---|---|
+| `prune_old_logs` | **打扫**失败（丢的是历史日志） | 吞掉 + 继续，影响不到本次运行的记录 |
+| `FileHandler.emit` | **本次运行的记录没了** | **抛** |
+
+为什么抛：无人值守下**退出码是唯一还活着的信号**（任务计划丢弃 stderr；磁盘满时 `LAST-ERROR.txt` 也写不出来）。
+这时候静默继续会得到一个 `exit 0 但日志有洞` 的运行——**正是 M4 要消灭的形状**。
+「没人看得见」比「这次没跑完」更糟。代价（磁盘满时 `LAST-ERROR.txt` 也写不出）是物理约束，接受。
+
+### 8.3 T2：任务计划的三处修复（**R5 / R6 / R7 / R11 / R12 / R13 / R14**）
+
+| 计划里的写法 | 实测后果 | 增补 |
+|---|---|---|
+| `register-task.ps1` 用 `$ErrorActionPreference="Stop"` + `schtasks /delete ... 2>$null` | **PS 5.1 把原生命令 stderr 升格成终止性错误** ⇒ 脚本第 1 步就死，**任务根本建不出来** | 该段临时降为 `SilentlyContinue`（正是该文件 `.DESCRIPTION` 自述的意图），用完还原 |
+| 脚本按 UTF-8 **无 BOM** 保存 | ACP=936 的机器把任务名**静默**注册成 `VIGIL姣忔棩绠＄嚎`——伪装成"注册成功" | 加 **UTF-8 BOM**（Windows 上含中文的 `.ps1` 一律要） |
+| `schtasks /create` 的默认设置 | 本机 `PCSystemType=2`（笔记本）：电池上**不启动**、拔电源**被杀**、睡眠**跳过且永不补跑**，三条**全无日志** | `Set-ScheduledTask` 补三个设置 |
+| 用 `New-ScheduledTaskSettingsSet` + `Set-ScheduledTask -Settings` | **整体替换**，顺带 `Task version 1.2→1.3` 且打开 `UseUnifiedSchedulingEngine`——**两个我们没选过的漂移** | 改**先读后改**（`(Get-ScheduledTask).Settings` 上直接赋三个属性）⇒ 漂移全消，`version` 保持 1.2 |
+| 自查判据 `if ($xml -notmatch '<StartWhenAvailable>true')` | `schtasks` 多行输出被 PS 捕获成**数组**，数组上的 `-notmatch` 返回"不匹配的元素"（几乎恒非空）⇒ **判据无条件误报** | 捕获处 `(…) -join "\`n\`"`，三条判据一字未改 |
+
+**刻意不开 `WakeToRun`**：它会**主动唤醒用户的笔记本**（风扇转、屏幕亮），换来的只是"早几小时"。
+`StartWhenAvailable` 已能在机器一可用时补跑，日报本来就是给人白天看的。
+
+### 8.4 T3：`_MIME` 从 `create_app` 局部变量上移到模块级（**R8**）
+
+计划的测试 `assert api._MIME == _EXPECTED` **逐字照抄必跑不了**——`_MIME` 原本是 `create_app` 内的局部变量。
+上移是**纯提升**（字典逐字搬、两个 hunk、键序一致），与 `api.py` 既有的"`WEB_DIST` 必须现读"纪律**不冲突**：
+`WEB_DIST` 要被 monkeypatch 所以必须现读；`_MIME` 是被**断言**的冻结契约，上移正是为了让测试够得着。
+（reviewer 实测确认：`spa` 走**模块全局查找不是闭包捕获**——建 app 后清空 `api._MIME`，404 变 200。）
+
+### 8.5 ⚠️ **给 T7 / T8 的接口警告**（T1 implementer 在 fix loop 里提出的，**必须遵守**）
+
+> 原话：「`exit 0 但日志有洞` 的**最后一跳在 T7/T8** —— 若他们用 `try/except` 包住
+> daily 主体，这条链会在我看不见的文件里**再次断掉**。」
+
+**背景**：T1 刚把 `logs.emit` 的行为钉死为「**写不进日志就抛**」（§8.2 的 F3 裁定），
+理由是无人值守下退出码是唯一存活信号。但这个决定**只有在异常能一路冒到退出码时才成立**——
+而 T7 的 `daily.run()` 每个阶段都有 `try/except Exception`，T8 的 `cmd_daily` 又有一个顶层 `except`。
+
+**T7 与 T8 必须遵守**：
+
+1. **不许在 `logs.emit` 外面套"吞掉并继续"的 `try/except`。** 阶段级的 `except Exception` 捕到
+   `emit` 抛出的 `OSError` 时，**必须让 `RunReport.ok` 为假**（即记成阶段失败），不许吞掉后照常继续。
+2. **`cmd_daily` 的顶层 `except Exception` 必须返回非零**（计划里写的是 `return 1`，照做）。
+   **绝对不许**写成 `except Exception: logs.emit(...); return 0` 之类的"降级成功"。
+3. `logs.write_last_error` 在磁盘满时**自己也会抛**——那没关系（异常继续往上走 ⇒ 退出码仍非零），
+   **但如果 T8 把它包进 `try/except: pass`，整条可见性链就断在这里**。要么不包，要么包了之后
+   **仍然返回非零**。
+4. ⚠️ 该判据钉的是「**异常必须从 `logs.emit` 冒出去**」这条契约，**不是**在模拟真实磁盘满。
+   别把它写成"模拟磁盘满的端到端测试"——那不是它证明的事。
+
+**一句话**：**能吞异常的只有"打扫类"失败（如轮转）。本次运行的记录类失败一律不许吞。**
+
+### 8.6 走查本节的读者请注意
+
+上面**五类增补里有六处**是"计划里的代码在真实环境里根本不工作"，而不是"写得不够好"：
+
+- `logs._name` 跨零点必崩（且只在跨零点崩）
+- `register-task.ps1` 第 1 步就死
+- `schtasks /create` 的默认设置在笔记本上静默漏跑
+- `-notmatch` 对数组恒真的判据
+- brief 的测试够不着局部变量
+- `Set-ScheduledTask -Settings` 带来的未选漂移
+
+**共同形态：全部在边界时刻 / 异常路径 / 真实运行时。** 主流程一直是对的。
+⇒ **写计划时的教训：对"平时不走、出事才走"的那些行，必须先跑一个最小可执行验证再落笔。**
+本节是这条教训的账单。
 
 
 
