@@ -135,12 +135,23 @@ def build_user_prompt(
 
 
 def _parse_deadline(value: object) -> int | None:
-    """把 'YYYY-MM-DD' 转成 unix 秒。解析不了就当没有——不猜。"""
+    """把 'YYYY-MM-DD' 转成 unix 秒。解析不了就当没有——不猜。
+
+    ⚠️ 只捕 ``ValueError`` 是不够的：``"1970-01-01"`` 是**合法日期**，却在
+    ``timestamp()`` 上抛 ``OSError``（实测本机：1970-01-03 之前的日期、
+    以及 4000 年以后的日期都落不进去）。而它恰恰是模型表达「没有截止日」
+    最经典的哨兵——只挡格式不挡范围，等于把最常见的那个值留成了地雷。
+    捕获范围与 ``api._day_start`` 对齐：**格式错的、范围错的都当"没有"处理**。
+
+    ⚠️ 返回值保持"没把握就不猜"：抛异常和返回 None 对调用方是同一件事，
+    但没有第二个人知道要在这里接异常——M3 的接线点（`_to_item`）就在
+    每批 try/except 的**外面**，一个日期串足以掀掉整轮 refine。
+    """
     if not isinstance(value, str) or not value.strip():
         return None
     try:
         return int(dt.datetime.strptime(value.strip(), "%Y-%m-%d").timestamp())
-    except ValueError:
+    except (ValueError, OSError, OverflowError):
         return None
 
 
@@ -375,45 +386,70 @@ def refine(
                 )
                 continue
 
+            # ⚠️ token 累加**留在保护圈外**：token 是真花掉的，本地后处理炸了
+            # 不代表模型没被调用——圈进去会让账目说谎（成功路径行为不变）。
             stats.input_tokens += result.input_tokens
             stats.output_tokens += result.output_tokens
 
-            raw_items = result.payload.get("items")
-            if not isinstance(raw_items, list):
-                raw_items = []
+            # ⚠️ 保护圈**从这一行起，到本批结束**：解析、核验、落库、记账、
+            # 报进度。设计里那句「单批失败不中断整轮」以前只对**网络**失败
+            # 成立——这里的每一步都在上一版 try/except 的圈外，于是一条 item
+            # 带个 ``deadline: "1970-01-01"`` 就能让整轮 refine 抛异常终止：
+            # 前面跑完的批次白跑，剩下的批次永远不跑。
+            # 这是 M1 留下的保护圈缺口，M3 只是又往缺口里塞了一个新调用点
+            # （核验接线），所以修法是**把整段本地后处理挪进圈里**，
+            # 而不是逐个去堵已知的异常类型。
+            try:
+                raw_items = result.payload.get("items")
+                if not isinstance(raw_items, list):
+                    raw_items = []
 
-            produced: list[store.ExtractedItem] = []
-            hit_ids: set[int] = set()
-            for raw in raw_items:
-                if not isinstance(raw, dict):
-                    continue
-                item = _to_item(raw, batch, known_kinds=known_kinds)
-                if item is None:
-                    continue
-                produced.append(item)
-                hit_ids.update(item.src_msg_ids)
+                produced: list[store.ExtractedItem] = []
+                hit_ids: set[int] = set()
+                for raw in raw_items:
+                    if not isinstance(raw, dict):
+                        continue
+                    item = _to_item(raw, batch, known_kinds=known_kinds)
+                    if item is None:
+                        continue
+                    produced.append(item)
+                    hit_ids.update(item.src_msg_ids)
 
-            if produced:
-                produced, dropped = _drop_unsupported_deadlines(produced, batch)
-                stats.deadlines_dropped += dropped
-                stats.items_saved += store.save_items(
-                    conn, produced, model=model, prompt_ver=prompt_ver
-                )
+                if produced:
+                    produced, dropped = _drop_unsupported_deadlines(produced, batch)
+                    stats.deadlines_dropped += dropped
+                    stats.items_saved += store.save_items(
+                        conn, produced, model=model, prompt_ver=prompt_ver
+                    )
 
-            store.record_run(
-                conn, batch_ids, status=store.STATUS_DISCARDED,
-                prompt_ver=prompt_ver,
-            )
-            if hit_ids:
                 store.record_run(
-                    conn, sorted(hit_ids), status=store.STATUS_OK,
-                    prompt_ver=prompt_ver, item_count=len(produced),
+                    conn, batch_ids, status=store.STATUS_DISCARDED,
+                    prompt_ver=prompt_ver,
                 )
+                if hit_ids:
+                    store.record_run(
+                        conn, sorted(hit_ids), status=store.STATUS_OK,
+                        prompt_ver=prompt_ver, item_count=len(produced),
+                    )
 
-            on_progress(
-                f"[refine] 批次 {index}/{len(batches)}：{len(batch)} 条 → "
-                f"{len(produced)} 条 item"
-            )
+                on_progress(
+                    f"[refine] 批次 {index}/{len(batches)}：{len(batch)} 条 → "
+                    f"{len(produced)} 条 item"
+                )
+            except Exception as exc:
+                # 捕 `Exception` 而不是某个具体类型：设计意图是「单批失败不中断
+                # 整轮」，捕窄一类，下一个未知异常类型会**再次**掀掉整轮——
+                # 那正是这次在修的模式（同一类缺陷在本项目已是第三次出现）。
+                # 捕宽的前提是**可见**：异常照样进 stats.errors、照样
+                # on_progress 出来、照样记进 refine_runs；静默吞异常不可接受。
+                msg = f"第 {index} 批本地后处理失败: {exc}"
+                stats.errors.append(msg)
+                on_progress(f"[refine] {msg}")
+                store.record_run(
+                    conn, batch_ids, status=store.STATUS_ERROR,
+                    prompt_ver=prompt_ver, err=str(exc)[:200],
+                )
+                continue
 
         return stats
     finally:

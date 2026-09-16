@@ -40,9 +40,24 @@ def _day_start(day: str, *, plus_days: int = 0) -> int:
 
     ⚠️ 必须用 ``datetime`` 而不是 SQLite 的 ``strftime('%s', ...)``：后者按
     **UTC** 解释同一个日期串，与产品的「本地日」口径差 8 小时（M2 实测记录）。
+
+    ⚠️ 「能解析成日期」与「能表示成 epoch 秒」是**两件事**，所以坏输入有两种
+    形状：``1970-01-01``（早于 epoch）在 ``timestamp()`` 上抛 ``OSError``；
+    ``9999-12-31`` 配 ``plus_days=1`` 连 ``date + timedelta`` 都过不去，抛
+    ``OverflowError``。它们都是**合法日期**，于是径直穿过 ``_parse_day`` 那
+    一关——格式错的给 400、范围错的给 500，是同一个文件里两套错误处理，
+    这正是这次缺陷的成因。所以这里**也要转 400**，与 `_parse_day` 同形。
     """
-    d = _parse_day(day) + dt.timedelta(days=plus_days)
-    return int(dt.datetime.combine(d, dt.time.min).timestamp())
+    try:
+        d = _parse_day(day) + dt.timedelta(days=plus_days)
+        return int(dt.datetime.combine(d, dt.time.min).timestamp())
+    except (OSError, OverflowError, ValueError):
+        # ValueError 其实已被 _parse_day 转成 400 了，多捕它一层只是不让
+        # 任何一条漏网的转换异常有机会变成 500。
+        raise HTTPException(
+            status_code=400,
+            detail=f"日期超出可表示范围（是合法日期，但转不成时间戳），收到：{day}",
+        )
 
 
 def _day_of(ts: int) -> str:
@@ -247,8 +262,11 @@ def create_app(config: Config) -> FastAPI:
         """静态文件 + SPA 兜底。三件事按序：挡 /api、发真文件、发前端入口。
 
         ⚠️ 三条边界都必须挡：
-        * ``/api/*`` **不能**落进兜底——否则 `GET /api/typo` 会返回 200 的 HTML，
-          调用方 ``r.json()`` 直接炸，而真正的 404 被吞掉。
+        * ``/api`` 与 ``/api/*`` **都不能**落进兜底——否则 `GET /api/typo` 会返回
+          200 的 HTML，调用方 ``r.json()`` 直接炸，而真正的 404 被吞掉。
+          裸 ``/api`` 必须**单独**判：``startswith("api/")`` 漏掉它（``"api"``
+          不以 ``"api/"`` 开头，曾是实测的漏网口），而 ``startswith("api")``
+          又会把将来的 ``/apiary`` 之类一起吞掉——守卫精确到这两个形状。
         * **真存在的静态文件必须先发**（见上面 _MIME 的说明）。
         * 前端**没构建**时不许返回空白页，要明说「去跑 npm run build」——
           与日报同一条规矩：只说自己有资格说的话，没构建就说没构建。
@@ -258,7 +276,9 @@ def create_app(config: Config) -> FastAPI:
         它，冻住的话那些测试测的还是真实 web/dist（本机已构建，于是全都变成
         「怎么改都绿」的空守卫）。
         """
-        if full_path.startswith("api/"):
+        # 裸 "api" 必须单列（见 docstring）：只用 startswith("api/") 时
+        # `GET /api` 会一路走到 SPA 兜底，返回 200 的 HTML。
+        if full_path == "api" or full_path.startswith("api/"):
             raise HTTPException(status_code=404, detail=f"没有这个端点：/{full_path}")
 
         dist_root = WEB_DIST.resolve()
