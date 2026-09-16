@@ -933,18 +933,49 @@ def _persist(
     无意义 diff，而且「库副本 == 文件副本」这条不变量**没法用最自然的写法
     断言**——只能打折扣按文本比，那种折扣正是将来出事的入口。
     """
-    stats.digest_id = store.save_digest(
-        conn,
-        window_from=stats.window_from,
-        window_to=stats.window_to,
-        body_md=body,
-        model=model,
-        prompt_ver=prompt_ver,
-        item_ids=item_ids,
-    )
-    if write_file:
-        path = out_dir / f"{day_label}.md"
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(body, encoding="utf-8", newline="\n")
-        stats.output_path = str(path)
+    # ⚠️ 写库与落文件必须在**同一个事务**里，且顺序是「先写临时文件 → 原子改名
+    # → 再提交库」。理由与两种旧写法的坏处：
+    #
+    #   · 旧版先 `save_digest`（自己 commit）再 `write_text`：落盘失败会留下
+    #     一个没有 .md 的库行，归档不变量（文件集合 == 窗口日期集合）当场
+    #     破掉，而没有任何东西会报错。
+    #   · 直接 `write_text` 是「截断原文件再写」：写到一半失败会让**上一版**
+    #     日报变成半截文件——而 docs/digests/ 是**归档**，它唯一的价值就是完整。
+    #     所以先写 `.md.tmp` 再用 `Path.replace` 原子改名（同目录内改名，
+    #     Windows 上也是原子的）。
+    #
+    # 落盘失败 ⇒ 事务回滚 ⇒ 库行与文件都没有，且异常照常抛给调用方
+    # （`vigil daily` 记进 LAST-ERROR.txt 并返回非零；`vigil digest` 直接
+    # 冒泡成 traceback、退出码非零——两条都**不是**静默），重跑
+    # `vigil digest --date <day>` 即可。
+    with store.transaction(conn):
+        stats.digest_id = store.save_digest(
+            conn,
+            window_from=stats.window_from,
+            window_to=stats.window_to,
+            body_md=body,
+            model=model,
+            prompt_ver=prompt_ver,
+            item_ids=item_ids,
+            commit=False,
+        )
+        if write_file:
+            path = out_dir / f"{day_label}.md"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_name(path.name + ".tmp")
+            try:
+                tmp.write_text(body, encoding="utf-8", newline="\n")
+                tmp.replace(path)
+            except BaseException:
+                # ⚠️ 失败不许把残骸留在归档目录里。不变量按原文是
+                # 「`docs/digests/` 的**文件集合** == 库里的窗口日期集合」，
+                # 一个没人引用的 `.md.tmp` 是同一个洞的镜像破法——而且是
+                # 本写法自己引入的（旧的直接 `write_text` 从不产生 .tmp）。
+                # 清理失败不遮住原异常：用户该看到的是「落盘为什么失败」。
+                try:
+                    tmp.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                raise
+            stats.output_path = str(path)
     return stats

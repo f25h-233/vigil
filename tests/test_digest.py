@@ -2065,3 +2065,138 @@ def test_deadline_supported_is_the_shared_module_not_a_local_copy():
     from vigil import deadline
 
     assert digest.deadline_supported is deadline.deadline_supported
+
+
+# ── M4 T6：落盘失败不许留下"库里有、文件没有"的日报 ────────────────
+
+
+def _break_digest_file_write(monkeypatch, *, partial=False):
+    """把「日报落盘」这一步变成必炸。
+
+    ⚠️ **两种目标都要炸**：旧写法直接写 `YYYY-MM-DD.md`，新写法先写
+    `.md.tmp` 再原子改名。注入若只认其中一种，M2（把 `tmp.replace(path)`
+    换回 `path.write_text`）就会让测试「因为换了写法」而变红/变绿——那样
+    守的成了实现细节，而不是「库什么时候提交」。两种都炸，M1/M2 的结论
+    才只取决于提交顺序。
+
+    `partial=False`：一个字节都没写就抛（权限拒绝、目录不存在那种）。
+    `partial=True`：**先写一半再抛**——磁盘满的真实形状正是「文件已经被
+    截断成半截」。
+
+    注入点选 `Path.write_text` 是因为它是 `_persist` 落盘分支里**唯一**
+    写字节的那一步（`tmp.replace` 只是改名，不写内容）；按后缀放行其它
+    写入，避免误伤测试自身的文件操作。
+    """
+    real_write_text = Path.write_text
+
+    def fake_write_text(self, data, *args, **kwargs):
+        if self.name.endswith((".md", ".md.tmp")):
+            if partial:
+                self.write_bytes(data[: max(1, len(data) // 2)].encode("utf-8"))
+            raise OSError(28, "No space left on device", str(self))
+        return real_write_text(self, data, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "write_text", fake_write_text)
+
+
+def test_persist_rolls_back_db_when_file_write_fails(seeded, monkeypatch, tmp_path):
+    """⭐ 归档不变量的守护。
+
+    不变量（接力文件原文）：`docs/digests/` 的文件集合 == 库里 `digests` 的
+    窗口日期集合。旧 `_persist` **先写库、后写文件**，文件那步失败就留下
+    一个没有 `.md` 的库行——不变量当场破掉，而没有任何东西会报错。
+    修好后两者在同一事务里：文件写失败 ⇒ 库行一并回滚，两者都没有。
+
+    变异反证：M1（删掉 `commit=False`）→ 本条红（`count(*)` 变成 1）。
+    """
+    conn, since, until = seeded
+    monkeypatch.setattr(
+        "vigil.digest.chat_json",
+        _FakeLLM([{"quotes": ["体检表", "讲座"], "label": "全部", "text": ""}]),
+    )
+    _break_digest_file_write(monkeypatch)
+
+    with pytest.raises(OSError) as excinfo:
+        digest.digest(_Config({100: "班级群", 200: "新生群"}), api_key="k",
+                      conn=conn, since=since, until=until,
+                      day_label="2026-09-13", output_dir=tmp_path)
+
+    # 失败必须**看得见**：异常照常抛给调用方（CLI/daily 转成非零退出）。
+    # 断言错误原文而不只断言类型——别的 OSError 也满足类型，只有这句是
+    # 「落盘那一步炸的」的证据（注入没生效时这条先红，不会假绿）。
+    assert "No space left on device" in str(excinfo.value)
+    assert conn.execute("SELECT COUNT(*) FROM digests").fetchone()[0] == 0
+    assert not (tmp_path / "2026-09-13.md").exists()
+
+
+def test_persist_failed_rerun_changes_neither_file_nor_db(seeded, monkeypatch,
+                                                          tmp_path):
+    """⚠️ 失败的重跑必须**什么都没改**：归档与库都停在上一版。
+
+    三件都要钉，缺哪件就有变异存活：
+
+    · **文件**：直接 `write_text` 是「截断原文件再写」，写到一半失败会把
+      **上一版**日报砸成半截——而归档唯一的价值就是完整。所以落盘走
+      `.md.tmp` → `Path.replace`（同目录改名，Windows 上也是原子的）。
+    · **库**：`save_digest(commit=False)` 的 DELETE+INSERT 回滚后，库里必须
+      还是**上一版**那一行。只在文件那半边回滚是不够的：不变量是「文件 ==
+      库」，两边都得停在原地。
+    · **目录**：失败不许在归档目录里留下 `.md.tmp`。不变量按原文是
+      「`docs/digests/` 的**文件集合** == 窗口日期集合」——一个没人引用的
+      残留文件正是同一个洞的镜像（而且这种写法是 T6 自己引入的）。
+
+    变异反证：删掉失败分支的 `tmp.unlink` → 目录那条红；M2（`tmp.replace` →
+    `path.write_text`）→ 文件那条红。
+    """
+    conn, since, until = seeded
+    cfg = _Config({100: "班级群", 200: "新生群"})
+    monkeypatch.setattr("vigil.digest.chat_json", _FakeLLM([
+        {"quotes": ["体检表", "讲座"], "label": "第一版", "text": ""}]))
+    digest.digest(cfg, api_key="k", conn=conn, since=since, until=until,
+                  day_label="2026-09-13", output_dir=tmp_path)
+
+    path = tmp_path / "2026-09-13.md"
+    file_before = path.read_bytes()
+    db_before = conn.execute(
+        "SELECT body_md FROM digests WHERE window_from=? AND window_to=?",
+        (since, until),
+    ).fetchone()[0]
+    # 前提：第一版真的落了盘、入了库（否则下面的断言在空集上恒真）
+    assert file_before and "第一版" in db_before
+
+    # 第二次：正文换成第二版，但落盘写到一半就炸
+    monkeypatch.setattr("vigil.digest.chat_json", _FakeLLM([
+        {"quotes": ["体检表", "讲座"], "label": "第二版", "text": ""}]))
+    _break_digest_file_write(monkeypatch, partial=True)
+
+    with pytest.raises(OSError):
+        digest.digest(cfg, api_key="k", conn=conn, since=since, until=until,
+                      day_label="2026-09-13", output_dir=tmp_path)
+
+    assert [p.name for p in tmp_path.iterdir()] == ["2026-09-13.md"], \
+        "归档目录里留下了残骸（半截 .md.tmp）"
+    assert path.read_bytes() == file_before, "上一版日报被砸烂了"
+    assert conn.execute(
+        "SELECT body_md FROM digests WHERE window_from=? AND window_to=?",
+        (since, until),
+    ).fetchone()[0] == db_before, "库里被换成了第二版"
+
+
+def test_persist_leaves_no_tmp_file_behind(seeded, monkeypatch, tmp_path):
+    """成功的运行也不许在归档目录里留下 `.md.tmp`。
+
+    不变量是按**文件集合**说的（`docs/digests/` 的文件集合 == 库里的窗口
+    日期集合），所以临时文件只许活在「写 → 改名」之间那一瞬。变异 M2
+    （`tmp.replace(path)` → `path.write_text(body, ...)`）在**成功路径**上
+    每次都会留一个 `.md.tmp`：库里有一行、目录里多一个没人引用的文件——
+    正是这条不变量要防的那个洞的镜像。`assert` 用集合相等而不是
+    「`.tmp` 不存在」，这样「多出别的残骸」也会被抓住。
+    """
+    conn, since, until = seeded
+    monkeypatch.setattr("vigil.digest.chat_json", _FakeLLM([
+        {"quotes": ["体检表", "讲座"], "label": "全部", "text": ""}]))
+    digest.digest(_Config({100: "班级群", 200: "新生群"}), api_key="k", conn=conn,
+                  since=since, until=until, day_label="2026-09-13",
+                  output_dir=tmp_path)
+
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["2026-09-13.md"]
