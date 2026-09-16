@@ -483,3 +483,60 @@ def test_traversal_test_has_detection_power(client, tmp_path, monkeypatch):
     monkeypatch.setattr(api, "WEB_DIST", dist)
 
     assert "VIGIL_DB_KEY" in client.get("/.env").text    # 能读到 → 上一条不是空的
+
+
+# ── M4 T3：_MIME 的「键缺失」守卫（M3-1）──────────────────────────────
+#
+# ⚠️ 这张表是**故意与 vigil/api.py 的 _MIME 重复**的，不要改成
+# `for suffix in api._MIME`——那样就变成空守卫了：从 _MIME 里删掉一个键，
+# 参数集合同步缩小一个，测试**照样绿**，而缺陷（缺文件时不再 404、
+# 改成返回 200 的 index.html）原封不动。要抓的就是"键少了"这件事，
+# 判据就必须独立于它。
+_EXPECTED_STATIC_SUFFIXES = {
+    ".js": "text/javascript",
+    ".css": "text/css",
+    ".webmanifest": "application/manifest+json",
+    ".json": "application/json",
+    ".png": "image/png",
+    ".svg": "image/svg+xml",
+    ".ico": "image/x-icon",
+    ".woff2": "font/woff2",
+    ".txt": "text/plain",
+}
+
+
+def test_mime_table_matches_the_frozen_contract():
+    """键与值都钉死。
+
+    值被改（`.js` → `text/html`）与键被删（少了 `.js`）**都要红**：
+    前者让浏览器拒绝执行脚本，后者让「缺文件宁 404」那条守卫失效——
+    两种都只有真跑才现形，所以靠这张独立的表当判据。
+    """
+    import vigil.api as api
+
+    assert api._MIME == _EXPECTED_STATIC_SUFFIXES
+
+
+@pytest.mark.parametrize("suffix", sorted(_EXPECTED_STATIC_SUFFIXES))
+def test_missing_static_asset_is_404_not_index_html(
+    client, tmp_path, monkeypatch, suffix
+):
+    """⭐ 「职责二」的守卫：磁盘上没有的静态资源宁可 404，绝不许拿 index.html 顶。
+
+    这条是 M3-1 的核心——删掉 `_MIME` 里任意一个键，**这一条会红**，
+    因为该后缀不再被判为静态资源，请求会落进 SPA 兜底拿到 200 的 HTML。
+    """
+    import vigil.api as api
+
+    dist = tmp_path / "dist"
+    dist.mkdir()
+    (dist / "index.html").write_text("<html>INDEX</html>", encoding="utf-8")
+    monkeypatch.setattr(api, "WEB_DIST", dist)
+
+    r = client.get(f"/不存在{suffix}")
+
+    assert r.status_code == 404, (
+        f"{suffix} 是静态资源后缀，磁盘上没有就必须 404——"
+        f"拿到 {r.status_code} 说明它落进了 SPA 兜底"
+    )
+    assert "INDEX" not in r.text, "绝不许把 index.html 当静态资源发出去"

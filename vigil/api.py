@@ -25,6 +25,33 @@ WEB_DIST = REPO_ROOT / "web" / "dist"
 
 MAX_LIMIT = 200
 
+# ⚠️ 这张表同时承担**两个**职责，动它之前先看清两种后果不一样：
+#
+#   1) 真文件发出去时的 media type：`FileResponse(..., media_type=_MIME.get(suffix))`。
+#      **删掉某个键，这里照样对**——`media_type=None` 时 Starlette 会回落到
+#      `mimetypes.guess_type`（实测 `.js → text/javascript`）。
+#   2) 「这个后缀是静态资源、不是前端路由」的判据：`if suffix in _MIME: 404`。
+#      **删掉同一个键，这里静默坏掉**——该后缀不再被判为静态资源，缺文件时
+#      一路落进 SPA 兜底，返回 **200 的 index.html**。
+#
+# 于是「删键」的后果**只**出现在职责二上，而所有只看 content-type 的测试都抓不到
+# （浏览器把 HTML 当 JS/manifest 解析失败，而状态码全是 200——正是上面那段
+# 注释里实测过的同一类假绿）。键与值都被 `tests/test_api.py` 逐字钉死。
+#
+# 定义在**模块级**而不是 `create_app` 内部：它是被测试直接断言的冻结契约
+# （`api._MIME`）。放进 `create_app` 里，测试就够不着这张表了。
+_MIME = {
+    ".js": "text/javascript",
+    ".css": "text/css",
+    ".webmanifest": "application/manifest+json",
+    ".json": "application/json",
+    ".png": "image/png",
+    ".svg": "image/svg+xml",
+    ".ico": "image/x-icon",
+    ".woff2": "font/woff2",
+    ".txt": "text/plain",
+}
+
 
 def _parse_day(day: str) -> dt.date:
     try:
@@ -245,18 +272,6 @@ def create_app(config: Config) -> FastAPI:
     # 后果是浏览器把 HTML 当 manifest 解析、把 HTML 当 Service Worker 注册
     # （MIME 不符直接失败），「添加到主屏」整条路走不通——**而所有状态码都是
     # 200，日志上一个异常都没有**。这类缺陷只有真跑进程才现形。
-    _MIME = {
-        ".js": "text/javascript",
-        ".css": "text/css",
-        ".webmanifest": "application/manifest+json",
-        ".json": "application/json",
-        ".png": "image/png",
-        ".svg": "image/svg+xml",
-        ".ico": "image/x-icon",
-        ".woff2": "font/woff2",
-        ".txt": "text/plain",
-    }
-
     @app.get("/{full_path:path}", include_in_schema=False)
     def spa(full_path: str):
         """静态文件 + SPA 兜底。三件事按序：挡 /api、发真文件、发前端入口。
