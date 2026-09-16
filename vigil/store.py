@@ -402,12 +402,19 @@ def window_items(
 
     （旧注释曾称锚点「隐式依赖」本函数顺序，那是**错的因果**：结论「顺序不能改」
     成立，但理由不是锚点，而是机械补行序与出网 payload 序。已修正。）
+
+    ⚠️ **人工干预层必须在这里生效**：被软删的条目不进日报，被改过类目的条目
+    按新类目进日报。`digest.py` 不直接读 `items`——它走本函数，
+    所以**这一处就是日报侧的全部接入点**（spec §3.3 实测）。
     """
+    _ensure_overlay(conn)
     rows = conn.execute(
-        "SELECT item_id, kind, title, detail, event_ts, deadline_ts,"
-        " group_id, place, amount, confidence"
-        " FROM items WHERE event_ts >= ? AND event_ts < ?"
-        " ORDER BY event_ts ASC, item_id ASC",
+        "SELECT i.item_id, COALESCE(ost.kind, i.kind), i.title, i.detail, i.event_ts,"
+        " i.deadline_ts, i.group_id, i.place, i.amount, i.confidence"
+        " FROM items i"
+        " LEFT JOIN ov.item_state ost ON ost.item_id = i.item_id"
+        f" WHERE i.event_ts >= ? AND i.event_ts < ? AND {_NOT_DELETED}"
+        " ORDER BY i.event_ts ASC, i.item_id ASC",
         (since, until),
     ).fetchall()
     return [WindowItem(*row) for row in rows]
@@ -716,8 +723,26 @@ class DigestRow:
     item_count: int
 
 
+def _ensure_overlay(conn: sqlite3.Connection) -> None:
+    """确保人工干预层已挂成 `ov`。**每个走 `_ITEM_COLS` 的查询入口都要调。**
+
+    ⚠️ 做成"入口自 attach"而不是"调用方先 attach"，是**结构性**的防线：
+    SQL 里写了 `ov.item_state` 而没人挂载时，报的是运行时的
+    `no such table`——一个漏掉的调用方就是一个 500。
+    自 attach 之后，「忘记」在结构上不可能发生（R13 的落点）。
+
+    ⚠️ 局部 import：`store` 与 `overrides` 谁先被 import 都不该出问题。
+    （Task 4 实测：其实**不存在**模块级环，`overrides` 只 import 标准库与 `config`；
+     局部 import 无害、又省掉每次 import 的代价——留着，但别照抄"会成环"这个错论证。）
+    """
+    from . import overrides
+
+    overrides.attach_readonly(conn)
+
+
 _ITEM_COLS = (
-    "i.item_id, i.kind, i.title, i.detail, i.event_ts, i.deadline_ts, i.group_id,"
+    "i.item_id, COALESCE(ost.kind, i.kind) AS kind, i.title, i.detail, i.event_ts,"
+    " i.deadline_ts, i.group_id,"
     " COALESCE(NULLIF(sn.group_nick, ''), NULLIF(sn.qq_nick, ''), '') AS actor,"
     " i.place, i.amount, i.links,"
     " (SELECT COUNT(*) FROM item_sources src WHERE src.item_id = i.item_id)"
@@ -727,7 +752,13 @@ _ITEM_COLS = (
 _ITEM_JOINS = (
     " FROM items i"
     " LEFT JOIN sender_names sn ON sn.group_id = i.group_id AND sn.uid = i.actor_uid"
+    " LEFT JOIN ov.item_state ost ON ost.item_id = i.item_id"
 )
+
+# ⚠️ 软删的条目在**所有**读取路径上都必须消失（D15）。拼进 `_ITEM_JOINS` 的
+# `WHERE` 片段单独定义，是为了让"哪几处用了它"一眼可数——
+# 漏掉任何一处的后果是「界面上删了、日报里还在」（R13）。
+_NOT_DELETED = "IFNULL(ost.deleted, 0) = 0"
 
 
 def _parse_links(raw: object) -> tuple[str, ...]:
@@ -775,10 +806,11 @@ def _item_filters(
     q: str | None,
 ) -> tuple[list[str], list[object]]:
     """拼 WHERE 片段。**关键词的两条路径在这里分岔**（trigram / LIKE）。"""
-    where: list[str] = []
+    where: list[str] = [_NOT_DELETED]
     params: list[object] = []
     if kind:
-        where.append("i.kind = ?")
+        # ⚠️ 按**覆盖后**的类目筛——否则界面上改了分类却筛不出来。
+        where.append("COALESCE(ost.kind, i.kind) = ?")
         params.append(kind)
     if since is not None:
         where.append("i.event_ts >= ?")
@@ -830,12 +862,18 @@ def search_items(
     ⚠️ 与 ``window_items`` 的 ASC 不同是**故意的**：日报按时间顺着读，
     信息流按时间倒着看。两处都不许「顺手改成一致」。
     """
+    _ensure_overlay(conn)
     where, params = _item_filters(
         kind=kind, since=since, until=until, group=group, q=q
     )
     clause = (" WHERE " + " AND ".join(where)) if where else ""
+    # ⚠️ 总数也要走同一套 JOIN/过滤——否则分页与「共 N 条」会说谎。
     total = int(
-        conn.execute(f"SELECT COUNT(*) FROM items i{clause}", params).fetchone()[0]
+        conn.execute(
+            f"SELECT COUNT(*) FROM items i"
+            f" LEFT JOIN ov.item_state ost ON ost.item_id = i.item_id{clause}",
+            params,
+        ).fetchone()[0]
     )
     rows = conn.execute(
         f"SELECT {_ITEM_COLS}{_ITEM_JOINS}{clause}"
@@ -847,8 +885,10 @@ def search_items(
 
 def get_item(conn: sqlite3.Connection, item_id: int) -> ApiItem | None:
     """单条条目；不存在返回 None（由调用方决定 404 的形状）。"""
+    _ensure_overlay(conn)
     row = conn.execute(
-        f"SELECT {_ITEM_COLS}{_ITEM_JOINS} WHERE i.item_id = ?", (item_id,)
+        f"SELECT {_ITEM_COLS}{_ITEM_JOINS} WHERE i.item_id = ? AND {_NOT_DELETED}",
+        (item_id,),
     ).fetchone()
     return _to_api_item(row) if row else None
 
@@ -877,10 +917,15 @@ def source_messages(conn: sqlite3.Connection, item_id: int) -> list[SourceRow]:
 
 
 def kind_counts(conn: sqlite3.Connection) -> dict[str, int]:
-    """每个类目有多少条。类目视图的角标用它。"""
+    """每个类目有多少条（**按覆盖后的类目**，且不含软删）。类目视图的角标用它。"""
+    _ensure_overlay(conn)
     return {
         str(k): int(n)
-        for k, n in conn.execute("SELECT kind, COUNT(*) FROM items GROUP BY kind")
+        for k, n in conn.execute(
+            "SELECT COALESCE(ost.kind, i.kind), COUNT(*) FROM items i"
+            " LEFT JOIN ov.item_state ost ON ost.item_id = i.item_id"
+            f" WHERE {_NOT_DELETED} GROUP BY COALESCE(ost.kind, i.kind)"
+        )
     }
 
 
@@ -908,11 +953,16 @@ def get_digest(conn: sqlite3.Connection, digest_id: int) -> DigestRow | None:
 
 
 def digest_items(conn: sqlite3.Connection, digest_id: int) -> list[ApiItem]:
-    """一篇日报引用的条目，按 ``(event_ts, item_id)`` 升序——与日报正文同序。"""
+    """一篇日报引用的条目，按 ``(event_ts, item_id)`` 升序——与日报正文同序。
+
+    ⚠️ 软删的条目在这里也必须消失：`/api/digests/{id}` 的条目清单
+    与日报正文是**同一份数据的两处显示**，缺一边就是 R13。
+    """
+    _ensure_overlay(conn)
     rows = conn.execute(
         f"SELECT {_ITEM_COLS}{_ITEM_JOINS}"
         " JOIN digest_items di ON di.item_id = i.item_id"
-        " WHERE di.digest_id = ?"
+        f" WHERE di.digest_id = ? AND {_NOT_DELETED}"
         " ORDER BY i.event_ts ASC, i.item_id ASC",
         (digest_id,),
     ).fetchall()

@@ -1,4 +1,10 @@
-"""持久化层的测试。全部用内存库，不碰 data/vigil.db。"""
+"""持久化层的测试。全部用内存库，不碰 data/vigil.db。
+
+⚠️ Task 5 起，本文件里**每个** `sqlite3.connect(":memory:", ...)` 都带 `uri=True`：
+查询层入口会 `ATTACH 'file:...?mode=ro'`，而 URI 形式只在连接带
+`SQLITE_OPEN_URI` 时才被解析（Task 4 实测、T5 复核）。对 `:memory:` 而言这个标志
+不影响任何行为，与生产侧三处连接的补齐（裁决 R4）是同一件事。
+"""
 
 from __future__ import annotations
 
@@ -6,6 +12,7 @@ import sqlite3
 
 import pytest
 
+from vigil import overrides
 from vigil import store
 from vigil.store import ExtractedItem, PendingMessage
 
@@ -678,7 +685,7 @@ def _insert_message(
 
 
 def test_items_with_deadline_only_returns_rows_that_have_one():
-    conn = sqlite3.connect(":memory:")
+    conn = sqlite3.connect(":memory:", uri=True)
     store.ensure_schema(conn)
     _insert_item(conn, 1, deadline_ts=1000)
     _insert_item(conn, 2, deadline_ts=None)
@@ -694,7 +701,7 @@ def test_clear_deadlines_only_touches_that_column():
     唯一一处对真库的不可逆写操作（`vigil deadline-audit --apply` 直接改
     `data/vigil.db`），忽略参数就等于**静默清掉全库的截止日**。
     """
-    conn = sqlite3.connect(":memory:")
+    conn = sqlite3.connect(":memory:", uri=True)
     store.ensure_schema(conn)
     _insert_item(conn, 1, deadline_ts=1000)
     _insert_item(conn, 2, deadline_ts=2000)
@@ -724,7 +731,7 @@ def test_clear_deadlines_only_touches_that_column():
 
 
 def test_clear_deadlines_with_empty_list_is_a_noop():
-    conn = sqlite3.connect(":memory:")
+    conn = sqlite3.connect(":memory:", uri=True)
     store.ensure_schema(conn)
     assert store.clear_deadlines(conn, []) == 0
 
@@ -739,7 +746,7 @@ def test_search_finds_two_chinese_chars_via_like_fallback():
     而中文双字词（「选课」「讲座」）恰恰是最常见的查询。
     没有 LIKE 兜底的话，「搜不到」会被读成「库里没有」。
     """
-    conn = sqlite3.connect(":memory:")
+    conn = sqlite3.connect(":memory:", uri=True)
     store.ensure_schema(conn)
     _insert_item(conn, 1, title="选课通知", kind="academic")
     _insert_item(conn, 2, title="失物招领", kind="lostfound")
@@ -748,7 +755,7 @@ def test_search_finds_two_chinese_chars_via_like_fallback():
 
 
 def test_search_finds_three_chinese_chars_via_trigram():
-    conn = sqlite3.connect(":memory:")
+    conn = sqlite3.connect(":memory:", uri=True)
     store.ensure_schema(conn)
     _insert_item(conn, 1, title="校园卡补办", kind="life")
     items, total = store.search_items(conn, q="校园卡")
@@ -761,7 +768,7 @@ def test_search_survives_fts5_syntax_characters():
     ⚠️ **必须带断言 + 阳性对照**。「调用一下不抛异常」是空守卫：
     搜索整个坏掉（永远返回 0）时，它照样绿。
     """
-    conn = sqlite3.connect(":memory:")
+    conn = sqlite3.connect(":memory:", uri=True)
     store.ensure_schema(conn)
     _insert_item(conn, 1, title="选课通知", kind="academic")
     for q in ["NOT", 'a"b', "(", "补退选 -卡", "a OR b"]:
@@ -776,7 +783,7 @@ def test_search_survives_fts5_syntax_characters():
 
 def test_search_escapes_like_wildcards():
     """`%` 不转义就会匹配一切——那是个假数字。"""
-    conn = sqlite3.connect(":memory:")
+    conn = sqlite3.connect(":memory:", uri=True)
     store.ensure_schema(conn)
     _insert_item(conn, 1, title="选课通知", kind="academic")
     _, total = store.search_items(conn, q="%")
@@ -799,7 +806,7 @@ def test_search_strips_nul_before_the_trigram_branch():
     ⚠️ 阳性对照不是可选项：只断言「NUL 查询不抛异常」的话，
     「搜索整个坏掉、永远返 0」也照样绿。所以紧跟一个**不带 NUL 的同义查询**。
     """
-    conn = sqlite3.connect(":memory:")
+    conn = sqlite3.connect(":memory:", uri=True)
     _seed_two_items_for_search(conn)
 
     assert store.search_items(conn, q="\x00选课通知")[1] == 1
@@ -819,7 +826,7 @@ def test_search_strips_nul_before_the_like_branch():
 
     ⚠️ 阳性对照同上：每条 NUL 查询都配一条不带 NUL 的同义查询。
     """
-    conn = sqlite3.connect(":memory:")
+    conn = sqlite3.connect(":memory:", uri=True)
     _seed_two_items_for_search(conn)
 
     # 正确答案 1；不净化时 LIKE 被截断成 '%' → 2（全表）
@@ -835,7 +842,7 @@ def test_search_strips_nul_before_the_like_branch():
 
 
 def test_search_filters_by_kind_and_window():
-    conn = sqlite3.connect(":memory:")
+    conn = sqlite3.connect(":memory:", uri=True)
     store.ensure_schema(conn)
     _insert_item(conn, 1, kind="academic", event_ts=100)
     _insert_item(conn, 2, kind="job", event_ts=200)
@@ -846,7 +853,7 @@ def test_search_filters_by_kind_and_window():
 
 def test_search_is_newest_first():
     """信息流按时间倒着看。⚠️ 与 window_items 的 ASC 不同是**故意的**。"""
-    conn = sqlite3.connect(":memory:")
+    conn = sqlite3.connect(":memory:", uri=True)
     store.ensure_schema(conn)
     _insert_item(conn, 1, event_ts=100)
     _insert_item(conn, 2, event_ts=200)
@@ -855,7 +862,7 @@ def test_search_is_newest_first():
 
 
 def test_source_messages_returns_the_linked_messages():
-    conn = sqlite3.connect(":memory:")
+    conn = sqlite3.connect(":memory:", uri=True)
     store.ensure_schema(conn)
     _insert_item(conn, 1)
     _insert_message(conn, 11, content="原文在这里")
@@ -865,7 +872,7 @@ def test_source_messages_returns_the_linked_messages():
 
 
 def test_source_messages_of_unknown_item_is_empty():
-    conn = sqlite3.connect(":memory:")
+    conn = sqlite3.connect(":memory:", uri=True)
     store.ensure_schema(conn)
     # ⚠️ 偏差（逃逸舱）：brief 原版没有这一行。`source_messages` JOIN `messages`，
     # 而 SQLite **在 prepare 阶段**就报 `no such table: messages`——哪怕 WHERE
@@ -876,7 +883,7 @@ def test_source_messages_of_unknown_item_is_empty():
 
 
 def test_digest_items_are_in_ascending_order_like_the_digest_body():
-    conn = sqlite3.connect(":memory:")
+    conn = sqlite3.connect(":memory:", uri=True)
     store.ensure_schema(conn)
     _insert_item(conn, 1, event_ts=200)
     _insert_item(conn, 2, event_ts=100)
@@ -889,7 +896,7 @@ def test_digest_items_are_in_ascending_order_like_the_digest_body():
 
 
 def test_kind_counts_groups_by_kind():
-    conn = sqlite3.connect(":memory:")
+    conn = sqlite3.connect(":memory:", uri=True)
     store.ensure_schema(conn)
     _insert_item(conn, 1, kind="academic")
     _insert_item(conn, 2, kind="academic")
@@ -908,7 +915,7 @@ def test_kind_counts_groups_by_kind():
 
 
 def test_get_item_maps_every_column_or_none():
-    conn = sqlite3.connect(":memory:")
+    conn = sqlite3.connect(":memory:", uri=True)
     store.ensure_schema(conn)
     _ensure_message_tables(conn)
     conn.execute(
@@ -942,7 +949,7 @@ def test_get_digest_matches_the_row_field_by_field():
     所以这里断言**整个 dataclass 相等**，而不是抽查一两个字段。
     变异反证：把 `get_digest` 的 SELECT 里任意两列对调，这条立刻变红。
     """
-    conn = sqlite3.connect(":memory:")
+    conn = sqlite3.connect(":memory:", uri=True)
     store.ensure_schema(conn)
     conn.execute(
         "INSERT INTO digests (digest_id, window_from, window_to, body_md, model,"
@@ -968,7 +975,7 @@ def test_search_total_is_independent_of_limit_and_offset():
     一旦把 total 实现成 `len(rows)`，按钮要么永远不出现、要么空转永远点不完，
     而且**接口不报错**（数字看着还很像样）。
     """
-    conn = sqlite3.connect(":memory:")
+    conn = sqlite3.connect(":memory:", uri=True)
     store.ensure_schema(conn)
     for i in (1, 2, 3):
         _insert_item(conn, i, event_ts=1000 + i)
@@ -989,7 +996,7 @@ def test_ensure_schema_rebuilds_the_index_for_rows_that_predate_it():
     这条立刻变红（而其余 12 个搜索用例**照样全绿**——它们都在 ensure_schema
     之后才插数据，触发器兜住了，这正是本条存在的理由）。
     """
-    conn = sqlite3.connect(":memory:")
+    conn = sqlite3.connect(":memory:", uri=True)
     conn.executescript(store._ITEMS_DDL)   # 只有 items：索引尚不存在的状态
     _insert_item(conn, 1, title="校园卡补办")
 
@@ -1001,7 +1008,7 @@ def test_ensure_schema_rebuilds_the_index_for_rows_that_predate_it():
 
 def test_list_digests_is_newest_window_first():
     """日报列表按窗口倒序（最近的在前），且带上每条引用了多少条目。"""
-    conn = sqlite3.connect(":memory:")
+    conn = sqlite3.connect(":memory:", uri=True)
     store.ensure_schema(conn)
     for did, wf in ((1, 100), (2, 200)):
         conn.execute(
@@ -1105,9 +1112,9 @@ def test_save_digest_is_atomic():
 
     ⚠️ 这条不用 ``memdb`` 夹具：注入点需要 ``factory=`` 的子类连接
     （见 ``_InsertIntoDigestsFails`` 的说明），``memdb`` 给的是普通连接。
-    连接本身仍是 ``sqlite3.connect(":memory:")``——与夹具同一个形状。
+    连接本身仍是 ``sqlite3.connect(":memory:", uri=True)``——与夹具同一个形状。
     """
-    conn = sqlite3.connect(":memory:", factory=_InsertIntoDigestsFails)
+    conn = sqlite3.connect(":memory:", uri=True, factory=_InsertIntoDigestsFails)
     store.ensure_schema(conn)
     first = store.save_digest(conn, window_from=10, window_to=20,
                               body_md="第一版", model="m", prompt_ver="v1",
@@ -1160,7 +1167,7 @@ def test_transaction_rolls_back_when_commit_itself_fails():
     ⚠️ 与 `test_save_digest_is_atomic` 同因：不用 `memdb` 夹具，
     因为注入点需要 `factory=` 的子类连接。
     """
-    conn = sqlite3.connect(":memory:", factory=_CommitFailsOnce)
+    conn = sqlite3.connect(":memory:", uri=True, factory=_CommitFailsOnce)
     store.ensure_schema(conn)
     item = _make_item(conn, msg_id=1)
 
@@ -1286,3 +1293,137 @@ def test_save_items_writes_sources_of_every_duplicate(memdb):
     assert memdb.execute(
         "SELECT msg_id FROM item_sources ORDER BY msg_id"
     ).fetchall() == [(11,), (22,)]
+
+# ── Task 5：overlay 接入查询层 ────────────────────────────────────
+
+
+def _seed(conn, *, title="标题", kind="notice", ts=1_700_000_000, group_id=100):
+    from vigil.store import ExtractedItem
+
+    # ⚠️ brief 之外新增（逃逸舱 1）：查询层 LEFT JOIN `sender_names` 取署名，
+    # 而它**不由** `store.ensure_schema` 建（真库里是 export.py 的产物）。
+    # 少了这一行，`search_items` / `get_item` / `digest_items` 报的是
+    # `no such table: sender_names`——brief 的 Expected 说会报
+    # `no such table: ov.item_state`，实测不是那个。
+    _ensure_message_tables(conn)
+    conn.execute(
+        "INSERT INTO items (kind, title, detail, event_ts, deadline_ts, group_id,"
+        " actor_uid, place, links, amount, confidence, model, prompt_ver, created_at)"
+        " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (kind, title, None, ts, None, group_id, "u_x", None, "[]", None,
+         0.9, "m", "v3", ts),
+    )
+    return conn.execute("SELECT MAX(item_id) FROM items").fetchone()[0]
+
+
+def _ov_conn():
+    from vigil import overrides
+
+    overrides.ensure_schema()
+    conn = overrides.connect()
+    overrides.ensure_tables(conn)
+    return conn
+
+
+def test_soft_deleted_item_disappears_from_search(memdb):
+    store.ensure_schema(memdb)
+    iid = _seed(memdb)
+    ov = _ov_conn()
+    overrides.delete_item(ov, item_id=iid, msg_id=None)
+    ov.close()
+
+    items, total = store.search_items(memdb, limit=50, offset=0)
+    assert total == 0, "⚠️ total 也必须跟着变——否则分页与『共 N 条』会说谎"
+    assert items == []
+
+
+def test_set_kind_overrides_kind_in_search(memdb):
+    store.ensure_schema(memdb)
+    iid = _seed(memdb, kind="notice")
+    ov = _ov_conn()
+    overrides.set_kind(ov, item_id=iid, kind="academic")
+    ov.close()
+
+    items, _ = store.search_items(memdb, limit=50, offset=0)
+    assert items[0].kind == "academic"
+
+
+def test_kind_filter_uses_effective_kind(memdb):
+    """⚠️ 筛选必须按**覆盖后**的类目——否则改了分类却筛不出来。"""
+    store.ensure_schema(memdb)
+    iid = _seed(memdb, kind="notice")
+    ov = _ov_conn()
+    overrides.set_kind(ov, item_id=iid, kind="academic")
+    ov.close()
+
+    assert store.search_items(memdb, kind="academic", limit=50, offset=0)[1] == 1
+    assert store.search_items(memdb, kind="notice", limit=50, offset=0)[1] == 0
+
+
+def test_soft_deleted_item_disappears_from_window(memdb):
+    """⚠️ R13 的典型形态：只改 API 不改 window_items ⇒「界面上删了、日报里还在」。"""
+    store.ensure_schema(memdb)
+    iid = _seed(memdb, ts=1_700_000_000)
+    ov = _ov_conn()
+    overrides.delete_item(ov, item_id=iid, msg_id=None)
+    ov.close()
+
+    got = store.window_items(memdb, since=1_699_000_000, until=1_701_000_000)
+    assert got == []
+
+
+def test_get_item_returns_none_for_deleted(memdb):
+    store.ensure_schema(memdb)
+    iid = _seed(memdb)
+    ov = _ov_conn()
+    overrides.delete_item(ov, item_id=iid, msg_id=None)
+    ov.close()
+
+    assert store.get_item(memdb, iid) is None
+
+
+def test_kind_counts_uses_effective_kind_and_skips_deleted(memdb):
+    store.ensure_schema(memdb)
+    a = _seed(memdb, title="甲", kind="notice")
+    _seed(memdb, title="乙", kind="notice")
+    ov = _ov_conn()
+    overrides.set_kind(ov, item_id=a, kind="academic")
+    ov.close()
+
+    counts = store.kind_counts(memdb)
+    assert counts == {"academic": 1, "notice": 1}
+
+
+def test_deleted_item_missing_from_digest_items(memdb):
+    store.ensure_schema(memdb)
+    iid = _seed(memdb)
+    store.save_digest(
+        memdb, window_from=1, window_to=2, body_md="x", model="m",
+        prompt_ver="v1", item_ids=[iid],
+    )
+    ov = _ov_conn()
+    overrides.delete_item(ov, item_id=iid, msg_id=None)
+    ov.close()
+
+    did = memdb.execute("SELECT MAX(digest_id) FROM digests").fetchone()[0]
+    assert store.digest_items(memdb, did) == []
+
+
+
+def test_query_layer_provisions_a_missing_overlay_file(memdb):
+    """❓ 读取路径必须能在「从没写过干预」的库上工作（brief Step 3 的新分支）。
+
+    ⚠️ 变异反证（Task 5 实测）：把 `attach_readonly` 里
+    「`if not target.is_file(): ensure_schema(target)`」两行删掉，
+    全量 **477 条里一条都不红**——brief 那批用例都先经 `_ov_conn()` 把库造了出来，
+    没有一条覆盖"库不存在"。真后果：用户**从没点过任何一条干预**（或干预库被删掉、
+    换了机器）时，`/api/items` 与日报的**第一条**查询就是 500——而它本该只是"没有干预"。
+    """
+    store.ensure_schema(memdb)        # 立 items 表（它顺带也会把 overlay 库建出来）
+    _seed(memdb)
+    overrides.OVERRIDES_DB.unlink()   # 抹掉：模拟"从没写过干预"
+    assert not overrides.OVERRIDES_DB.exists()
+
+    items, total = store.search_items(memdb, limit=50, offset=0)
+    assert (total, len(items)) == (1, 1), "没有干预时，读取路径必须照常返回全部条目"
+    assert overrides.OVERRIDES_DB.exists(), "读取路径应当把空的 overlay 库就位"
