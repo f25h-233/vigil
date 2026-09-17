@@ -6,7 +6,7 @@
 > 2. **M5 计划**：`docs/superpowers/plans/2026-09-16-vigil-m5-correctness.md`
 >    —— ⚠️ **它有 `## ⚠️ 执行期勘误` 一节（E1–E11），读计划正文前先读它**
 >
-> ⚠️ **第一版 spec（`2026-09-13-…-design.md`）只覆盖 M1–M4，已冻结。**
+> ⚠️ **第一版 spec（`2026-09-13-vigil-product-layer-design.md`）只覆盖 M1–M4，已冻结。**
 >
 > 最后更新：2026-09-17 深夜　｜　仓库：`https://github.com/f25h-233/vigil`（private）
 > **HEAD `6ce3941` 已推 origin/master**
