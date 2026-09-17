@@ -782,7 +782,7 @@ def test_delete_tombstones_every_source_message(client, db_path):
 
 
 def test_person_rejects_control_chars(client, tmp_path, monkeypatch):
-    """⭐ R10 的另一半：**转义**（`config._toml_str`，T7 已做）与**拒绝**（API）各管一半。
+    """⭐ R10 的另一半：**转义**（`config.toml_str`，T7 已做）与**拒绝**（API）各管一半。
 
     理由：`config/*.toml` 是**人手输**的。把一个换行静默存进一个"名字"里、
     再在界面上错乱显示，是**最不诚实**的做法——而且它一旦落盘，

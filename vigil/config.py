@@ -66,9 +66,38 @@ def load_config(path: pathlib.Path | None = None) -> Config:
     if not path.is_file():
         raise ConfigError(f"找不到配置文件: {path}")
 
-    with open(path, "rb") as f:
-        raw = tomllib.load(f)
+    try:
+        with open(path, "rb") as f:
+            raw = tomllib.load(f)
+    except tomllib.TOMLDecodeError as exc:
+        # ⚠️ 必须包成 ConfigError（M6 T2 修）。`TOMLDecodeError` 继承自
+        # **ValueError** 而不是 RuntimeError，不包的话会绕过
+        # `cli._load_config_only` 的 `except ConfigError`，用户看到的是
+        # **裸 traceback** 而不是一行可读的配置错误。
+        # ⚠️ `load_categories` 从 M5 起就是这么做的（那里有完整论证），
+        # 而本函数一直没跟上——今天 `groups.toml` 只由人手编辑、撞上的概率低，
+        # **M6 之后 Web 会写它** ⇒ 一次序列化缺陷就会以 traceback 收场。
+        raise ConfigError(f"{path}: TOML 语法错误——{exc}") from exc
 
+    return validate_config_raw(raw, path)
+
+
+def validate_config_raw(raw: dict, path: pathlib.Path) -> Config:
+    """把**已解析**的 TOML 校验成 `Config`。
+
+    ⚠️ **读路径与写路径共用这一个函数**（M6 T2）。写路径若另写一套校验，
+    两份会漂移——而漂移的后果在这里尤其重：`save_config` 能写出
+    `load_config` 拒绝的文件 ⇒ 一份配置永久落盘（原子写、无回滚）
+    ⇒ **整个程序起不来**（`config.py` 是所有入口的硬依赖）。
+
+    ⚠️ 它**不是**段序的兜底（⚠️ 实测修正 M6 T2）：tomllib 下 `[settings]`
+    写在 `[[groups]]` 之后仍落在顶层，本函数看不出顺序。它抓得住的是
+    **结果**——「顶层根本没有 `settings`」（`raw.get("settings")` 得到 `None`
+    ⇒ 报「缺少 [settings] 段」）。写路径因此在落盘前仍能挡住
+    「上游把 settings 整个弄没了」那类缺陷。
+    """
+    # ↓↓↓ 以下为原 `load_config` 从 `settings = raw.get("settings")`
+    #     到 `return Config(...)` 的**逐字搬移**，一行不改 ↓↓↓
     settings = raw.get("settings")
     if not isinstance(settings, dict):
         raise ConfigError(f"{path}: 缺少 [settings] 段")
@@ -140,6 +169,92 @@ def atomic_write_text(path: pathlib.Path, text: str) -> None:
     except BaseException:
         tmp.unlink(missing_ok=True)
         raise
+
+
+# ── 写侧序列化（M6 T2）──────────────────────────────────────────────
+#
+# ⚠️ Python 标准库**只有 `tomllib`（读）**，没有写入器。本仓库的依赖表只有
+# sqlcipher3，不为写 TOML 引第三方库。所以写侧是手写的，而手写序列化
+# **唯一的正确性判据是「全函数」**：
+#
+#     任何合法的值进去，产出的文本都要能被 `tomllib` 读回**同一个值**。
+#
+# ⚠️ 光有「全函数」还不够：它只覆盖**值**，不覆盖**段序**（`[settings]` 掉到
+# `[[groups]]` 后面）与**键名**。**键名**那半由各自的 `save_*` 用「先解析、再
+# 喂给读路径的同一个校验函数」挡住（见 `save_config` / `save_categories`）；
+# **段序**那半**挡不住**（⚠️ 实测修正 M6 T2：tomllib 下两种顺序解析出的顶层表
+# 一模一样，见 `save_config` 的 docstring），只能靠代码里的书写顺序
+# 与 `tests/test_config.py` 里那条行锚定断言钉着。
+
+
+def toml_str(value: str) -> str:
+    """TOML 基本字符串——**全函数**：任何字符串进去，`save` 的产物都 `load` 得回来。
+
+    ⚠️ 只转义反斜杠与双引号是**不够**的：一个带换行的 label 会写出**解析不了**的 toml，
+    而原子写会让它**永久落盘**——`save` 成功返回、`load` 从此抛 `TOMLDecodeError`，
+    整份文件连读都读不出来（M5 T7 实测，见 task-7-report.md）。
+
+    ⚠️ 这里只是**转义**那一半；「名字里不许有换行」的**拒绝**在 API 层——
+    `config/*.toml` 是人手输的，把一个换行静默存进"名字"里、再在界面上错乱显示，
+    比直接报错更不诚实。
+
+    ⚠️ 原名为 `_toml_str`，M6 T2 去掉下划线：`categories.py` 的写侧要用它，
+    而跨模块 import 一个下划线名字是在制造「这是私有的、但谁都在用」的假象。
+    """
+    out: list[str] = []
+    for ch in value:
+        esc = TOML_ESCAPES.get(ch)
+        if esc is not None:
+            out.append(esc)
+        elif ch < " " or ch == "\x7f":
+            out.append(f"\\u{ord(ch):04X}")
+        else:
+            out.append(ch)
+    return '"' + "".join(out) + '"'
+
+
+def toml_int(value: object, field: str) -> int:
+    """把值当整数写出——**拒绝 bool，也拒绝「能转成整数的字符串」**。
+
+    ⚠️ `bool` 是 `int` 的子类（`True == 1`），所以裸的 `isinstance(x, int)`
+    会放行 `True` ⇒ 写出 `uin = true`，读回来是 `uin = 1`（M5 遗留 #22，已复现）。
+
+    ⚠️ 也不接受 `"100000001"` 这类字符串：给「静默转一下」留口子，就等于把
+    `api._edit_id_of` 那个 `int("abc")` → 500、`1.9` → 静默截断成 1 的缺陷
+    换个形状请回来（那里已有完整论证）。**契约是「整数」而不是「能转成整数的东西」。**
+
+    ⚠️ 它同时是 M5 遗留 #19 的落点：旧代码是裸 f-string `f"uin = {p.uin}"`，
+    一个非 int 的值可以**注入 TOML**（已复现：写出第二个 `[[persons]]` 段头，
+    并让整份文件 `TOMLDecodeError` 报废）。
+    """
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ConfigError(
+            f"{field} 必须是整数（**拒绝 bool**：True 是 int 的子类，会静默变成 1；"
+            f"也拒绝字符串：静默转换会把「1.9 截断」那类缺陷请回来），"
+            f"实际是 {value!r}（{type(value).__name__}）"
+        )
+    return value
+
+
+def _toml_path(value: pathlib.Path) -> str:
+    """把路径写成 TOML 字符串：**能在仓库内相对表达就相对**，否则写绝对。
+
+    ⚠️ 不统一成绝对、也不统一成相对——两个方向各有一个具体的坏法：
+
+      · **全写绝对** ⇒ 配置文件搬到别的目录时仍指回原仓库。T8 的「配置包
+        在另一个目录导入并生效」会因此**静默指向旧库**（判据 4 直接失败）。
+      · **全写相对** ⇒ `REPO_ROOT` 之外的路径（QQ 库在 `C:/Users/...`）
+        根本没法相对表达；而**相对路径的解析基准是 cwd、不是 `REPO_ROOT`**
+        （⚠️ 实测修正 M6 T2：`validate_config_raw` 只对 `output_db` 做
+        `REPO_ROOT / ...`，`qq_db_dir` 是裸 `Path(...)`。实测：
+        `qq_db_dir = "qqdb"` 在 cwd=那个目录时读得通，cwd=仓库根时抛
+        「QQ 数据库目录不存在: qqdb」）。⇒ 全写相对等于把「从哪个目录启动」
+        冻进配置，换个 cwd 就报一句**指向根本没错的路径**的错误。
+    """
+    try:
+        return toml_str(value.relative_to(REPO_ROOT).as_posix())
+    except ValueError:
+        return toml_str(value.as_posix())
 
 
 def _check_persons_shape(path: pathlib.Path, raw: dict) -> None:
@@ -216,6 +331,96 @@ def load_persons(path: pathlib.Path | None = None) -> tuple[Person, ...]:
     return tuple(out)
 
 
+_GROUPS_HEADER = """\
+# VIGIL 监听群配置
+#
+# ── 怎么加群 ───────────────────────────────────────────────
+#   1. 跑 `vigil groups`，它会列出 QQ 本地库里所有群
+#      （含群号、群名、消息数，以及「是否已纳入」）
+#   2. 把新群的 id 按下面格式加一段 [[groups]]
+#   3. 重跑 `vigil export`。**每次都是全量重读所有已纳群**（不做增量记账，
+#      实测 4.7 万条几秒），写入用 INSERT OR REPLACE，所以重跑不会产生重复行。
+#      新群加进来后第一次 export 就会拉到它的全部历史。
+#
+# ── 怎么退群 ───────────────────────────────────────────────
+#   把 enabled 改成 false（保留配置便于回看），或整段删掉。
+#   已导出的历史数据留在库里不动——那是你的记录。
+#
+# ⚠️ **本文件由程序整体重写**（网页「配置」页保存时会覆盖它）：
+#    手工改也行，但**手工加的注释会在下一次网页保存时消失**。
+#
+# 注意：刚加入的新群，QQ 需要先把它同步到本地库
+#      （group_info.db 出现群名、nt_msg.db 开始落消息），
+#      之后 `vigil groups` 才看得见。刚加完立刻查可能是空的。
+"""
+
+
+def save_config(config: Config, path: pathlib.Path | None = None) -> None:
+    """整体替换写出群配置（原子）。
+
+    ⚠️ 是**整体替换**不是追加：追加语义下「删掉一个群」永远做不到
+    （与 `save_persons` 同一条理由）。
+
+    ⚠️ **`[settings]` 必须写在 `[[groups]]` 之前**。⚠️ 实测修正（M6 T2）：
+    原稿给的理由是「否则会被解析成最后一个数组元素下的子表
+    （`groups[-1].settings`）⇒ `raw.get("settings")` 变成 `None` ⇒ 程序起不来」
+    ——**这条实测不成立**：tomllib（TOML 1.0）里 `[settings]` 是**根相对**路径，
+    写在 `[[groups]]` 之后**仍落在顶层**（实测 `raw.get("settings")` 拿到的正是
+    那张表）；只有 `[groups.settings]` 这种**穿过数组**的写法才会嵌套。
+    所以段序**只有这一处在保证**：代码里这个顺序 +
+    `tests/test_config.py::test_save_config_writes_settings_before_groups`
+    的行锚定断言（把它挪到 `[[groups]]` 之后 ⇒ 那条测试实测变红）。
+    末尾那次落盘前自校验能挡住的是「最终文本里顶层根本没有 `settings`」
+    （⇒「缺少 [settings] 段」），**挡不住段序本身**——tomllib 认为那是合法的。
+
+    ⚠️ 路径走 `_toml_path`（仓库内相对、仓库外绝对），不要图省事写绝对。
+    """
+    target = path or DEFAULT_CONFIG
+
+    # ⚠️ 拒绝零个群**不是洁癖**：`validate_config_raw` 把「一个群都没配」
+    # 当成配置错误，所以写出一份零群的配置 = **把程序改成起不来**——
+    # 而且下一次启动才现形，那时用户已经在网页上点过保存、拿到了「成功」。
+    # ⚠️ 这同时**否掉了一个看起来更自然的设计**：网页上「删掉最后一个群」。
+    # 正确动作是 `enabled = false`（保留配置、保留历史）。
+    if not config.groups:
+        raise ConfigError(
+            "拒绝写出零个群的配置：读回来会被判成「一个群都没配」的配置错误，"
+            "整个程序起不来。要退掉最后一个群，请改成 `enabled = false`"
+            "（保留配置、保留已导出的历史）。"
+        )
+
+    lines = [
+        _GROUPS_HEADER,
+        "",
+        "[settings]",
+        f"qq_db_dir = {_toml_path(config.qq_db_dir)}",
+        f"output_db = {_toml_path(config.output_db)}",
+        "",
+    ]
+    for g in config.groups:
+        lines.append("[[groups]]")
+        lines.append(f"id = {toml_int(g.id, '群号')}")
+        lines.append(f"name = {toml_str(g.name)}")
+        lines.append(f"enabled = {'true' if g.enabled else 'false'}")
+        lines.append(f"tier = {toml_str(g.tier)}")
+        lines.append("")
+
+    text = "\n".join(lines)
+
+    # ⚠️ **顺序是承重的：先自己解析+校验，再落盘**。反过来的话，一份不合法的
+    # 配置已经落盘了才发现不对——而 `atomic_write_text` 是原子写，
+    # **没有任何自动回滚**，那份坏配置会一直躺在那里直到有人手动修。
+    # ⚠️ 校验的是**最终文本**（而不是内存里的 `Config`）：只有这样才能抓到
+    # 序列化本身的缺陷（漏转义的引号、写反的段序），而不只是数据的问题。
+    try:
+        raw = tomllib.loads(text)
+    except tomllib.TOMLDecodeError as exc:
+        raise ConfigError(f"内部错误：为 {target} 生成的 TOML 解析不了——{exc}") from exc
+    validate_config_raw(raw, target)
+
+    atomic_write_text(target, text)
+
+
 def save_persons(persons: Sequence[Person], path: pathlib.Path | None = None) -> None:
     """整体替换写出人物名单（原子）。
 
@@ -235,10 +440,16 @@ def save_persons(persons: Sequence[Person], path: pathlib.Path | None = None) ->
     ]
     for p in persons:
         lines.append("[[persons]]")
-        lines.append(f"uin = {p.uin}")
-        lines.append(f"label = {_toml_str(p.label)}")
+        # ⚠️ 走 `toml_int` 而不是裸 f-string（M5 遗留 #19/#22）：
+        # 裸 f-string 让一个非 int 的值**可注入 TOML**（已复现：能写出第二个
+        # `[[persons]]` 段头，并让整份文件 `TOMLDecodeError` 报废），
+        # 而 `uin = true` 会被接受（bool ⊂ int）⇒ 建出一个 uin=1 的人。
+        # `Person` 是 frozen dataclass 但**不强制类型**，所以产品路径今天
+        # 够不到它——T8 的批量导入会让它够到，故必须在此之前收掉。
+        lines.append(f"uin = {toml_int(p.uin, 'uin')}")
+        lines.append(f"label = {toml_str(p.label)}")
         if p.note:
-            lines.append(f"note = {_toml_str(p.note)}")
+            lines.append(f"note = {toml_str(p.note)}")
         lines.append("")
     atomic_write_text(target, "\n".join(lines))
 
@@ -247,36 +458,13 @@ def save_persons(persons: Sequence[Person], path: pathlib.Path | None = None) ->
 # **U+0000–U+0008、U+000A–U+001F（`\t` 除外）、U+007F**——原样落进引号里会让 tomllib 解析失败；
 # 而 `]` / `#` / `=` / `"""` / U+2028 / C1 / NBSP / BOM 都实测 round-trip 一致，**不必动**
 # （别凭直觉扩大转义集：多转义不会更安全，只会改变正文）。
-_TOML_ESCAPES = {
+TOML_ESCAPES = {
     "\\": "\\\\",
     '"': '\\"',
     "\n": "\\n",
     "\r": "\\r",
     "\t": "\\t",
 }
-
-
-def _toml_str(value: str) -> str:
-    """TOML 基本字符串——**全函数**：任何字符串进去，`save` 的产物都 `load` 得回来。
-
-    ⚠️ 只转义反斜杠与双引号是**不够**的：一个带换行的 label 会写出**解析不了**的 toml，
-    而原子写会让它**永久落盘**——`save` 成功返回、`load` 从此抛 `TOMLDecodeError`，
-    整份人物名单连读都读不出来（实测，见 task-7-report.md）。
-
-    ⚠️ 这里只是**转义**那一半；「名字里不许有换行」的**拒绝**在 API 层——
-    `config/*.toml` 是人手输的，把一个换行静默存进"名字"里、再在界面上错乱显示，
-    比直接报错更不诚实。
-    """
-    out: list[str] = []
-    for ch in value:
-        esc = _TOML_ESCAPES.get(ch)
-        if esc is not None:
-            out.append(esc)
-        elif ch < " " or ch == "\x7f":
-            out.append(f"\\u{ord(ch):04X}")
-        else:
-            out.append(ch)
-    return '"' + "".join(out) + '"'
 
 
 def _read_env(name: str, env_path: pathlib.Path | None = None) -> str:

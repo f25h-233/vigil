@@ -96,7 +96,7 @@ def _day_of(ts: int) -> str:
 def _reject_controls(value: str, field: str) -> None:
     """`label` / `note` 里有换行或别的控制字符 ⇒ **400**（R10：转义与拒绝各管一半）。
 
-    ⚠️ `config._toml_str` 已经能把这些字符**转义**成合法 TOML 并按原样读回来
+    ⚠️ `config.toml_str` 已经能把这些字符**转义**成合法 TOML 并按原样读回来
     （那是 T7 完成的另一半），但「存得进去」不等于「应该存」：
     `config/*.toml` 是**人手输**的，把一个换行静默存进一个"名字"里、
     再在界面上错乱显示，是**最不诚实**的做法——而它一旦落盘，

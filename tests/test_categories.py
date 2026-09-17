@@ -180,3 +180,59 @@ def test_category_is_frozen():
     c = Category(slug="a", label="b", desc="c")
     with pytest.raises(Exception):
         c.slug = "x"  # type: ignore[misc]
+
+
+# ── M6 T2：写侧 ──────────────────────────────────────────────────────
+
+
+def test_save_categories_roundtrips(tmp_path):
+    p = tmp_path / "categories.toml"
+    cats = (
+        categories.Category(slug="notice", label="通知", desc="正式通知", icon="📋"),
+        categories.Category(slug="life", label="生活", desc="吃住行"),
+    )
+    categories.save_categories(cats, p)
+    assert categories.load_categories(p) == cats
+
+
+def test_save_categories_rejects_an_invalid_slug(tmp_path):
+    """⭐ 写路径必须复用**读路径的同一个校验函数**。
+
+    ⚠️ 变异反证：把 `save_categories` 里那句 `validate_categories(...)` 删掉
+    ⇒ 本条**必红**（会静默写出一个 `load_categories` 拒绝的文件）。
+
+    ⚠️ 后果为什么特别重：`categories.py` 是 **refine 与 api 的硬依赖**，
+    一份校验不过的 `categories.toml` 会让**整个程序起不来**——
+    而它是原子写的，**没有任何自动回滚**。
+    """
+    p = tmp_path / "categories.toml"
+    with pytest.raises(categories.CategoryError):
+        categories.save_categories(
+            [categories.Category(slug="Notice", label="大写", desc="slug 不合法")], p
+        )
+    assert not p.exists(), "校验不过就不许落盘"
+
+
+def test_save_categories_rejects_discard_as_slug(tmp_path):
+    """`discard` 是保留字（`refine_runs` 用它记「这条消息被丢了」），写侧也要挡。"""
+    p = tmp_path / "categories.toml"
+    with pytest.raises(categories.CategoryError):
+        categories.save_categories(
+            [categories.Category(slug="discard", label="丢弃", desc="保留字")], p
+        )
+
+
+def test_save_categories_refuses_zero(tmp_path):
+    """⚠️ 零个类目会被 `load_categories` 判为配置错误 ⇒ 拒绝写出（与 `save_config` 同理）。"""
+    p = tmp_path / "categories.toml"
+    with pytest.raises(categories.CategoryError, match="零个类目"):
+        categories.save_categories((), p)
+    assert not p.exists()
+
+
+def test_save_categories_escapes_a_quote_in_desc(tmp_path):
+    """`desc` 里带引号/换行也必须写出可解析的 TOML（`toml_str` 的全函数性）。"""
+    p = tmp_path / "categories.toml"
+    cats = (categories.Category(slug="x", label='带"引号"', desc="第一行\n第二行"),)
+    categories.save_categories(cats, p)
+    assert categories.load_categories(p) == cats

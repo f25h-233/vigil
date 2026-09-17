@@ -160,7 +160,7 @@ def test_atomic_write_cleans_temp_on_failure(tmp_path, monkeypatch):
 
 
 def test_toml_str_is_total(tmp_path):
-    """⚠️ `_toml_str` 必须是**全函数**：任何字符串进去，`save` 的产物都 `load` 得回来。
+    """⚠️ `toml_str` 必须是**全函数**：任何字符串进去，`save` 的产物都 `load` 得回来。
 
     实测坏字符集（原样落进引号里会让 tomllib 解析失败）：
     **U+0000–U+0008、U+000A–U+001F（`\\t` 除外）、U+007F**。
@@ -215,3 +215,182 @@ def test_load_persons_empty_file_is_still_legal(tmp_path):
     """阳性对照：**空文件**是合法的（一个人都没监视），不许被上面两条顺带拒掉。"""
     assert config.load_persons(_write(tmp_path, "")) == ()
     assert config.load_persons(_write(tmp_path, "# 只有注释\n")) == ()
+
+
+# ── M6 T2：写侧序列化层 ──────────────────────────────────────────────
+
+
+def test_save_config_roundtrips(tmp_path):
+    """`save_config` 的产物必须被 `load_config` 原样读回来。
+
+    ⚠️ 这条钉的是「**全函数**」那一半：任何 `Config` 进去，产物都读得回来。
+    但它**钉不住段序**——见下一条。
+    """
+    p = tmp_path / "groups.toml"
+    cfg = config.Config(
+        qq_db_dir=tmp_path / "qqdb",
+        output_db=config.REPO_ROOT / "data" / "vigil.db",
+        groups=(
+            config.Group(id=111, name="甲群", enabled=True, tier="high"),
+            config.Group(id=222, name="乙群", enabled=False),
+        ),
+    )
+    (tmp_path / "qqdb").mkdir()
+    config.save_config(cfg, p)
+    back = config.load_config(p)
+    assert back.groups == cfg.groups
+    assert back.output_db == cfg.output_db
+
+
+def test_save_config_writes_settings_before_groups(tmp_path):
+    """⭐ `[settings]` 必须在 `[[groups]]` **之前**（布局约定，见下）。
+
+    ⚠️ 实测修正（M6 T2）：原稿给的理由是「`[table]` 出现在
+    `[[array_of_tables]]` 之后会被解析成最后一个数组元素下的子表
+    （`groups[-1].settings`）⇒ `raw.get("settings")` 变成 `None` ⇒
+    下一次 `load_config` 报「缺少 [settings] 段」，整个程序起不来」。
+    这条**实测不成立**：tomllib 里 `[settings]` 是**根相对**路径，写在
+    `[[groups]]` 之后**仍落在顶层**（`raw.get("settings")` 拿到的正是那张表）；
+    只有 `[groups.settings]` 这种**穿过数组**的写法才嵌套。
+    所以段序**不是**靠 load 报错兜住的——就靠下面这条断言钉着。
+
+    ⚠️ 变异反证：把 `save_config` 里的 `lines = [HEADER, "", "[settings]"]`
+    挪到 `for g in config.groups` 之后 ⇒ 本条**必红**（实测 `assert 28 < 0`：
+    红的原因就是行锚定断言，**不是** `load_config` 抛 `ConfigError`）。
+
+    ⚠️ 实施修正（M6 T2）：原稿用的是 `text.index("[[groups]]")`，而
+    `_GROUPS_HEADER` 的**正文里**有一句「按下面格式加一段 `[[groups]]`」
+    ⇒ 子串搜索命中的是**注释里那个**（实测 643 vs 168），段序完全正确也红。
+    改成**行锚定**比较，钉的仍是段头本身的先后。
+    """
+    p = tmp_path / "groups.toml"
+    (tmp_path / "qqdb").mkdir()
+    cfg = config.Config(
+        qq_db_dir=tmp_path / "qqdb",
+        output_db=config.REPO_ROOT / "data" / "vigil.db",
+        groups=(config.Group(id=111, name="甲群"),),
+    )
+    config.save_config(cfg, p)
+    text = p.read_text(encoding="utf-8")
+    lines = text.splitlines()
+    assert lines.index("[settings]") < lines.index("[[groups]]")
+    # 再机械确认一次：解析出来的顶层键就是那两个
+    import tomllib
+    assert set(tomllib.loads(text)) == {"settings", "groups"}
+
+
+def test_save_config_refuses_zero_groups(tmp_path):
+    """⚠️ 拒绝写出零个群。
+
+    不是洁癖：`load_config` 把「一个群都没配」当成配置错误（`[[]] 段为空`），
+    所以写出一份零群的配置 = **把程序改成起不来**——而且下一次启动才现形，
+    那时用户已经在网页上点过保存、拿到了「成功」。
+
+    ⚠️ 这同时**否掉了一个看起来更自然的设计**：「删掉最后一个群」。
+    要退掉最后一个群，正确动作是 `enabled = false`（保留配置、保留历史）。
+    """
+    p = tmp_path / "groups.toml"
+    (tmp_path / "qqdb").mkdir()
+    cfg = config.Config(
+        qq_db_dir=tmp_path / "qqdb", output_db=config.REPO_ROOT / "data" / "vigil.db",
+        groups=(),
+    )
+    with pytest.raises(config.ConfigError, match="零个群"):
+        config.save_config(cfg, p)
+    assert not p.exists(), "拒绝之后不许留下文件"
+
+
+def test_save_config_keeps_repo_relative_paths_relative(tmp_path):
+    """仓库内的路径写**相对**、仓库外的写**绝对**（`_toml_path` 的契约）。
+
+    两个方向各有一个具体的坏法：
+      · 全写绝对 ⇒ 配置搬到别的目录时仍指回原仓库（T8 的导入导出就废了）；
+      · 全写相对 ⇒ `C:/Users/...` 的 QQ 库路径会被 `load_config` 拼成
+        `REPO_ROOT / "C:/Users/..."`，一个不存在的路径。
+
+    ⚠️ 实施修正（M6 T2）：原稿写的是 `qq_db_dir=pathlib.Path("C:/somewhere/nt_db")`
+    ——一个**不存在**的路径，而 `save_config` 落盘前要把最终文本喂给
+    `validate_config_raw`，那里有「QQ 数据库目录不存在」这条检查
+    ⇒ 原稿在本平台**必红**（实测 `ConfigError: QQ 数据库目录不存在: C:\\somewhere\\nt_db`）。
+    换成一个真实存在、且仍在 `REPO_ROOT` **之外**的绝对路径（本平台的 pytest
+    `tmp_path` 就是 `C:/Users/...`，与 docstring 里那个坏法同形）：契约不变。
+    """
+    p = tmp_path / "groups.toml"
+    outside = tmp_path / "nt_db"
+    outside.mkdir()
+    cfg = config.Config(
+        qq_db_dir=outside,
+        output_db=config.REPO_ROOT / "data" / "vigil.db",
+        groups=(config.Group(id=111, name="甲群"),),
+    )
+    config.save_config(cfg, p)
+    text = p.read_text(encoding="utf-8")
+    assert 'output_db = "data/vigil.db"' in text
+    assert f'qq_db_dir = "{outside.as_posix()}"' in text
+
+
+def test_save_persons_rejects_a_non_int_uin(tmp_path):
+    """⭐ M5 遗留 #19 + #22：`uin` 必须是**真正的整数**，且**拒绝 bool**。
+
+    ⚠️ 旧实现是裸 f-string `f"uin = {p.uin}"`，两个坏法：
+      · `uin="1\\n[[persons]]\\nlabel=\\"注入\\""` ⇒ 写出**第二个段头**，
+        整份文件结构被改写（已复现）；
+      · `uin=True` ⇒ 写出 `uin = true`，读回来是 `uin = 1`（`bool` ⊂ `int`）。
+
+    ⚠️ `Person` 是 frozen dataclass，**不强制类型** ⇒ 产品路径今天够不到它。
+    但 T8 的批量导入会让它够到，所以必须在此之前收掉（终审原话）。
+
+    ⚠️ 变异反证：把 `save_persons` 里那行换回 `f"uin = {p.uin}"`
+    ⇒ 本条**必红**。
+    """
+    for bad in ("1\n[[persons]]\nlabel=\"注入\"", True, 1.5, "100000001"):
+        with pytest.raises(config.ConfigError, match="uin"):
+            config.save_persons(
+                [config.Person(uin=bad, label="甲")], tmp_path / "persons.toml"  # type: ignore[arg-type]
+            )
+    assert not (tmp_path / "persons.toml").exists()
+
+
+def test_saved_persons_never_contain_a_uid_key(tmp_path):
+    """M5 遗留 #20：`uid` **不落配置**——`config/*.toml` 里不许出现它。
+
+    ⚠️ 为什么要有这条：`Person` 的键是 `uin`，`uid` 只在**查询时**由
+    `sender_names` 反查（spec §3.1：uid 与 uin 会脱节，落盘就等于把一份
+    会过期的映射冻进配置）。今天靠「代码里没写 uid」保证，而
+    **没有任何测试挡着后来者顺手加一列**。
+    """
+    p = tmp_path / "persons.toml"
+    config.save_persons([config.Person(uin=100000001, label="甲")], p)
+    assert "uid" not in p.read_text(encoding="utf-8")
+
+
+def test_load_config_wraps_a_toml_syntax_error(tmp_path):
+    """⚠️ 本任务修掉的既有缺陷：语法错误必须包成 `ConfigError`。
+
+    不包的话 `tomllib.TOMLDecodeError`（继承自 **ValueError**，不是
+    RuntimeError）会**绕过 `cli._load_config_only` 的 `except ConfigError`**，
+    用户看到的是**裸 traceback** 而不是一行可读的配置错误。
+    `load_categories` 早就这么做了（`categories.py:51-55` 有完整论证），
+    `load_config` 没有——M6 之后 Web 会写这份文件，撞上的概率从
+    「人手打错字」升到「一次序列化缺陷」。
+
+    ⚠️ 变异反证：去掉 `load_config` 里那个 `try/except tomllib.TOMLDecodeError`
+    ⇒ 本条**必红**（抛的是 TOMLDecodeError）。
+    """
+    p = tmp_path / "groups.toml"
+    p.write_text("[settings\nqq_db_dir = 1\n", encoding="utf-8")
+    with pytest.raises(config.ConfigError, match="TOML"):
+        config.load_config(p)
+
+
+def test_toml_str_is_reachable_under_its_public_name():
+    """`_toml_str` → `toml_str` 的改名必须真的发生（`categories.py` 要 import 它）。
+
+    ⚠️ 这条看着像废话，但它挡的是一个具体的形状：改名改了一半——
+    留个 `_toml_str = toml_str` 的兼容别名。别名会让两处引用**看起来都在用
+    `toml_str`**，而实际上 `save_persons` 走的是别名那条路，于是
+    「谁在调用它」这个问题永远数不清（本项目反复吃「看起来有、其实没人看」
+    那个形状的亏，见 `daily.RunReport.counters` 的墓碑）。
+    """
+    assert hasattr(config, "toml_str")
+    assert not hasattr(config, "_toml_str"), "别留兼容别名"
