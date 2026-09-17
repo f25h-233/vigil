@@ -15,12 +15,15 @@ import datetime as dt
 import pathlib
 import sqlite3
 import threading
+import tomllib
+from collections.abc import Sequence
 
 from fastapi import Body, FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse, HTMLResponse
 
+from . import categories as categories_mod
 from . import groups_snapshot, overrides, store
-from .categories import load_categories
+from .categories import Category, load_categories
 from .config import (
     REPO_ROOT,
     TIER_NORMAL,
@@ -29,6 +32,7 @@ from .config import (
     ConfigError,
     Group,
     Person,
+    atomic_write_text,
     load_config,
     load_persons,
     save_config,
@@ -155,9 +159,6 @@ def create_app(config: Config) -> FastAPI:
     db_path = config.output_db
     db_uri = f"file:{db_path.as_posix()}?mode=ro"
 
-    cats = load_categories()
-    cat_by_slug = {c.slug: c for c in cats}
-
     # ⚠️ overlay 的**文件**在这里就位（D11 允许 Web 写 overlay）。之后每个
     # 请求的 `store._ensure_overlay(conn)` 才能无条件 ATTACH。
     # ⚠️ **不能**在这里调 `store.ensure_schema`——那是写 `vigil.db`，
@@ -196,6 +197,102 @@ def create_app(config: Config) -> FastAPI:
     # 而 Web 不该因为「任务计划在跑」就整个不能保存配置。
     write_lock = threading.Lock()
 
+    # ── 类目编辑（M6 T5）────────────────────────────────────────────
+    #
+    # ⚠️ 这里开始，`categories.toml` 由**程序**整体重写（`save_categories`）。
+    # 配置仍是唯一真相源，只是从此有了一个比手写更常见的来源。
+
+    def categories_path() -> pathlib.Path:
+        """⚠️ 与 `config_path()` 一样**每次现读** `REPO_ROOT` 全局
+        （Global Constraint 11：不许在 `create_app` 时算好冻进闭包）。
+
+        ⚠️ **实测（M6 T5）：把这一处冻住，全量 704 passed / 0 red。**
+        原因清楚——所有隔离夹具都是**在造 app 之前**就
+        `monkeypatch.setattr(api, "REPO_ROOT", tmp)` 的，于是"冻住的那一份"
+        也落在 tmp 根里。⇒ **这一处的『现读』今天没有牙**，它不是被测试逼出来的形状。
+
+        ⇒ 仍然现读，是照约束 11 与同族的 `config_path()` / `persons_path()`
+        （后者那次「测试往真仓库写人」的事故，是**那处**的实测历史，不是这一处的）。
+        ⚠️ 写清楚这一点是刻意的：本项目最贵的一课是**错的论证比没有论证更危险**
+        （勘误 E7）——把一个没被守卫的形状说成"不然测试会红"，会让下一个读的人
+        以为自己理解了，于是不去验证。
+        """
+        return REPO_ROOT / "config" / "categories.toml"
+
+    def current_categories() -> tuple[Category, ...]:
+        """**每次现读**的类目表（名字对齐 `current_config()`）。
+
+        ⚠️ 读不出来 ⇒ **500**（同 `current_config()`）：这是服务端自己的配置问题，
+        而 503 在浏览器里会被读成「服务没起来」，方向完全不同。
+        """
+        try:
+            return load_categories(categories_path())
+        except categories_mod.CategoryError as exc:
+            raise HTTPException(
+                status_code=500, detail=f"config/categories.toml 读不出来：{exc}"
+            )
+
+    def category_map() -> dict[str, Category]:
+        """slug → `Category`，**每次现读**（与 `group_names_map()` 同族）。
+
+        ⚠️ 只在**端点入口**读一次、再传进 `item_out`：列表接口一页 50 条，
+        写在 `item_out` 里就是 50 次读同一份文件。
+        """
+        return {c.slug: c for c in current_categories()}
+
+    def snapshot_categories() -> None:
+        """把**当前** `categories.toml` 的原文存进 overlay。每次改动**之前**调。
+
+        ⚠️ 文件不存在时静默跳过：那意味着这份配置还没被创建过，
+        而"撤销到一个不存在的文件"没有意义。
+        """
+        path = categories_path()
+        if not path.is_file():
+            return
+        ov = overrides.connect()
+        try:
+            overrides.save_config_snapshot(ov, body=path.read_text(encoding="utf-8"))
+        finally:
+            ov.close()
+
+    def category_or_400(body: dict) -> Category:
+        """把请求体变成一个 `Category`，**校验不过一律 400**（不是 500）。
+
+        ⚠️ 校验**必须在写之前**：`save_categories` 自己也会校验（T2），
+        但那是最后一道闸——先校验一次，才能做到「400 的时候
+        **一份快照都没产生、一个字节都没落盘**」。
+        """
+        slug = str(body.get("slug", "")).strip()
+        label = str(body.get("label", "")).strip() or slug
+        desc = str(body.get("desc", "")).strip()
+        icon = str(body.get("icon", "")).strip()
+        for fname, value in (
+            ("slug", slug), ("label", label), ("desc", desc), ("icon", icon),
+        ):
+            _reject_controls(value, fname)
+        if not desc:
+            raise HTTPException(
+                status_code=400,
+                detail="desc 不能为空——它会被**逐字**渲染进 LLM 的提示词，是类目的判据",
+            )
+        return Category(slug=slug, label=label, desc=desc, icon=icon)
+
+    def validate_or_400(cats: Sequence[Category]) -> None:
+        try:
+            categories_mod.validate_categories(
+                categories_mod.as_dicts(cats), categories_path()
+            )
+        except categories_mod.CategoryError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+
+    def commit_categories(cats: Sequence[Category]) -> None:
+        try:
+            categories_mod.save_categories(cats, categories_path())
+        except categories_mod.CategoryError as exc:
+            # 走到这里说明 `validate_or_400` 放行了一份 `save_categories` 拒绝的
+            # 东西——那是**程序自己的 bug**，500 才对（400 会把排障引向用户输入）。
+            raise HTTPException(status_code=500, detail=f"内部错误：{exc}")
+
     def persons_path() -> pathlib.Path:
         """⚠️ 路径**每次现读** `REPO_ROOT` 全局，不许在 `create_app` 时算好冻进闭包。
 
@@ -226,8 +323,16 @@ def create_app(config: Config) -> FastAPI:
         """
         return {g.id: g.name for g in current_config().groups}
 
-    def item_out(it: store.ApiItem, names: dict[int, str]) -> dict:
-        cat = cat_by_slug.get(it.kind)
+    def item_out(
+        it: store.ApiItem, names: dict[int, str], cats: dict[str, Category]
+    ) -> dict:
+        """⚠️ `cats` 由调用方**每次现读**后传进来（见 `category_map()`）。
+
+        不是为了省一次读（虽然也省了 50 次同一份文件的读），而是因为**冻住的
+        那一份会过时**：网页上刚加的类目在信息流里会显示成**裸 slug**——
+        用户看着自己刚做的操作没生效（与 `group_names_map()` 是同一条判据）。
+        """
+        cat = cats.get(it.kind)
         return {
             "item_id": it.item_id,
             "kind": it.kind,
@@ -253,22 +358,207 @@ def create_app(config: Config) -> FastAPI:
 
     @app.get("/api/categories")
     def api_categories() -> dict:
+        # ⚠️ 原实现用的是 `create_app` 时冻住的 `cats` / `cat_by_slug`。改成**现读**
+        # （同 T4 的 `current_config`）：编辑器刚存下的类目必须立刻在这个响应里，
+        # 否则用户看到的还是旧表、以为自己没存上。
+        # 变量名从 `cats` 改成 `cfg_cats` 是刻意的，好让 `grep -n "cats" vigil/api.py`
+        # 一眼看出还有哪里在用旧的那一份。
+        cfg_cats = current_categories()
         con = connect()
         try:
             counts = store.kind_counts(con)
         finally:
             con.close()
+        ov = overrides.connect()
+        try:
+            aliases = overrides.kind_aliases(ov)
+        finally:
+            ov.close()
         return {
             "categories": [
                 {
                     "slug": c.slug,
                     "label": c.label,
                     "icon": c.icon,
+                    # ⚠️ `desc` 也在契约里（M6 T5）：编辑器要拿它回填输入框，
+                    # 而这个字段是**逐字进 LLM 提示词的判据**——不给的话，
+                    # 界面上改一次别的字段就会把它抹掉。
+                    "desc": c.desc,
                     "count": counts.get(c.slug, 0),
                 }
-                for c in cats
-            ]
+                for c in cfg_cats
+            ],
+            # ⚠️ 一次把别名映射也交出去，供界面显示「旧名 life → 现在叫 daily」。
+            # 单独开一个端点也行，但界面每次都要它，多一次往返不值。
+            "aliases": aliases,
         }
+
+    # ⚠️ **四个写端点里每一步都在 `write_lock` 里**（与 `api_add_group` 同形）。
+    # 读在锁外的话，「读 → 改 → 写」这个整体替换就会被两个并发请求交错
+    # （各自读到旧版本、各自算 candidate、后写的赢）⇒ 可能丢一次编辑。
+    # 那正是 `write_lock` 上面那段注释点名要防的事，不因为「单用户自用概率低」
+    # 就可以省（spec §6 R10）。
+    # ⚠️ **实测：这一层今天没有牙**——把锁换成空上下文，全量 **704 passed / 0 red**
+    # （没有任何并发用例）。它守的是一个**单线程测试看不见**的性质，
+    # 与上面 `categories_path()` 那条是同一族的诚实标注（勘误 E7）。
+    #
+    # ⚠️ 快照的**位置**也是承重的：`snapshot_categories()` 必须在
+    # `commit_categories()` **之前**。反过来（先 commit 再拍快照）实测 ⇒
+    # `test_api_category_undo_restores_the_previous_file` **红**：撤销会"回滚"到
+    # 刚写进去的那一份，即点了撤销什么都没发生。
+    #
+    # ⚠️ `api_update_category` / `api_delete_category` 里「**先写别名、再写配置**」
+    # 的顺序**没有测试**（两种顺序在单请求里都绿）：它防的是**两次写之间崩溃**
+    # 留下的"配置里已经没有 life 了、但别名还没建"⇒ 条目永久悬空。
+    # 这一条是**设计选择**，不是被测试逼出来的——如实标注，免得后来者以为有守卫。
+
+    @app.post("/api/categories", status_code=201)
+    def api_add_category(body: dict = Body(...)) -> dict:
+        cat = category_or_400(body)
+        with write_lock:
+            existing = current_categories()
+            if any(c.slug == cat.slug for c in existing):
+                raise HTTPException(status_code=409, detail=f"类目 {cat.slug} 已经存在")
+            candidate = existing + (cat,)
+            validate_or_400(candidate)      # ⚠️ 先验，后拍快照 ⇒ 400 时零副作用
+            snapshot_categories()
+            commit_categories(candidate)
+        return {"slug": cat.slug, "label": cat.label}
+
+    @app.put("/api/categories/{slug}")
+    def api_update_category(slug: str, body: dict = Body(...)) -> dict:
+        """改一个类目。**body 里带 `slug` 且与路径不同 ⇒ 这是一次改名**。
+
+        ⚠️ **写入顺序是承重的：先写别名，再写配置文件。**
+        反过来的话，中间崩溃会留下「配置里已经没有 `life` 了、但别名还没建」
+        ⇒ 条目永久悬空（正是 spec §4.2 ④ 点名要禁的状态）；
+        先写别名的话，中间崩溃只留下一条约不到的别名——无害，
+        配置文件写好之后它立刻生效。
+        """
+        with write_lock:
+            existing = current_categories()
+            old = next((c for c in existing if c.slug == slug), None)
+            if old is None:
+                raise HTTPException(status_code=404, detail=f"没有这个类目：{slug}")
+
+            new_slug = str(body.get("slug", slug)).strip() or slug
+            merged = category_or_400(
+                {
+                    "slug": new_slug,
+                    "label": body.get("label", old.label),
+                    "desc": body.get("desc", old.desc),
+                    "icon": body.get("icon", old.icon),
+                }
+            )
+            # ⚠️ 空操作**不拍快照**：拍下去的话，一次"什么都改"的 PUT
+            # 会往撤销栈里塞一格假的——用户点撤销时会看到"配置没变"
+            # （因为那一格就是当前内容），于是以为撤销坏了。
+            if merged == old:
+                return {"slug": slug, "label": old.label}
+
+            candidate = tuple(merged if c.slug == slug else c for c in existing)
+            validate_or_400(candidate)
+
+            if new_slug != slug:
+                ov = overrides.connect()
+                try:
+                    overrides.set_kind_alias(ov, old_kind=slug, new_kind=new_slug)
+                finally:
+                    ov.close()
+            snapshot_categories()
+            commit_categories(candidate)
+        return {"slug": merged.slug, "label": merged.label}
+
+    @app.delete("/api/categories/{slug}", status_code=204)
+    def api_delete_category(slug: str, migrate_to: str | None = None) -> None:
+        """删一个类目。**还有条目指着它时必须给 `?migrate_to=`**。
+
+        ⚠️ 「有 N 条属于它」这句话**必须真的说出来**（spec 出口判据 6）：
+        只回一句「不能删」是没用的，用户需要知道**有多少条**、
+        以及**不迁移会怎样**。所以 detail 里带上条数。
+
+        ⚠️ 迁移的实现就是一条别名（`slug → migrate_to`），**不碰 `items`**
+        ——那正是 `kind_alias` 存在的理由。
+        """
+        with write_lock:
+            existing = current_categories()
+            if not any(c.slug == slug for c in existing):
+                raise HTTPException(status_code=404, detail=f"没有这个类目：{slug}")
+
+            candidate = tuple(c for c in existing if c.slug != slug)
+            if not candidate:
+                raise HTTPException(
+                    status_code=409,
+                    detail="这是最后一个类目，删掉它会让 refine 的提示词没有类目表可用。",
+                )
+            validate_or_400(candidate)
+
+            con = connect()
+            try:
+                n = store.kind_counts(con).get(slug, 0)
+            finally:
+                con.close()
+
+            if n and not migrate_to:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"类目 {slug} 还有 {n} 条条目指着它。删之前必须给一个迁移目标："
+                        f"`DELETE /api/categories/{slug}?migrate_to=<某个现存 slug>`。"
+                        "不给的话那些条目会指向一个不存在的类目。"
+                    ),
+                )
+            if migrate_to and migrate_to not in {c.slug for c in candidate}:
+                raise HTTPException(
+                    status_code=400, detail=f"迁移目标 {migrate_to!r} 不是一个现存类目"
+                )
+
+            if migrate_to:
+                # ⚠️ 先写别名（见 `api_update_category` 的 docstring）
+                ov = overrides.connect()
+                try:
+                    overrides.set_kind_alias(ov, old_kind=slug, new_kind=migrate_to)
+                finally:
+                    ov.close()
+            snapshot_categories()
+            commit_categories(candidate)
+        return None
+
+    @app.post("/api/categories/undo")
+    def api_category_undo() -> dict:
+        """把 `categories.toml` 回滚到上一次程序写它之前的样子。
+
+        ⚠️ **与 `/api/undo` 是两回事**（spec §3.3：「两者都做，别混为一谈」）：
+        那条撤的是**对条目的人工修改**（删事件），这条回滚的是**配置文件**
+        （整份存档）。协议上也刻意分开：这条回 `{"undone": bool}`，
+        与 `/api/undo` 对齐，但**不接受 `edit_id`**——快照没有"中间某一条"，
+        只有"上一格"。
+        """
+        ov = overrides.connect()
+        try:
+            popped = overrides.pop_config_snapshot(ov)
+        finally:
+            ov.close()
+        if popped is None:
+            return {"undone": False}
+
+        _, body = popped
+        # ⚠️ 恢复的是一份**手里没有第二份**的内容：先校验再落盘。
+        # 直接 `atomic_write_text` 的话，一份坏快照会把配置永久写坏
+        # （原子写、无回滚），而 `categories.toml` 是 refine 与 api 的硬依赖。
+        try:
+            raw = tomllib.loads(body)
+            categories_mod.validate_categories(
+                raw.get("categories"), categories_path()
+            )
+        except (tomllib.TOMLDecodeError, categories_mod.CategoryError) as exc:
+            raise HTTPException(
+                status_code=500,
+                detail=f"快照内容已损坏，拒绝写回（配置未被改动）：{exc}",
+            )
+        with write_lock:
+            atomic_write_text(categories_path(), body)
+        return {"undone": True}
 
     @app.get("/api/items")
     def api_items(
@@ -285,6 +575,7 @@ def create_app(config: Config) -> FastAPI:
         # 否则选了 9/13 却搜不到 9/13 当天，是最容易让人不信任搜索的错法。
         q = (q or "").strip()
         names = group_names_map()
+        cats = category_map()
         con = connect()
         try:
             items, total = store.search_items(
@@ -301,7 +592,7 @@ def create_app(config: Config) -> FastAPI:
         finally:
             con.close()
         return {
-            "items": [item_out(it, names) for it in items],
+            "items": [item_out(it, names, cats) for it in items],
             # ⚠️ total 是**符合筛选条件的总数**，与 limit/offset 无关（不是当页条数）。
             # 前端三处依赖它：分页按钮出不出、「共 N 条」、「还有 N 条」。
             # store.search_items 已经把两者一起返回，这里照传即可。
@@ -313,12 +604,13 @@ def create_app(config: Config) -> FastAPI:
     @app.get("/api/items/{item_id}")
     def api_item(item_id: int) -> dict:
         names = group_names_map()
+        cats = category_map()
         con = connect()
         try:
             it = store.get_item(con, item_id)
             if it is None:
                 raise HTTPException(status_code=404, detail=f"没有这条条目：{item_id}")
-            payload = item_out(it, names)
+            payload = item_out(it, names, cats)
             payload["sources"] = [
                 {
                     "msg_id": s.msg_id,
@@ -668,6 +960,7 @@ def create_app(config: Config) -> FastAPI:
     @app.get("/api/digests/{digest_id}")
     def api_digest(digest_id: int) -> dict:
         names = group_names_map()
+        cats = category_map()
         con = connect()
         try:
             row = store.get_digest(con, digest_id)
@@ -684,7 +977,7 @@ def create_app(config: Config) -> FastAPI:
             "created_at": row.created_at,
             "item_count": row.item_count,
             "body_md": row.body_md,
-            "items": [item_out(it, names) for it in items],
+            "items": [item_out(it, names, cats) for it in items],
         }
 
     # ⚠️ **不要**用 `app.mount("/assets", StaticFiles(...))` 那一套。

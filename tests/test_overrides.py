@@ -655,3 +655,63 @@ def test_undo_conflict_is_its_own_type_not_a_dumb_overlay_error(ov):
     with pytest.raises(overrides.UndoConflict, match="重新被软删"):
         overrides.undo(ov, edit_id=e_kind)
     assert _state_row(ov, 9) == ("life", 0), "被拒绝的撤销改动了状态"
+
+
+# ── M6 T5：配置快照 + slug 别名 ─────────────────────────────────────
+#
+# ⚠️ 偏差（逃逸舱）：brief 这五条的参数名写的是 `con`，但本文件**没有**这个夹具
+# ——既有的写路径用例一律用 `ov`（内存库 + `ensure_tables`），这里照用 `ov`，
+# 不新造一个同形的第二个夹具（两份实现会漂移）。
+
+
+def test_config_snapshot_roundtrips(ov):
+    sid = overrides.save_config_snapshot(ov, body="[llm]\n", now=100)
+    assert sid > 0
+    assert overrides.list_config_snapshots(ov) == [(sid, 100)]
+
+
+def test_pop_removes_the_row_so_undo_walks_backwards(ov):
+    """⭐ 撤销是「往回走一格」，不是「在两份内容之间弹跳」。
+
+    ⚠️ 这条钉的是一个具体的错法：`pop` 若不删行，那么「撤销 → 再撤销」
+    会**无限撤销同一个状态**（用户看到的是"点了没反应"），
+    而第三次、第四次仍是它。删行之后每一次撤销都真的往回走一格。
+    """
+    overrides.save_config_snapshot(ov, body="第一版", now=1)
+    overrides.save_config_snapshot(ov, body="第二版", now=2)
+    assert overrides.pop_config_snapshot(ov) == (2, "第二版")
+    assert overrides.pop_config_snapshot(ov) == (1, "第一版")
+    assert overrides.pop_config_snapshot(ov) is None
+    assert overrides.list_config_snapshots(ov) == []
+
+
+def test_kind_alias_flattens_a_chain(ov):
+    """⭐ 别名在**写入时压平**，读路径永远只面对一层映射。
+
+    ⚠️ 不压平的话，`_EFFECTIVE_KIND` 那一个 JOIN 只能跟一格
+    （`life → daily` 之后又 `daily → daily_v2`，条目仍会显示成 `daily`），
+    要跟到底就得用**递归 CTE**——而那要把复杂度塞进 `store.py` 的
+    每一条查询里（四处，漏一处就是静默的错分类）。
+
+    ⚠️ 变异反证：把 `set_kind_alias` 里那句
+    `UPDATE kind_alias SET new_kind = ? WHERE new_kind = ?` 删掉
+    ⇒ 本条**必红**（`kind_aliases(ov)["life"]` 会是 `"daily"` 而不是 `"daily_v2"`）。
+    """
+    overrides.set_kind_alias(ov, old_kind="life", new_kind="daily", now=1)
+    final = overrides.set_kind_alias(ov, old_kind="daily", new_kind="daily_v2", now=2)
+    assert final == "daily_v2"
+    aliases = overrides.kind_aliases(ov)
+    assert aliases["life"] == "daily_v2", "旧名字必须跟着一起走到最终名"
+    assert aliases["daily"] == "daily_v2"
+
+
+def test_kind_alias_rejects_a_self_loop(ov):
+    with pytest.raises(overrides.OverlayError, match="相同"):
+        overrides.set_kind_alias(ov, old_kind="life", new_kind="life")
+
+
+def test_kind_alias_refuses_to_build_a_cycle(ov):
+    """⚠️ 环只可能来自手工改库，但**死循环比报错糟得多**（它会挂住整个请求）。"""
+    overrides.set_kind_alias(ov, old_kind="a", new_kind="b", now=1)
+    with pytest.raises(overrides.OverlayError, match="环"):
+        overrides.set_kind_alias(ov, old_kind="b", new_kind="a")

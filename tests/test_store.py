@@ -1569,3 +1569,67 @@ def test_dedupe_batch_key_is_exact_not_normalized():
         "选课通知", "选课通知 ", "CET-4 报名", "cet-4 报名",
     ], "键被规范化了：两条不同的条目被合并，其中一条会从 Web 与日报消失"
     assert [i.src_msg_ids for i in out] == [(11,), (12,), (13,), (14,)]
+
+
+# ── M6 T5：kind_alias 进读取层（四处 SQL 的收敛）────────────────────
+#
+# ⚠️ 偏差（逃逸舱）：brief 这条用例的夹具写的是 `con_with_two_items`，本文件
+# **没有**这个夹具（既有的造数助手是 `_seed` / `_insert_item` /
+# `_seed_two_items_for_search`）。这里按 `_seed` 补一个最小夹具：
+# **两条 kind='life' 的条目**，且两条都落在 `window_items` 的窗口内。
+
+
+@pytest.fixture
+def con_with_two_items():
+    """两条 `kind='life'` 的条目（内存库 + overlay 就位）。
+
+    ⚠️ 两条而不是一条：`kind_counts` / `total` 那几处断言若只有一条，
+    「按 kind 分桶错成整表计数」之类会看不出来。
+    """
+    conn = sqlite3.connect(":memory:", uri=True)
+    store.ensure_schema(conn)
+    _seed(conn, title="甲", kind="life")
+    _seed(conn, title="乙", kind="life")
+    yield conn
+    conn.close()
+
+
+def test_kind_alias_applies_to_every_reading_path(con_with_two_items):
+    """⭐ 一条别名必须同时改变**四个**读取路径的回答（R13 的落点）。
+
+    ⚠️ 这条测试的形状是刻意的：它**在一个用例里同时断言四处**。
+    拆成四条独立用例的话，「只改了 `_ITEM_COLS`、忘了 `kind_counts`」
+    会各自绿一条、红一条——而那恰恰是最可能发生的漏法（四处里有三处
+    长得完全一样，只有 `window_items` 是手抄的）。
+
+    ⚠️ 变异反证（四个方向各验一次，**实施时都要跑**）：
+      · 把 `_ITEM_COLS` 里的 `_EFFECTIVE_KIND` 换回 `COALESCE(ost.kind, i.kind)` ⇒ 红
+      · 把 `_item_filters` 那处换回 ⇒ 红
+      · 把 `kind_counts` 那处换回（**两处都要**）⇒ 红
+      · 把 `window_items:419` 那处换回 ⇒ 红
+    """
+    from vigil import overrides
+
+    overrides.attach_readonly(con_with_two_items)
+    ov = overrides.connect()
+    try:
+        overrides.set_kind_alias(ov, old_kind="life", new_kind="daily")
+    finally:
+        ov.close()
+
+    # ① _ITEM_COLS（列表接口）
+    items, total = store.search_items(con_with_two_items)
+    assert {it.kind for it in items} == {"daily"}
+
+    # ② _item_filters（按类目筛选）
+    hit, _ = store.search_items(con_with_two_items, kinds=["daily"])
+    assert len(hit) == total
+    miss, _ = store.search_items(con_with_two_items, kinds=["life"])
+    assert miss == [], "旧 slug 不该还能筛出东西——它已经不是任何条目的有效类目了"
+
+    # ③ kind_counts（角标）
+    assert store.kind_counts(con_with_two_items) == {"daily": total}
+
+    # ④ window_items（日报）
+    win = store.window_items(con_with_two_items, since=0, until=2**31)
+    assert {w.kind for w in win} == {"daily"}

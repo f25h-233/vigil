@@ -61,7 +61,24 @@ CREATE TABLE IF NOT EXISTS item_state (
     kind    TEXT,
     deleted INTEGER NOT NULL DEFAULT 0
 );
+
+CREATE TABLE IF NOT EXISTS config_snapshots (
+    snapshot_id INTEGER PRIMARY KEY,
+    saved_at    INTEGER NOT NULL,
+    body        TEXT    NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS kind_alias (
+    old_kind   TEXT PRIMARY KEY,
+    new_kind   TEXT NOT NULL,
+    created_at INTEGER NOT NULL
+);
 """
+
+# ⚠️ 上面这两张新表（M6 T5）**刻意不加索引**：都是个位数到几十行的规模，
+# 而 `_qualified_ddl` 的索引处理有一条极易踩的坑——索引名要限定 schema、
+# 但**表名不许带 schema**（SQLite 语法限制，见 `_qualified_ddl` 的实测记录）。
+# 不加索引就不会碰到它。
 
 
 class OverlayError(RuntimeError):
@@ -314,6 +331,153 @@ def delete_item(
         conn, item_id=item_id, msg_id=msg_id, action=ACTION_DELETE, field=None,
         old_value=None, new_value=None, actor=actor, now=now,
     )
+
+
+# ── 配置版本快照（M6 T5）────────────────────────────────────────────
+#
+# ⚠️ 它**不是** overlay。（spec §3.3：「类目配置的回滚是另一件事
+# （`config/categories.toml` 的版本快照），两者都做，别混为一谈」。）
+# overlay 记的是「人对**条目**的修改」，快照记的是「程序对**配置文件**的
+# 上一次覆盖」——前者用事件日志（可逐条撤销），后者用整份存档
+# （只能是整体回滚）。
+#
+# ⚠️ 为什么快照存在 overlay 库里而不是 `config/history/` 下：
+# `config/` 是**要进 git** 的、且它的语义是「唯一真相源」；往里堆历史副本
+# 会让「哪一份是真的」变得需要解释，而 `data/overrides.db` 本来就是
+# 「会随时间增长的本地可写数据」——这正是快照的性质。
+#
+# ⚠️ **升级路径**：`config_snapshots` / `kind_alias` 是 M6 T5 新加的表，
+# 而已有的 `data/overrides.db` 里没有它们。`ensure_schema` 用的是
+# `CREATE TABLE IF NOT EXISTS`，`create_app`（服务启动）与 `store.ensure_schema`
+# 都会调它 ⇒ **升级后让服务重启一次**（或跑一次 `vigil refine`）即可。
+# ⚠️ 而**读取路径**（`attach_readonly`）只在「文件本来就不存在」时才建表——
+# 所以没重启就会撞 `no such table: ov.kind_alias`。那是**响亮**的失败，
+# 不是静默降级（与 R4 的既有权衡一致：宁可报错，也不许"查不到别名 ⇒ 按旧
+# slug 显示"这种静默的错分类）。
+
+
+def save_config_snapshot(
+    conn: sqlite3.Connection, *, body: str, now: int | None = None
+) -> int:
+    """存一份配置文件的**原文**。返回 `snapshot_id`。
+
+    ⚠️ 存**原文**而不是解析后的结构：撤销要还原的是**那份文件**，
+    重新序列化会丢掉用户手工加的注释（而 `_CATEGORIES_HEADER` 之外的东西
+    正是「用户改过这里」的痕迹）。
+    """
+    stamp = int(time.time()) if now is None else now
+    cur = conn.execute(
+        "INSERT INTO config_snapshots (saved_at, body) VALUES (?, ?)", (stamp, body)
+    )
+    conn.commit()
+    return int(cur.lastrowid)
+
+
+def list_config_snapshots(
+    conn: sqlite3.Connection, *, limit: int = 20
+) -> list[tuple[int, int]]:
+    """`[(snapshot_id, saved_at)]`，**新的在前**。"""
+    return [
+        (int(a), int(b))
+        for a, b in conn.execute(
+            "SELECT snapshot_id, saved_at FROM config_snapshots"
+            " ORDER BY snapshot_id DESC LIMIT ?",
+            (limit,),
+        )
+    ]
+
+
+def pop_config_snapshot(conn: sqlite3.Connection) -> tuple[int, str] | None:
+    """取最近一条快照**并删掉它**，返回 `(snapshot_id, body)`；空栈返回 `None`。
+
+    ⚠️ **必须删掉那一行**，否则「撤销 → 再撤销」会无限撤销同一个状态
+    （用户看到的是"点了没反应"）。删行之后每一次撤销都真的往回走一格——
+    这与 `undo` 删事件是同一个思路（两者都是"往回走一格"）。
+    """
+    row = conn.execute(
+        "SELECT snapshot_id, body FROM config_snapshots ORDER BY snapshot_id DESC LIMIT 1"
+    ).fetchone()
+    if row is None:
+        return None
+    conn.execute("DELETE FROM config_snapshots WHERE snapshot_id = ?", (row[0],))
+    conn.commit()
+    return (int(row[0]), str(row[1]))
+
+
+# ── slug 别名（M6 T5）───────────────────────────────────────────────
+#
+# ⚠️ 它解决的是一个**结构性**矛盾：spec §4.2 ④ 要求「slug 重命名/删除必须级联」，
+# 而 §7/§9 又说 `data/vigil.db` 只读 ⇒ **级联只能发生在读取层**。
+# 于是 `store._EFFECTIVE_KIND` 写成 `COALESCE(ost.kind, ka.new_kind, i.kind)`，
+# 而这张表就是那个 `ka`。
+
+
+def set_kind_alias(
+    conn: sqlite3.Connection, *, old_kind: str, new_kind: str,
+    now: int | None = None,
+) -> str:
+    """记下「旧 slug 现在叫新 slug」。返回**最终**落进表里的 `new_kind`。
+
+    ⚠️ **写入时压平，读取时只做一次 JOIN**（这是本函数存在的全部理由）。
+    别名可以链式追加（`life → daily` 之后又 `daily → daily_v2`）。若表里留着链，
+    读路径就得用**递归 CTE** 才能算出最终 slug——而那会把复杂度塞进
+    `store.py` 的**四处**查询里（`_ITEM_COLS` / `_item_filters` / `kind_counts`
+    两处 / `window_items`），漏一处就是静默的错分类。
+    在这里压平，读路径永远只面对「一层映射」。
+
+    ⚠️ 写入顺序在 API 侧是承重的：**先写别名、再写配置文件**。
+    反过来的话，中间崩溃会留下「配置里已经没有 life 了、但别名还没建」⇒
+    条目永久悬空；而先写别名的话，中间崩溃只留下一条约不到的别名（无害，
+    配置写好之后就生效了）。
+    """
+    if not old_kind or not new_kind:
+        raise OverlayError("别名两端都不能为空")
+    if old_kind == new_kind:
+        raise OverlayError(
+            f"别名两端相同（{old_kind}）——那是一条什么都不做的映射，"
+            "多半是改名时把新旧名字填成了同一个"
+        )
+
+    stamp = int(time.time()) if now is None else now
+
+    # ① 先跟到底：新名字自己可能已经被改过名
+    final = new_kind
+    seen = {old_kind}
+    while True:
+        row = conn.execute(
+            "SELECT new_kind FROM kind_alias WHERE old_kind = ?", (final,)
+        ).fetchone()
+        if row is None:
+            break
+        if row[0] in seen:
+            # 环只可能来自手工改库，但**死循环比报错糟得多**——它会挂住整个请求，
+            # 而请求是跑在线程池里的，几个环就能把服务拖垮。
+            raise OverlayError(
+                f"别名成环：{old_kind} → … → {row[0]}。"
+                "这张表是程序维护的，出现环说明有人手工改过它。"
+            )
+        seen.add(row[0])
+        final = str(row[0])
+
+    # ② 链式传播：所有指向 old_kind 的行一起走到 final
+    conn.execute(
+        "UPDATE kind_alias SET new_kind = ? WHERE new_kind = ?", (final, old_kind)
+    )
+    # ③ 记下/更新自己
+    conn.execute(
+        "INSERT INTO kind_alias (old_kind, new_kind, created_at) VALUES (?,?,?)"
+        " ON CONFLICT(old_kind) DO UPDATE SET new_kind = excluded.new_kind",
+        (old_kind, final, stamp),
+    )
+    conn.commit()
+    return final
+
+
+def kind_aliases(conn: sqlite3.Connection) -> dict[str, str]:
+    """`{旧 slug: 新 slug}`。**已是压平后的**（见 `set_kind_alias`）。"""
+    return {
+        str(a): str(b) for a, b in conn.execute("SELECT old_kind, new_kind FROM kind_alias")
+    }
 
 
 def _state_of(conn: sqlite3.Connection, item_id: int) -> tuple[str | None, int]:

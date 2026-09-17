@@ -125,6 +125,22 @@ def validate_categories(entries: object, path: pathlib.Path) -> tuple[Category, 
     return tuple(out)
 
 
+def as_dicts(cats: Sequence[Category]) -> list[dict[str, str]]:
+    """`Category` 序列 → `tomllib` 形状的字典列表。
+
+    ⚠️ 存在的理由是**字段名只能有一份**：`slug`/`label`/`desc`/`icon` 这四个
+    名字同时出现在读侧（`validate_categories` 的取值）、写侧（`save_categories`
+    的 f-string）与 API 侧（`_category_from_body`）。让 API 侧手搓第三个
+    字典字面量，就是给「改了三个漏一个」留位置。
+
+    ⚠️ 它**不负责校验**——喂给 `validate_categories` 才有校验。
+    叫 `as_dicts` 而不是 `to_raw` 是刻意的：后者听起来像"已经验过了"。
+    """
+    return [
+        {"slug": c.slug, "label": c.label, "desc": c.desc, "icon": c.icon} for c in cats
+    ]
+
+
 def prompt_block(cats: tuple[Category, ...]) -> str:
     """渲染成提示词里的类目表——改 categories.toml 即改提示词。"""
     width = max(len(c.slug) for c in cats)

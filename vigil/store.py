@@ -417,10 +417,14 @@ def window_items(
     """
     _ensure_overlay(conn)
     rows = conn.execute(
-        "SELECT i.item_id, COALESCE(ost.kind, i.kind), i.title, i.detail, i.event_ts,"
+        f"SELECT i.item_id, {_EFFECTIVE_KIND}, i.title, i.detail, i.event_ts,"
         " i.deadline_ts, i.group_id, i.place, i.amount, i.confidence"
         " FROM items i"
         " LEFT JOIN ov.item_state ost ON ost.item_id = i.item_id"
+        # ⚠️ 这一处**曾经是手抄的**（T5 之前它自己写 `COALESCE(ost.kind, i.kind)`，
+        # 而且没有 `ka`），漏掉它的后果是「界面与日报对同一个条目的类目说法不同」
+        # ——R13 的典型形状。现在它用同一个常量。
+        " LEFT JOIN ov.kind_alias ka ON ka.old_kind = i.kind"
         f" WHERE i.event_ts >= ? AND i.event_ts < ? AND {_NOT_DELETED}"
         " ORDER BY i.event_ts ASC, i.item_id ASC",
         (since, until),
@@ -867,8 +871,27 @@ def _ensure_overlay(conn: sqlite3.Connection) -> None:
     overrides.attach_readonly(conn)
 
 
+# ⚠️ **「有效类目」的唯一表达式**（M6 T5）。三条来源的优先级是**承重的**：
+#
+#     ost.kind      人工在界面上改过的分类 —— **最强的意图**，不能被改名覆盖
+#     ka.new_kind   slug 改名映射（`overrides.kind_alias`）
+#     i.kind        库里的原值
+#
+# ⚠️ 抽成常量**不是为了好看**：在 T5 之前，同一个表达式在**四个地方**各抄了一遍
+# （`_ITEM_COLS` / `_item_filters` / `kind_counts` 两处 / `window_items`），
+# 而 `window_items` 那份是手抄的、形状还不同（它没有 `ost` 的别名）。
+# 「改三处漏一处」在这个形状下是**必然**会发生的，而漏掉 `window_items`
+# 的后果是「界面与日报对同一个条目的类目说法不同」——正是 R13。
+# 现在只有一处可改，与 `_NOT_DELETED` 完全同形。
+#
+# ⚠️ 用的地方**必须同时挂 `ka` 那个 LEFT JOIN**（见 `_ITEM_JOINS`）。
+# 不挂的话 SQLite 报 `no such column: ka.new_kind`——**响亮**的失败，不是静默
+# 的错分类。这是刻意的：静默的那一半（忘了改某个消费点）才是真正危险的，
+# 而"少挂 JOIN"这类错误一跑就现形。
+_EFFECTIVE_KIND = "COALESCE(ost.kind, ka.new_kind, i.kind)"
+
 _ITEM_COLS = (
-    "i.item_id, COALESCE(ost.kind, i.kind) AS kind, i.title, i.detail, i.event_ts,"
+    f"i.item_id, {_EFFECTIVE_KIND} AS kind, i.title, i.detail, i.event_ts,"
     " i.deadline_ts, i.group_id,"
     " COALESCE(NULLIF(sn.group_nick, ''), NULLIF(sn.qq_nick, ''), '') AS actor,"
     " sn.uin AS actor_uin,"
@@ -881,6 +904,15 @@ _ITEM_JOINS = (
     " FROM items i"
     " LEFT JOIN sender_names sn ON sn.group_id = i.group_id AND sn.uid = i.actor_uid"
     " LEFT JOIN ov.item_state ost ON ost.item_id = i.item_id"
+    # slug 改名映射（M6 T5）。键取**库里的原值** `i.kind`。
+    #
+    # ⚠️ 写成 `ON ka.old_kind = COALESCE(ost.kind, i.kind)` **也一样对**——实测：
+    # 四处一起换掉，全量 **704 passed / 0 red**。两个键在本表达式下可证明等价：
+    # `ost.kind` 非空时它自己就占了 `COALESCE` 的最左位，`ka.new_kind` 根本没机会
+    # 露头（匹配到哪一行都改不了答案）；`ost.kind` 为空时两个键是同一个表达式。
+    # 选 `i.kind` 只是因为它短、且不必让读的人先在脑子里展开一遍 COALESCE
+    # ——**不是**因为另一个写法会错。（勘误 E7：没有实测支撑的理由不许写成结论。）
+    " LEFT JOIN ov.kind_alias ka ON ka.old_kind = i.kind"
 )
 
 # ⚠️ 软删的条目在**所有**读取路径上都必须消失（D15）。拼进 `_ITEM_JOINS` 的
@@ -958,7 +990,7 @@ def _item_filters(
     if kinds:
         # ⚠️ 按**覆盖后**的类目筛——否则界面上改了分类却筛不出来。
         marks = ",".join("?" * len(kinds))
-        where.append(f"COALESCE(ost.kind, i.kind) IN ({marks})")
+        where.append(f"{_EFFECTIVE_KIND} IN ({marks})")
         params.extend(kinds)
     if actor_uins:
         # ⚠️ `uin` 只在 `sender_names` 里（`items` 存的是 `actor_uid`）。
@@ -1027,12 +1059,18 @@ def search_items(
     # ⚠️ 总数也要走同一套 JOIN/过滤——否则分页与「共 N 条」会说谎。
     # ⚠️ 这里的 FROM 必须与 `_ITEM_JOINS` **逐字一致**（人物筛选用到 `sn.uin`）：
     # 两处并排写着，就是为了让「改了一处忘了另一处」一眼可见。
+    # ⚠️ M6 T5 起还多一处：`_item_filters` 产出的 `kinds` 片段引用
+    # `{_EFFECTIVE_KIND}`（它含 `ka`）⇒ **这里的 FROM 也必须挂 `ka`**，
+    # 否则「按类目筛」这条路径直接 `no such column: ka.new_kind`。
+    # 它是 `_EFFECTIVE_KIND` 的**第五个消费点**，而计划正文只数了四处
+    # ——因为这一处消费的是**筛选片段**而不是那个表达式本身。
     total = int(
         conn.execute(
             "SELECT COUNT(*) FROM items i"
             " LEFT JOIN sender_names sn"
             "   ON sn.group_id = i.group_id AND sn.uid = i.actor_uid"
             " LEFT JOIN ov.item_state ost ON ost.item_id = i.item_id"
+            " LEFT JOIN ov.kind_alias ka ON ka.old_kind = i.kind"
             f"{clause}",
             params,
         ).fetchone()[0]
@@ -1081,12 +1119,16 @@ def source_messages(conn: sqlite3.Connection, item_id: int) -> list[SourceRow]:
 def kind_counts(conn: sqlite3.Connection) -> dict[str, int]:
     """每个类目有多少条（**按覆盖后的类目**，且不含软删）。类目视图的角标用它。"""
     _ensure_overlay(conn)
+    # ⚠️ 这里**不能省 JOIN**：它不走 `_ITEM_JOINS`（那是 SELECT 列与 FROM 的配对），
+    # 所以加 `ka` 时必须**同一个函数里两处一起加**（FROM 与 GROUP BY 表达式
+    # 都依赖它）。缺 FROM 那半 ⇒ `no such column: ka.new_kind`。
     return {
         str(k): int(n)
         for k, n in conn.execute(
-            "SELECT COALESCE(ost.kind, i.kind), COUNT(*) FROM items i"
+            f"SELECT {_EFFECTIVE_KIND}, COUNT(*) FROM items i"
             " LEFT JOIN ov.item_state ost ON ost.item_id = i.item_id"
-            f" WHERE {_NOT_DELETED} GROUP BY COALESCE(ost.kind, i.kind)"
+            " LEFT JOIN ov.kind_alias ka ON ka.old_kind = i.kind"
+            f" WHERE {_NOT_DELETED} GROUP BY {_EFFECTIVE_KIND}"
         )
     }
 

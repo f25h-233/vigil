@@ -209,7 +209,9 @@ def test_spa_fallback_still_serves_frontend_routes(client, tmp_path, monkeypatch
 def test_categories_carry_counts(client):
     cats = client.get("/api/categories").json()["categories"]
     assert len(cats) == 7
-    assert {"slug", "label", "icon", "count"} == set(cats[0])
+    # ⚠️ M6 T5 起 `desc` 也在响应里（编辑器要拿它回填输入框）。
+    # 这条字段集合是**冻结契约**：少一个键，前端的输入框会静默空掉。
+    assert {"slug", "label", "icon", "desc", "count"} == set(cats[0])
     assert [c["slug"] for c in cats][0] == "notice"     # 顺序 = config 里的顺序
 
 
@@ -1419,6 +1421,53 @@ _QQ_GROUPS = (
     groups_snapshot.GroupInfo(id=222, name="乙群", messages=0, last_ts=0),
 )
 
+# 这个隔离根里的类目表（M6 T5）。比 conftest 那份小——它只需要满足类目端点
+# 用例的要求：`life` 既是「重复 slug」又是删类目的迁移目标，
+# `academic` 是被改名/被删的那一个（`item_ids[0]` 的类目）。
+_CATEGORIES_TOML = """\
+[[categories]]
+slug = "notice"
+label = "通知公告"
+desc = "隔离用类目：通知公告"
+
+[[categories]]
+slug = "academic"
+label = "学业"
+desc = "隔离用类目：学业"
+
+[[categories]]
+slug = "life"
+label = "生活"
+desc = "隔离用类目：生活"
+"""
+
+
+def _seed_items_db(db: pathlib.Path) -> None:
+    """造一个最小主库：两条条目（`academic` / `life`）。
+
+    ⚠️ **两条、且 `item_ids[0]` 那条不是 `life`**：类目用例里「改名/迁移之后
+    条目跟着走」的断言，拿一条本来就是目标类目的条目来测是**空的**
+    （改不改都绿）——而 T4 的夹具从不起库，`/api/items` 在它下面本来会炸。
+    """
+    conn = sqlite3.connect(str(db))
+    try:
+        store.ensure_schema(conn)
+        conn.executescript(_MESSAGE_TABLES_DDL)
+        ts = int(dt.datetime(2026, 9, 13, 12, 0).timestamp())
+        for item_id, kind, title in (
+            (1, "academic", "选课通知"), (2, "life", "宿舍通知"),
+        ):
+            conn.execute(
+                "INSERT INTO items (item_id, kind, title, detail, event_ts,"
+                " deadline_ts, group_id, actor_uid, place, amount, links, confidence,"
+                " model, prompt_ver, created_at)"
+                " VALUES (?,?,?,NULL,?,NULL,111,'u1',NULL,NULL,'[]',0.9,'m','v1',1)",
+                (item_id, kind, title, ts),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
 
 def _groups_root(tmp_path, monkeypatch, *, snapshot):
     """造一个 tmp「仓库根」+ 一份 `groups.toml` +（可选）一份快照。
@@ -1429,6 +1478,16 @@ def _groups_root(tmp_path, monkeypatch, *, snapshot):
     ⚠️ 路径写成**绝对 + posix**（`as_posix()`）：相对路径的解析基准是
     `config.REPO_ROOT`（**那个**全局没被挪走），写成相对就会指回真实仓库；
     反斜杠则是 TOML 基本字符串里的转义字符，必须避开。
+
+    ⚠️ M6 T5 起这个根下还多两样东西，否则类目端点用例够不着它们：
+      · `config/categories.toml`（`api.categories_path()` 与 `config_path()`
+        是**同一个根**）；
+      · 一个**真有条目**的主库（T4 的夹具从不起库，`/api/items` 在它下面
+        直接炸 `unable to open database`）。
+
+    ⚠️ 工厂上挂了一个 `item_ids` 属性（T5 的用例读 `client_factory.item_ids[0]`）。
+    它是**函数上的属性**而不是返回值上的字段：`client_factory()` 要的仍是
+    「一个本来就能直接当 TestClient 用的东西」，两者不能合成一个对象。
     """
     from vigil import api as _api
 
@@ -1443,6 +1502,10 @@ def _groups_root(tmp_path, monkeypatch, *, snapshot):
         _GROUPS_TOML.format(qq=qqdb.as_posix(), out=(data / "vigil.db").as_posix()),
         encoding="utf-8",
     )
+    (root / "config" / "categories.toml").write_text(
+        _CATEGORIES_TOML, encoding="utf-8"
+    )
+    _seed_items_db(data / "vigil.db")
     if snapshot is not None:
         groups_snapshot.write(snapshot, data / "groups-snapshot.json", now=1_700_000_999)
     # ⚠️ 必须在造 app 之前挪：`config_path()` 是**每次现读**这个全局的
@@ -1456,6 +1519,7 @@ def _groups_root(tmp_path, monkeypatch, *, snapshot):
     def make() -> TestClient:
         return TestClient(create_app(cfg))
 
+    make.item_ids = [1, 2]  # type: ignore[attr-defined]
     return make
 
 
@@ -1573,3 +1637,183 @@ def test_api_patch_group_disables_without_deleting(client_factory):
     body = c.get("/api/groups").json()
     assert all(not g["watched"] for g in body["groups"])
     assert any(g["id"] == 111 for g in body["groups"]), "停用不是删除——条目还在"
+
+
+# ── M6 T5：类目编辑端点 ─────────────────────────────────────────────
+#
+# ⚠️ 偏差（逃逸舱）：brief 这批用例逐字照抄，只多两处**夹具侧**的补丁
+# （见 `_groups_root` 的 docstring）：`client_factory.item_ids` 与
+# 「隔离根下要有 categories.toml / 一个真有条目的主库」。
+# T4 的夹具当初只造群清单，类目这一半是 T5 才出现的。
+
+
+def test_api_add_category_persists(client_factory):
+    c = client_factory()
+    r = c.post("/api/categories", json={
+        "slug": "sport", "label": "体育", "desc": "球赛、运动会", "icon": "⚽",
+    })
+    assert r.status_code == 201
+    slugs = [x["slug"] for x in client_factory().get("/api/categories").json()["categories"]]
+    assert "sport" in slugs
+
+
+def test_api_add_category_rejects_a_bad_slug(client_factory):
+    c = client_factory()
+    r = c.post("/api/categories", json={"slug": "Sports", "desc": "x"})
+    assert r.status_code == 400
+    # ⚠️ **断言详情，不只断言状态码**（勘误 E7 形态 5：输入到不了被测分支）。
+    # `category_or_400` 里还有别的 400（desc 为空 / 控制字符），400 本身
+    # 区分不出它是不是被 slug 规则拦下的——只有这句话能。
+    assert "slug" in r.json()["detail"]
+
+
+def test_api_add_category_rejects_a_duplicate(client_factory):
+    c = client_factory()
+    assert c.post("/api/categories", json={"slug": "life", "desc": "重复"}).status_code == 409
+
+
+def test_api_rename_category_creates_an_alias_and_moves_the_items(client_factory):
+    """⭐ **出口判据 6 的机械形式**：删/改一个类目之后，**不允许静默留下
+    指向不存在 slug 的条目**。
+
+    ⚠️ 判据必须查**条目那一侧**（`/api/items` 里那条的 `kind` 是不是新 slug），
+    只查 `/api/categories` 的话，"配置改了、条目还指着老 slug"照样绿——
+    而那是 spec 点名要禁的状态。
+    """
+    c = client_factory()
+    item_id = client_factory.item_ids[0]
+    old_kind = c.get(f"/api/items/{item_id}").json()["kind"]
+
+    r = c.put(f"/api/categories/{old_kind}", json={"slug": "life_v2"})
+    assert r.status_code == 200
+
+    assert c.get(f"/api/items/{item_id}").json()["kind"] == "life_v2"
+    slugs = [x["slug"] for x in c.get("/api/categories").json()["categories"]]
+    assert "life_v2" in slugs and old_kind not in slugs
+
+
+def test_api_delete_category_refuses_when_items_still_point_at_it(client_factory):
+    """⭐ 删除时**必须提示「有 N 条属于它」并要一个迁移目标**。
+
+    ⚠️ 不回 400/409 而直接删掉的话，那些条目会指向一个不存在的 slug——
+    `digest.py:465-469` 会把这个 slug 当成「类目表里没有的 kind」排到日报末尾
+    （它**不静默丢**，这很好），但界面上会显示成裸 slug。
+    """
+    c = client_factory()
+    old_kind = c.get(f"/api/items/{client_factory.item_ids[0]}").json()["kind"]
+    r = c.delete(f"/api/categories/{old_kind}")
+    assert r.status_code == 409
+    assert "migrate_to" in r.json()["detail"]
+
+
+def test_api_delete_category_with_migration_leaves_nothing_dangling(client_factory):
+    c = client_factory()
+    item_id = client_factory.item_ids[0]
+    old_kind = c.get(f"/api/items/{item_id}").json()["kind"]
+
+    r = c.delete(f"/api/categories/{old_kind}?migrate_to=life")
+    assert r.status_code == 204
+    assert c.get(f"/api/items/{item_id}").json()["kind"] == "life"
+    slugs = [x["slug"] for x in c.get("/api/categories").json()["categories"]]
+    assert old_kind not in slugs
+
+
+def test_api_category_undo_restores_the_previous_file(client_factory):
+    """⭐ 类目的「撤销」走**版本快照**，与 overlay 的撤销是两回事（spec §3.3）。"""
+    c = client_factory()
+    before = {x["slug"] for x in c.get("/api/categories").json()["categories"]}
+
+    c.post("/api/categories", json={"slug": "sport", "desc": "球赛"})
+    assert "sport" in {x["slug"] for x in c.get("/api/categories").json()["categories"]}
+
+    assert c.post("/api/categories/undo").status_code == 200
+    assert {x["slug"] for x in c.get("/api/categories").json()["categories"]} == before
+
+
+def test_api_category_undo_says_so_when_there_is_nothing_to_undo(client_factory):
+    """⚠️ 空栈时回一句「没有可撤销的操作」，而不是假装成功。
+
+    ⚠️ 与 `/api/undo` 的既有语义对齐（它回 `{"undone": false}`）——
+    两处撤销在**协议上**可以不同（一个是内容回滚、一个是事件删除），
+    但在**「没得撤时要说出来」这一点上必须一致**。
+    """
+    c = client_factory()
+    body = c.post("/api/categories/undo").json()
+    assert body["undone"] is False
+
+
+# ── M6 T5 的补充守卫（**brief 之外**）─────────────────────────────────
+#
+# 存在的理由只有一条：勘误 E7 要求「每一处改动都要答得出**删掉它什么会红**」。
+# 下面四条各对着上面某个**此前只有注释、没有守卫**的断言；注释里那些
+# 「为什么这样写」若没有测试兜着，就是 E7 说的那种「错的论证」的温床。
+
+
+def test_api_add_category_rejection_leaves_no_snapshot_behind(client_factory):
+    """⭐ `validate_or_400` **必须在 `snapshot_categories()` 之前**（注释里那句话的守卫）。
+
+    ⚠️ 判据走**撤销栈**而不是"看文件没变"：400 时若先拍了快照再校验，
+    文件确实没变，但撤销栈里多了一格**与当前内容相同**的快照 ⇒ 用户下一次
+    「撤销」会撤销掉这一格假的（看到的是"点了没反应"），而**真正的上一次修改
+    再也撤不回来了**（它被那一格顶掉了位置）。
+
+    变异反证：把 `api_add_category` 里 `validate_or_400(candidate)` 挪到
+    `snapshot_categories()` **之后** ⇒ 本条**必红**（undo 会回 200 而不是
+    `undone: false`）。
+    """
+    c = client_factory()
+    # 先做一次**合法**改动，让撤销栈里有且只有一格
+    assert c.post("/api/categories", json={"slug": "sport", "desc": "球赛"}).status_code == 201
+    # 再来一次非法改动（slug 大写）
+    assert c.post("/api/categories", json={"slug": "Sports", "desc": "x"}).status_code == 400
+
+    # 撤销：应当撤掉**sport 那一次**，而不是被那次 400 挤掉
+    assert c.post("/api/categories/undo").status_code == 200
+    slugs = {x["slug"] for x in c.get("/api/categories").json()["categories"]}
+    assert "sport" not in slugs, "400 那次也拍了一份快照：真正的上一次修改撤不回来了"
+    # 而且撤销栈**已经空了**——340 那次 400 没有留下多余的格子
+    assert c.post("/api/categories/undo").json()["undone"] is False, (
+        "撤销栈里还有多余的格子：400 的路径产生了快照"
+    )
+
+
+def test_api_add_category_rejects_a_control_character(client_factory):
+    """`_reject_controls` 在类目这条路上也要有牙（R10：转义与拒绝各管一半）。
+
+    ⚠️ 不挡的话 `toml_str` 会**老老实实把它转义**（`\n` 写成 `\u000A`），
+    于是配置里存着一个带换行的 `desc`、界面与提示词里错乱显示——而
+    `save_categories` **不会**报错（那是"存得进去"与"应该存"的分别）。
+    """
+    c = client_factory()
+    r = c.post("/api/categories", json={"slug": "sport", "desc": "球赛\n换行"})
+    assert r.status_code == 400
+    assert "控制字符" in r.json()["detail"]
+
+
+def test_api_delete_category_rejects_a_nonexistent_migration_target(client_factory):
+    """迁移目标必须是**现存**类目——否则删完留下的是一条指向不存在 slug 的映射。
+
+    ⚠️ 它守的正是出口判据 6 的另一半：`migrate_to=typo` 的话，
+    条目会从一个不存在的 slug 走到**另一个**不存在的 slug，两边都悬空。
+    变异反证：删掉 `api_delete_category` 里那段 `if migrate_to and migrate_to not in ...`
+    ⇒ 本条**必红**（会回 204）。
+    """
+    c = client_factory()
+    old_kind = c.get(f"/api/items/{client_factory.item_ids[0]}").json()["kind"]
+    r = c.delete(f"/api/categories/{old_kind}?migrate_to=typo")
+    assert r.status_code == 400
+    slugs = {x["slug"] for x in c.get("/api/categories").json()["categories"]}
+    assert old_kind in slugs, "被拒的删除不该改动配置"
+
+
+def test_api_rename_category_reports_aliases(client_factory):
+    """`/api/categories` 的 `aliases` 是**契约的一部分**（编辑器要用它显示旧名）。
+
+    ⚠️ 单独钉它是因为：改名之后**只查 `categories` 那一半**的用例全都会绿，
+    而界面上「旧名 life → 现在叫 daily」那一行会静默消失。
+    """
+    c = client_factory()
+    item_id = client_factory.item_ids[0]
+    old_kind = c.get(f"/api/items/{item_id}").json()["kind"]
+    assert c.put(f"/api/categories/{old_kind}", json={"slug": "life_v2"}).status_code == 200
+    assert c.get("/api/categories").json()["aliases"] == {old_kind: "life_v2"}

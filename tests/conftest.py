@@ -31,6 +31,52 @@ from vigil import overrides  # noqa: E402
 from vigil import config  # noqa: E402
 
 
+# 隔离根里那份最小类目表（M6 T5）。形状与内容都**自带**，不抄仓库里真实的
+# `config/categories.toml`：抄一份等于把「测试红绿取决于用户的类目配置」留着，
+# 而 M6 的整个卖点就是把那份文件交给用户在网页上编辑。
+#
+# ⚠️ 七个 slug 与**顺序**（`notice` 在第一个）是 `tests/test_api.py` 里
+# `test_categories_carry_counts` 断言的东西；`academic` 的中文名是
+# `test_items_returns_the_frozen_field_set` 断言 `kind_label == "学业"` 要的。
+# 改这里之前先看那两条——它们会红，而且是**响亮**地红。
+_ISOLATED_CATEGORIES_TOML = """\
+[[categories]]
+slug = "notice"
+label = "通知公告"
+desc = "隔离用类目：通知公告"
+
+[[categories]]
+slug = "academic"
+label = "学业"
+desc = "隔离用类目：学业"
+
+[[categories]]
+slug = "activity"
+label = "活动"
+desc = "隔离用类目：活动"
+
+[[categories]]
+slug = "life"
+label = "生活"
+desc = "隔离用类目：生活"
+
+[[categories]]
+slug = "secondhand"
+label = "二手"
+desc = "隔离用类目：二手"
+
+[[categories]]
+slug = "lostfound"
+label = "失物招领"
+desc = "隔离用类目：失物招领"
+
+[[categories]]
+slug = "job"
+label = "兼职招聘"
+desc = "隔离用类目：兼职招聘"
+"""
+
+
 @pytest.fixture(autouse=True)
 def _isolate_overrides_path(tmp_path_factory, monkeypatch):
     """把人工干预层的默认路径挪出仓库——**否则写路径会建真实的 `data/overrides.db`**。
@@ -142,6 +188,12 @@ def _isolate_api_repo_root(tmp_path_factory, monkeypatch):
     ⚠️ 用 `mktemp` 而不是 `tmp_path`（理由与上面两道一字不差）：
     有些用例把 `tmp_path` 当**产品目录**用并按**文件集合**断言
     （`tests/test_digest.py` 就是 `sorted(p.name for p in tmp_path.iterdir())`）。
+
+    ⚠️ **M6 T5 起还要写一份 `config/categories.toml`**：`api.categories_path()`
+    与 `config_path()` 是**同一个根**，而 `api_categories` / `item_out` 从 T5 起
+    都**现读**它。这与 E6（`DEFAULT_LLM_TOML`）是同一族：
+    **新增的默认路径常量必须被夹具隔离**，否则测试要么写进真仓库、
+    要么跟着用户的配置红绿。
     """
     from vigil import api as _api
 
@@ -159,6 +211,19 @@ def _isolate_api_repo_root(tmp_path_factory, monkeypatch):
         'name = "隔离用群"\n'
         "enabled = true\n",
         encoding="utf-8",
+    )
+    # ⚠️ M6 T5 起 `api.categories_path()` 也在这个根下现读
+    # （`categories_path()` = `REPO_ROOT / "config" / "categories.toml"`），
+    # 而它**正是 M6 邀请用户在网页上改的那份文件**（T5 的类目编辑 + T10 的设置页）。
+    # 不写这一份的话：`load_categories` 抛"找不到类目配置"⇒ 每个走
+    # `/api/categories` 或 `item_out`（它要 `kind_label`）的用例都变 500。
+    #
+    # ⚠️ **内容自带、不抄仓库里那份真文件**：抄一份等于把「测试红绿取决于用户
+    # 的类目配置」这件事留着——用户删掉一个类目，一批无关用例跟着红
+    # （与上面 `_isolate_llm_toml_path` 记的假绿是同一族）。这里要的只是
+    # 「有一份能读通的类目表」，所以用一份最小的。
+    (root / "config" / "categories.toml").write_text(
+        _ISOLATED_CATEGORIES_TOML, encoding="utf-8"
     )
     monkeypatch.setattr(_api, "REPO_ROOT", root)
 
