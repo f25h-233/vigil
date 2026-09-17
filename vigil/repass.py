@@ -13,26 +13,37 @@
 UPDATE 不翻新 id，所以与"保留旧 item"不矛盾——而少了这一步，
 M5 出口判据 3（不再有 `deadline_ts < event_ts`）根本达不到。
 
-⚠️ 三条与计划正文不同的地方（勘误 E4/E5/E6，每条都有实测理由）：
+⚠️ **判据必须在「同一个上下文」里重判**（Fix loop 第 1 轮，实测驱动）。
+诊断实测（`task-9-report.md` 的 `## 诊断`）：在**稀疏源消息集**上分批时，
+repass 的批中位 **1 条**、63 个单条批，而 refine 的批中位 **30 条**（候选 ±2 邻居）
+⇒ **62/311 条源消息被"孤立判"**，而 refine 侧 0/311。后果实测：
 
-* **E4 批内去重**：产出集合在**算条数之前**过 `store.dedupe_batch`。
-  不去重的话，模型对同一条消息重抽两次（真库 item 290/296 的真实行为）
-  会让 `n_new` 算成 2 ⇒ 两条重复都留下、报「0 deleted」，而 `refine` 路径
-  （`save_items` 里有去重）只写 1 行——同一条消息在两条路径上得到相反结论。
-* **E5 失败 ≠ 产出 0 条**：LLM 或本地后处理失败的批次**不写 verdict**，
-  它的源消息整批进 `plan.unjudged`。计划原文的
-  `verdicts.setdefault(m.msg_id, 0)` 把「没判成」翻译成「产出 0 条」，
-  而这在本命令的语义里等于**删光那批消息的旧条目**——一次 429、
-  一次超时、一次解析失败就能造成不可逆的数据丢失。
-* **E6 不碰用户软删的行**：软删（D15）说「库里行仍在」，本命令做的是
-  `DELETE FROM items`。把用户软删的条目物理删掉，等于把"软删"升级成
-  "物理删"——`item_edits` 里那条 delete 事件还在、`undo` 照样成功，
-  但**没有任何行可以恢复**。
+* 同一批次逐字节重放 3 次，落地集合 Jaccard **0.67**、**10% 的消息在三次之间翻转**；
+* 丢弃率与批大小**无关**（batch=1/5/30 → 80% / 63% / 73%）；
+* 把探针放回 **refine 的密批**里，**item 14 / 86 / 182 全部复活**，只有 item 84 仍稳定判死。
+
+⇒ 「在稀疏集上重判」根本不是「v2/v3 同条件对比」，是**换了条件重判**。
+所以 `context_batches()` 复现 refine 的输入构造（`screen` → ±2 上下文 → `make_batches`），
+只保留**含源消息**的那些批次。
+
+**与计划的偏差**：计划写的是「在源消息集上 `make_batches`」。按优先级，实测 > 计划。
+
+⚠️ 另三条可审计性要求（同样由诊断挖出来）：
+
+1. **落盘 payload**（`audit_path`）：诊断指出「干跑没留 payload ⇒ 事后无法逐条复核」
+   ——那是真缺口。每一批发一条 JSONL：批次 id / 消息 id / **模型原话** / 每条源消息的判定。
+2. **`_to_item` 的静默丢弃要计数**：它返回 `None`（摘录没匹配上 / 类目非法 /
+   title 空 / 摘录太短）时不抛、不记、不报 ⇒ 「0 批失败」**不能**说明没有条目被闸门吞掉。
+   现在拆成 `dropped_unmatched` 与 `dropped_by_gate` 两个计数器。
+3. **区分 a0 与 a2**：「整批返回 `[]`」与「模型读了但没为这条产出」含义不同，
+   必须分开统计——这直接关系到结果可不可信。
 """
 
 from __future__ import annotations
 
 import datetime as dt
+import json
+import pathlib
 import sqlite3
 from collections.abc import Iterable
 from dataclasses import dataclass, field
@@ -43,7 +54,7 @@ from .config import Config
 from .deadline import deadline_sane, place_supported
 from .llm import DEFAULT_MODEL, LLMConfig, chat_json
 from .redact import Redactor
-from .refine import _to_item, build_system_prompt, build_user_prompt
+from .refine import _match_source, _to_item, build_system_prompt, build_user_prompt
 
 
 @dataclass
@@ -62,7 +73,7 @@ class RepassPlan:
     skipped_referenced: list[int] = field(default_factory=list)
     # 用户软删过的（D15：行仍在）——本命令一律不碰（勘误 E6）
     skipped_soft_deleted: list[int] = field(default_factory=list)
-    # 这一轮**没判成**的源消息产出的条目（LLM 失败 / 预算打到）——勘误 E5
+    # 这一轮**没判成**的源消息产出的条目（LLM 失败 / 预算打到 / 不在任何批次里）
     unjudged: list[int] = field(default_factory=list)
     # (item_id, place, deadline_ts) —— 保留但需要降级的条目
     downgrades: list[tuple[int, str | None, int | None]] = field(default_factory=list)
@@ -71,15 +82,24 @@ class RepassPlan:
 
 @dataclass
 class RepassStats:
-    scanned_msgs: int = 0
+    scanned_msgs: int = 0        # D10 划定的范围：已产出条目的源消息数
+    sent_batches: int = 0        # 实际送出的批数
+    sent_messages: int = 0       # 送出的消息数（含上下文邻居）
     deleted: int = 0
     kept: int = 0
     skipped_referenced: int = 0
     skipped_soft_deleted: int = 0
     unjudged_items: int = 0
     downgraded: int = 0
-    batches: int = 0          # **成功**跑完的批次
+    batches: int = 0             # **成功**跑完的批次
     failed_batches: int = 0
+    # ── 可审计性（诊断挖出来的三个缺口）──────────────────────────
+    items_raw: int = 0           # 模型返回的 item 条数（原始）
+    items_landed: int = 0        # 落地条数（去重后）
+    dropped_unmatched: int = 0   # 摘录没匹配上任何消息 ⇒ 丢
+    dropped_by_gate: int = 0     # 摘录命中了但被 `_to_item` 闸门丢（类目/title/太短）
+    empty_payloads: int = 0      # a0：整批没产出任何条目
+    msgs_no_output: int = 0      # a2：模型明明产出了东西，但**没为这条**产出
     input_tokens: int = 0
     output_tokens: int = 0
     budget_hit: bool = False
@@ -106,8 +126,9 @@ def build_plan(
     `verdicts`: `msg_id -> 新判据下产出的条目数`（0 = **确实**判为不该入库）。
     `item_ids_by_msg`: 该消息**曾经**产出过的 item_id（缺省时现查）。
     `judged`: `msg_id -> 新判据下的条目`，用于算出字段降级值。
-    `unjudged_msg_ids`: 这一轮**没取得判定**的源消息（批次失败 / 预算提前停止）。
-        它们的条目一条都不许删——「没判」与「判成 0 条」是两种状态（勘误 E5）。
+    `unjudged_msg_ids`: 这一轮**没取得判定**的源消息（批次失败 / 预算提前停止 /
+        不在任何上下文批次里）。它们的条目一条都不许删——「没判」与「判成 0 条」
+        是两种状态（勘误 E5）。
 
     分桶优先级（前者压倒后者）：
 
@@ -246,7 +267,7 @@ def collect_source_messages(conn: sqlite3.Connection) -> list[store.PendingMessa
     """所有**已产出条目**的源消息（去重），按 (ts, msg_id) 升序。
 
     ⚠️ 这是 D10 划定的重判范围——不碰 4.7 万条全量，只碰产出过条目的那批。
-    实测真库规模：328 条 item ⇒ 约 328 条源消息 ⇒ 约 11 批。
+    真库实测（2026-09-17 08:00 基线）：333 条 item ⇒ 312 条源消息。
 
     ⚠️ 范围由 `item_sources` 定义，**不是**由 `refine_runs.prompt_ver` 定义：
     后者记的是"这条消息跑过哪一版提示词"，而本命令要重判的是"已经有产物的
@@ -267,6 +288,126 @@ def collect_source_messages(conn: sqlite3.Connection) -> list[store.PendingMessa
     return [store.PendingMessage(*row) for row in rows]
 
 
+def context_batches(
+    conn: sqlite3.Connection,
+    *,
+    config: Config,
+    batch_size: int = 30,
+    context: int = 2,
+) -> tuple[list[list[store.PendingMessage]], set[int]]:
+    """**复现 refine 的输入构造**，只留含有源消息的批次。
+
+    与 `refine.refine()` 逐字同一套：`pending_messages(redo=True)` →
+    `prefilter.screen(tier_of=...)` → `prefilter.expand_context(context=2)` →
+    `prefilter.make_batches(max_batch=...)`。
+
+    返回 `(batches, source_msg_ids)`。
+
+    ⚠️ `redo=True` 是**必须**的：非 redo 的 `pending_messages` 会把已处理过的消息
+    全部过滤掉（真库里逐条都有 `refine_runs` 行）⇒ 一个批次都拼不出来。
+    代价是它返回**当前**全量而不是「当初那次 refine 时的待处理集」——
+    **历史待处理集没有存档，只能这样重建**；这是本函数已知的近似。
+
+    ⚠️ 保留的判据是「**含至少一条源消息**」而不是「含候选」：源消息可能自己不是
+    候选（它是被 ±2 邻居带进上下文的），那种批次照样要判——`_to_item` 对上下文
+    消息同样可以产出条目（`src_msg_ids` 就是那条消息）。
+    """
+    src_ids = {m.msg_id for m in collect_source_messages(conn)}
+    messages = store.pending_messages(conn, redo=True)
+    candidates, _ = prefilter.screen(messages, tier_of=config.tier_of)
+    in_scope = prefilter.expand_context(messages, candidates, context=context)
+    batches = [
+        b for b in prefilter.make_batches(in_scope, max_batch=batch_size)
+        if any(m.msg_id in src_ids for m in b)
+    ]
+    return batches, src_ids
+
+
+@dataclass
+class BatchOutcome:
+    """一批的**可审计**结果：模型说了什么、我们怎么处置的。"""
+
+    counts: dict[int, int] = field(default_factory=dict)   # 源消息 → 产出条数
+    produced: list[store.ExtractedItem] = field(default_factory=list)
+    raw_items: int = 0            # 模型返回的条数
+    landed: int = 0               # 落地条数（去重后）
+    dropped_unmatched: int = 0    # 摘录没匹配上任何消息
+    dropped_by_gate: int = 0      # 命中却被 `_to_item` 闸门丢
+    empty_payload: bool = False   # a0：整批没产出
+
+
+def _scan_payload(
+    payload: object, batch, *, known_kinds: frozenset[str], target_ids: set[int]
+) -> BatchOutcome:
+    """把一批的 payload 折成 `BatchOutcome`——**复用 refine 的 `_to_item`**。
+
+    ⚠️ 重用而不是重写：重写会让两条路径的判据漂移——存量重判说"该删"，
+    而新抽取说"该留"，同一个消息在两次运行里得到相反结论，**没有任何测试会发现**。
+
+    ⚠️ 出口处过 `store.dedupe_batch`——**必须在算产出条数之前**（勘误 E4）。
+    它是 `save_items` 用的同一个函数对象（`store.dedupe_batch` 是
+    `_dedupe_batch` 的公开别名），不是"相似的一段代码"。
+
+    ⚠️ 三种「没产出」在这里被**分开记**（诊断结论：它们的含义完全不同）：
+    `empty_payload`（a0）/ `dropped_unmatched` / `dropped_by_gate`。
+    以前它们全部混在「这条消息没产出」里，`stats.errors` 又只记批次级异常
+    ⇒ 「0 批失败」读不出「有没有条目被我们自己的闸门吞掉」。
+    """
+    out = BatchOutcome(counts={m.msg_id: 0 for m in batch if m.msg_id in target_ids})
+    raw_items = payload.get("items") if isinstance(payload, dict) else None
+    if not isinstance(raw_items, list) or not raw_items:
+        # 没有 items 数组 / 空数组：两种都按 a0 处理（都等于「这一批什么都没产出」）
+        out.empty_payload = True
+        return out
+    out.raw_items = len(raw_items)
+    for raw in raw_items:
+        if not isinstance(raw, dict):
+            out.dropped_by_gate += 1
+            continue
+        try:
+            item = _to_item(raw, batch, known_kinds=known_kinds)
+        except Exception:  # noqa: BLE001 —— 单条脏数据不该掀掉整轮
+            item = None
+        if item is None:
+            if _match_source(str(raw.get("quote") or ""), batch) is None:
+                out.dropped_unmatched += 1
+            else:
+                out.dropped_by_gate += 1
+            continue
+        out.produced.append(item)
+
+    out.produced = store.dedupe_batch(out.produced)
+    out.landed = len(out.produced)
+    for it in out.produced:
+        for mid in it.src_msg_ids:
+            if mid in out.counts:
+                out.counts[mid] += 1
+    return out
+
+
+def _audit_record(
+    index: int, batch, outcome: BatchOutcome, payload: object, target_ids: set[int]
+) -> dict:
+    """一条 JSONL：批次 id / 消息 id / **模型原话** / 每条源消息的判定。
+
+    「模型原话」是承重的：诊断那轮干跑没留它，174 条删除**事后一条都复核不了**，
+    只能靠重放做代理测量。落盘之后，任何一条判决都能被逐条追溯。
+    """
+    return {
+        "batch": index,
+        "n_msgs": len(batch),
+        "msg_ids": [m.msg_id for m in batch],
+        "source_msg_ids": sorted(m.msg_id for m in batch if m.msg_id in target_ids),
+        "empty_payload": outcome.empty_payload,
+        "raw_items": outcome.raw_items,
+        "landed": outcome.landed,
+        "dropped_unmatched": outcome.dropped_unmatched,
+        "dropped_by_gate": outcome.dropped_by_gate,
+        "counts": {str(k): v for k, v in sorted(outcome.counts.items())},
+        "payload": payload,
+    }
+
+
 def repass(
     config: Config,
     *,
@@ -274,15 +415,19 @@ def repass(
     conn: sqlite3.Connection | None = None,
     db_path=None,
     batch_size: int = 30,
+    context: int = 2,
     budget_tokens: int | None = None,
     model: str = DEFAULT_MODEL,
     enable_thinking: bool | None = False,
     apply: bool = False,
+    audit_path=None,
     on_progress=print,
 ) -> tuple[RepassPlan, RepassStats]:
     """跑一轮存量重判。`apply=False` 时**只出清单不写库**。
 
     ⚠️ 返回 `(plan, stats)`：即使 apply，调用方也拿得到清单去写报告。
+    ⚠️ `audit_path` 给了就把每一批的**模型原话与判定**逐条落成 JSONL——不可逆操作的
+    事前可见 + 事后可复核，是同一个需求的两半。
     """
     cats = load_categories()
     known_kinds = frozenset(c.slug for c in cats)
@@ -298,14 +443,34 @@ def repass(
         path = db_path if db_path is not None else config.output_db
         conn = sqlite3.connect(str(path), uri=True)
     stats = RepassStats()
+
+    audit_file = None
+    if audit_path is not None:
+        audit_path = pathlib.Path(audit_path)
+        audit_path.parent.mkdir(parents=True, exist_ok=True)
+        audit_file = audit_path.open("w", encoding="utf-8")
     try:
-        msgs = collect_source_messages(conn)
-        stats.scanned_msgs = len(msgs)
-        if not msgs:
+        src_msgs = collect_source_messages(conn)
+        stats.scanned_msgs = len(src_msgs)
+        if not src_msgs:
             on_progress("[repass] 没有需要重判的源消息")
             return RepassPlan(), stats
 
-        batches = prefilter.make_batches(msgs, max_batch=batch_size)
+        batches, src_ids = context_batches(
+            conn, config=config, batch_size=batch_size, context=context
+        )
+        stats.sent_batches = len(batches)
+        stats.sent_messages = sum(len(b) for b in batches)
+        covered = {m.msg_id for b in batches for m in b if m.msg_id in src_ids}
+        on_progress(
+            f"[repass] 源消息 {stats.scanned_msgs} 条 → 复现 refine 上下文："
+            f"{stats.sent_batches} 批 / 送 {stats.sent_messages} 条消息"
+            f"（覆盖源消息 {len(covered)} 条）"
+        )
+        if not batches:
+            on_progress("[repass] 没有任何含源消息的上下文批次，结束（一条都不会动）")
+            return RepassPlan(), stats
+
         llm_cfg = LLMConfig(
             api_key=api_key, model=model, enable_thinking=enable_thinking
         )
@@ -348,7 +513,9 @@ def repass(
             stats.output_tokens += result.output_tokens
 
             try:
-                produced = _produce(result.payload, batch, known_kinds=known_kinds)
+                outcome = _scan_payload(
+                    result.payload, batch, known_kinds=known_kinds, target_ids=src_ids
+                )
             except Exception as exc:  # noqa: BLE001 — 单批本地炸不许掀掉整轮
                 stats.failed_batches += 1
                 stats.errors.append(f"第 {index} 批本地后处理失败: {exc}")
@@ -356,25 +523,43 @@ def repass(
                 continue
             stats.batches += 1  # 只有真的解析出结果的那批才算跑过
 
-            # ⚠️ 先给整批填 0，再把**产出**累加上去：`counts[mid] == 0` 的语义
-            # 是「模型看了这一批、明确没为它产出任何条目」——那才是该删的信号。
-            # 它与「没判成」（上面那两个 except）必须是两种状态（勘误 E5）。
-            counts: dict[int, int] = {m.msg_id: 0 for m in batch}
-            for it in produced:
-                for mid in it.src_msg_ids:
-                    counts[mid] = counts.get(mid, 0) + 1
-                    judged.setdefault(mid, it)
-            verdicts.update(counts)
+            stats.items_raw += outcome.raw_items
+            stats.items_landed += outcome.landed
+            stats.dropped_unmatched += outcome.dropped_unmatched
+            stats.dropped_by_gate += outcome.dropped_by_gate
+            if outcome.empty_payload:
+                stats.empty_payloads += 1      # a0：整批没产出
+            else:
+                # a2：模型明明产出了东西，但没为**这条**产出
+                stats.msgs_no_output += sum(1 for v in outcome.counts.values() if v == 0)
+
+            for mid, n in outcome.counts.items():
+                verdicts[mid] = n
+                if n and mid not in judged:
+                    for it in outcome.produced:
+                        if mid in it.src_msg_ids:
+                            judged[mid] = it
+                            break
+
+            if audit_file is not None:
+                audit_file.write(
+                    json.dumps(
+                        _audit_record(index, batch, outcome, result.payload, src_ids),
+                        ensure_ascii=False,
+                    )
+                    + "\n"
+                )
+                audit_file.flush()
 
             on_progress(
                 f"[repass] 批次 {index}/{len(batches)}：{len(batch)} 条 → "
-                f"{len(produced)} 条 item"
+                f"{outcome.landed} 条 item"
             )
 
         # ⚠️ 「没判成」= 一条消息也**不在** verdicts 里。这是**唯一**的判据
-        # （不另立计数器）：失败、预算提前停止、将来的任何新 `continue`
-        # 都会自动落进这个集合，不需要有人记得去登记。
-        unjudged_ids = [m.msg_id for m in msgs if m.msg_id not in verdicts]
+        # （不另立计数器）：失败、预算提前停止、不在任何上下文批次里、
+        # 将来的任何新 `continue` 都会自动落进这个集合，不需要有人记得去登记。
+        unjudged_ids = [m.msg_id for m in src_msgs if m.msg_id not in verdicts]
         plan = build_plan(
             conn, verdicts=verdicts, judged=judged, unjudged_msg_ids=unjudged_ids
         )
@@ -385,31 +570,7 @@ def repass(
             stats.downgraded = applied.downgraded
         return plan, stats
     finally:
+        if audit_file is not None:
+            audit_file.close()
         if owns:
             conn.close()
-
-
-def _produce(payload: object, batch, *, known_kinds) -> list[store.ExtractedItem]:
-    """复用 refine 的 `_to_item`——**不重写一遍**。
-
-    ⚠️ 重写会让两条路径的判据漂移：存量重判说"该删"，而新抽取说"该留"，
-    同一个消息在两次运行里得到相反结论，而**没有任何测试会发现**。
-
-    ⚠️ 出口处过 `store.dedupe_batch`——**必须在算产出条数之前**（勘误 E4）。
-    它是 `save_items` 用的同一个函数对象（`store.dedupe_batch` 是
-    `_dedupe_batch` 的公开别名），不是"相似的一段代码"。
-    """
-    raw_items = payload.get("items") if isinstance(payload, dict) else None
-    if not isinstance(raw_items, list):
-        return []
-    out: list[store.ExtractedItem] = []
-    for raw in raw_items:
-        if not isinstance(raw, dict):
-            continue
-        try:
-            it = _to_item(raw, batch, known_kinds=known_kinds)
-        except Exception:  # noqa: BLE001 —— 单条脏数据不该掀掉整轮
-            continue
-        if it is not None:
-            out.append(it)
-    return store.dedupe_batch(out)

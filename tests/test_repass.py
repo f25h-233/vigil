@@ -20,6 +20,7 @@
 
 from __future__ import annotations
 
+import json
 import pathlib
 import sqlite3
 from typing import Any
@@ -254,7 +255,7 @@ def test_repass_dedupes_produced_items_before_counting(con, monkeypatch):
     `test_plan_deletes_duplicate_extras` **拦不住这个变异**——它手工喂
     `verdicts={1: 1}`，把被测的那一步整个跳过去了。
     """
-    content = "征集一起去恐龙园活动"
+    content = "通知：征集一起去恐龙园活动"
     _msg(con, 1, content)
     first = _item(con, 1, title=content)
     second = _item(con, 1, title=content)
@@ -530,7 +531,7 @@ def test_repass_downgrades_deadline_before_event_ts(con, monkeypatch):
 
     死线早于消息当天 ⇒ 它是过去的事实，不满足「需要行动」的语义。
     """
-    content = "档案袋封口时间：5 月 6 日"
+    content = "通知：档案袋封口时间：5 月 6 日"
     _msg(con, 1, content, ts=1_754_000_000)      # 2025-08-05 前后
     iid = _item(con, 1, title="档案袋", event_ts=1_754_000_000, deadline_ts=1_746_000_000)
     _stub_llm(monkeypatch, {"items": [_raw(content, title="档案袋")]})
@@ -553,7 +554,7 @@ def test_repass_does_not_rebuild_items(con, monkeypatch):
     变异：在 `repass()` 里改用 `store.save_items(...)` 重建 ⇒ 本条红
     （item_id 会变、且 items 表多出一行）。
     """
-    content = "最早9.5"
+    content = "通知：最早9.5"
     _msg(con, 1, content)
     old = _item(con, 1, title="宿舍最早入住时间")
     _stub_llm(monkeypatch, {"items": [_raw(content, title="宿舍最早入住时间")]})
@@ -720,6 +721,156 @@ def test_dry_run_does_not_write(con, monkeypatch):
         "默认那条路对库**一行都没改**（含触发器与 refine_runs）——"
         "「先看清单再决定」的全部价值建立在这一点上"
     )
+
+
+# ── Fix loop 第 1 轮：在**当初那个上下文**里重判 ──────────────────
+
+
+def test_repass_sends_the_context_neighbours_not_just_the_source(con, monkeypatch):
+    """⭐ 核心：重判必须在 refine 当初用的那个上下文里做。
+
+    造形：源消息（msg3）自己**不是候选**（没有保留关键词），它只是候选 msg2 的
+    ±2 邻居。真库实测这是常态：`refine` 的批中位 30 条（候选 ±2 邻居），
+    而在稀疏源消息集上分批时中位 **1** 条、63 个单条批 ⇒ 62/311 条被「孤立判」。
+
+    变异：把 `context_batches` 换回「在源消息集上 make_batches」⇒ 本条立刻红
+    （批里只剩源消息自己，`明天体检`/`记得早点睡` 都不在 prompt 里）。
+    """
+    _msg(con, 1, "隔壁宿舍昨天搬走了", ts=1_700_000_000)
+    _msg(con, 2, "通知：明天体检", ts=1_700_000_060)          # 候选（关键词「通知」）
+    _msg(con, 3, "那我要不要空着肚子去", ts=1_700_000_120)    # ← 源消息，自己不是候选
+    _msg(con, 4, "记得早点睡", ts=1_700_000_180)
+    iid = _item(con, 3, title="体检疑问", event_ts=1_700_000_120)
+    seen = _stub_llm(monkeypatch, {"items": [_raw("那我要不要空着肚子去", title="体检疑问")]})
+
+    plan, stats = repass.repass(_cfg(), api_key="k", conn=con)
+
+    assert stats.sent_batches == 1
+    assert len(seen) == 1, "只该发一批"
+    prompt = seen[0]
+    assert "明天体检" in prompt and "记得早点睡" in prompt, (
+        "批次里必须带上上下文邻居——去掉它们就是「换了个条件重判」，"
+        "而诊断实测：换条件会让 14/86/182 这类条目被无辜判死"
+    )
+    assert plan.to_keep == [iid]
+
+
+def test_context_window_is_configurable_and_defaults_to_refine_s_two(con, monkeypatch):
+    """`--context` 必须真的接到 `expand_context` 上（默认 2，与 refine 一致）。
+
+    变异：把 `context=context` 写死成 `context=0` ⇒ 本条红
+    （0 邻居 ⇒ 批里只剩候选自己，`隔壁宿舍昨天搬走了` 不在 prompt 里）。
+    """
+    _msg(con, 1, "隔壁宿舍昨天搬走了", ts=1_700_000_000)
+    _msg(con, 2, "通知：明天体检", ts=1_700_000_060)
+    _item(con, 2, title="体检通知", event_ts=1_700_000_060)
+    seen = _stub_llm(monkeypatch, {"items": [_raw("通知：明天体检", title="体检通知")]})
+
+    repass.repass(_cfg(), api_key="k", conn=con, context=0)
+
+    assert "隔壁宿舍昨天搬走了" not in seen[0], "context=0 就是不要邻居"
+
+
+def test_source_message_outside_every_context_batch_is_unjudged(con, monkeypatch):
+    """源消息既不是候选、也没落在任何候选的 ±2 邻域里 ⇒ 这一轮**判不到它**。
+
+    处置必须与 E5 同族：它的条目进 `plan.unjudged`、**一条都不许删**。
+    （真库实测：312 条源消息里有 1 条是这种。）
+
+    变异：把 `unjudged_ids` 收窄成「只统计批次失败的」⇒ 本条红（item 会被删）。
+    """
+    _msg(con, 1, "那我要不要空着肚子去", group_id=200, ts=1_700_000_000)
+    lonely = _item(con, 1, title="疑问", group_id=200)
+    _msg(con, 99, "通知：明天体检", group_id=100, ts=1_700_000_000)
+    other = _item(con, 99, title="体检通知", group_id=100)
+    _stub_llm(monkeypatch, {"items": []})
+
+    plan, stats = repass.repass(_cfg(), api_key="k", conn=con)
+
+    assert plan.unjudged == [lonely], "判不到的消息要明着列出来，一条都不许删"
+    assert plan.to_delete == [other], "判过的照常判（它确实产出 0 条）"
+    assert stats.sent_batches == 1, "只有含源消息的批次才发"
+
+
+def test_audit_jsonl_records_payload_and_verdict(con, monkeypatch, tmp_path):
+    """⭐ 可审计性：每一批的**模型原话**与每条源消息的判定必须落盘。
+
+    诊断结论：上一轮干跑没留 payload ⇒ 174 条删除**事后一条都复核不了**，
+    只能靠重放做代理测量。这条钉住「以后不用再靠代理测量」。
+
+    变异：`_audit_record` 里去掉 `payload` / `counts` 任一 ⇒ 本条红。
+    """
+    _msg(con, 1, "通知：明天体检")
+    _item(con, 1, title="体检通知")
+    _stub_llm(monkeypatch, {"items": []})
+    audit = tmp_path / "audit.jsonl"
+
+    repass.repass(_cfg(), api_key="k", conn=con, audit_path=audit)
+
+    lines = [json.loads(x) for x in audit.read_text(encoding="utf-8").splitlines()]
+    assert len(lines) == 1, "一批一条 JSONL"
+    rec = lines[0]
+    assert rec["batch"] == 1
+    assert rec["payload"] == {"items": []}, "模型原话必须落盘"
+    assert rec["source_msg_ids"] == [1]
+    assert rec["counts"] == {"1": 0}, "每条源消息的判定必须落盘"
+    assert rec["empty_payload"] is True
+
+
+def test_gate_drops_and_unmatched_are_counted_separately(con, monkeypatch):
+    """⭐ `_to_item` 的静默丢弃必须可见——诊断实测它无计数、无日志、无 payload。
+
+    三种情况分开记（含义完全不同）：
+
+    * 摘录没匹配上任何消息 ⇒ `dropped_unmatched`（模型抄错了摘录）
+    * 摘录命中了、但类目不在表里 ⇒ `dropped_by_gate`（**我们的闸门**，不是模型的错）
+    * 落地 ⇒ `items_landed`
+
+    变异：删掉 `dropped_by_gate += 1` 那一支（并回 unmatched）⇒ 本条红。
+    """
+    content = "通知：明天体检"
+    _msg(con, 1, content)
+    _item(con, 1, title="体检通知")
+    _stub_llm(monkeypatch, {"items": [
+        _raw(content, title="体检通知"),
+        _raw("这段字根本不在任何消息里出现过", title="幽灵"),
+        _raw(content, title="类目非法", kind="nope"),
+    ]})
+
+    _plan, stats = repass.repass(_cfg(), api_key="k", conn=con)
+
+    assert (stats.items_raw, stats.items_landed) == (3, 1)
+    assert stats.dropped_unmatched == 1
+    assert stats.dropped_by_gate == 1
+
+
+def test_a0_and_a2_are_counted_separately(con, monkeypatch):
+    """⭐ 「整批返回 []」（a0）与「模型读了但没为这条产出」（a2）必须分开统计。
+
+    两者含义不同：a0 = 这批没什么可抽；a2 = 这批有东西，但**这条**不在其中。
+    混成一句「没产出」，就分不清「模型没干活」与「模型干了活却没带上这条」。
+
+    变异：把 `empty_payloads` 与 `msgs_no_output` 并成一个计数器 ⇒ 本条红。
+    """
+    _msg(con, 1, "通知：明天体检", group_id=100)
+    _item(con, 1, title="体检通知")
+    _msg(con, 2, "通知：后天体检", group_id=200)
+    _item(con, 2, title="体检通知2", group_id=200)
+
+    def fake(cfg, *, system, user, **kw):
+        if "明天" in user:
+            return LLMResult(payload={"items": []}, input_tokens=1, output_tokens=1)
+        return LLMResult(
+            payload={"items": [_raw("这段字不在任何消息里", title="幽灵")]},
+            input_tokens=1, output_tokens=1,
+        )
+
+    monkeypatch.setattr(repass, "chat_json", fake)
+    _plan, stats = repass.repass(_cfg(), api_key="k", conn=con)
+
+    assert stats.batches == 2
+    assert stats.empty_payloads == 1, "第一批整批返回空 ⇒ a0"
+    assert stats.msgs_no_output == 1, "第二批有产出但没为 msg2 产出 ⇒ a2"
 
 
 def test_budget_stops_remaining_batches_and_never_deletes(con, monkeypatch):

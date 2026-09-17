@@ -17,7 +17,7 @@ from . import qqdb, reader
 from . import refine as refine_mod
 from . import repass as repass_mod
 from . import store
-from .config import ConfigError, load_config, load_key, load_llm_key
+from .config import REPO_ROOT, ConfigError, load_config, load_key, load_llm_key
 
 
 def _load_config_only():
@@ -363,16 +363,27 @@ def cmd_repass(args) -> int:
         )
         return 1
 
+    # ⚠️ **每次跑都落一份 audit**（诊断结论）：上一轮干跑没留 payload，174 条删除
+    # 事后一条都复核不了。不可逆操作的事前可见（清单）与事后可复核（payload）
+    # 是同一个需求的两半——不给 `--audit` 也照样写，只是路径带时间戳。
+    audit = args.audit
+    if not audit:
+        stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+        audit = str(REPO_ROOT / "data" / f"repass-audit-{stamp}.jsonl")
+
     # --model 不给时是 None，而 None 会绕过 repass() 的默认值，所以这里兜底
     common = dict(
         api_key=api_key,
         db_path=db,
         batch_size=args.batch,
+        context=args.context,
         budget_tokens=args.budget,
         model=args.model or refine_mod.DEFAULT_MODEL,
         enable_thinking=args.think,
+        audit_path=audit,
         on_progress=logs.emit,
     )
+    print(f"[repass] 审计文件：{audit}")
 
     if not args.apply:
         plan, stats = repass_mod.repass(config, apply=False, **common)
@@ -400,8 +411,24 @@ def _print_repass_plan(plan, stats) -> None:
     「根本没判」——而后者意味着**这次重判的结果不能全信**。
     """
     print(
-        f"[repass] 重判源消息 {stats.scanned_msgs} 条，成功 {stats.batches} 批"
-        f"（失败 {stats.failed_batches} 批），token {stats.total_tokens:,}"
+        f"[repass] 重判源消息 {stats.scanned_msgs} 条 → 复现 refine 上下文"
+        f" {stats.sent_batches} 批 / 送 {stats.sent_messages} 条消息；"
+        f"成功 {stats.batches} 批（失败 {stats.failed_batches} 批），"
+        f"token {stats.total_tokens:,}"
+    )
+    # ⚠️ 三种「没产出」必须分开报（诊断结论：含义完全不同）：
+    #   a0 = 整批返回空（模型认为这批没什么可抽）
+    #   a2 = 模型明明产出了东西，但没为这条产出
+    #   丢弃 = 模型产出了、摘录也命中了，却被 `_to_item` 闸门丢（**我们的**闸门）
+    # 上一轮把三者混成一句「没产出」，于是「0 批失败」读起来像「一切正常」。
+    print(
+        f"  判据质量：模型输出 {stats.items_raw} 条 → 落地 {stats.items_landed} 条；"
+        f"摘录没匹配上丢 {stats.dropped_unmatched} 条；"
+        f"被闸门丢 {stats.dropped_by_gate} 条"
+    )
+    print(
+        f"  没产出：整批返回空(a0) {stats.empty_payloads} 批；"
+        f"没为这条产出(a2) {stats.msgs_no_output} 条消息"
     )
     print(f"  将删除 {len(plan.to_delete)} 条：")
     for iid in plan.to_delete:
@@ -765,7 +792,17 @@ def main(argv: list[str] | None = None) -> int:
         help="真的写库；**不给就只出清单**——存量重判不可逆，默认先看清单",
     )
     p_repass.add_argument("--batch", type=int, default=30, help="每批消息数")
+    p_repass.add_argument(
+        "--context", type=int, default=2,
+        help="复现 refine 时的上下文邻居数（默认 2，与 refine 一致）；"
+        "**改小它就等于换条件重判**",
+    )
     p_repass.add_argument("--budget", type=int, help="token 预算上限")
+    p_repass.add_argument(
+        "--audit", default=None,
+        help="每批的模型原话与判定落成的 JSONL 路径"
+        "（默认 data/repass-audit-<时间戳>.jsonl）——不可逆操作要事后可复核",
+    )
     p_repass.add_argument("--model", default=None, help="覆盖默认模型")
     p_repass.add_argument("--think", action="store_true", help="打开模型思考模式")
     p_repass.set_defaults(func=cmd_repass)
