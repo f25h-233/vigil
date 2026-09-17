@@ -343,6 +343,13 @@ def create_app(config: Config) -> FastAPI:
         让条目的可见状态静默翻转（终审 Important-1：撤一条非尾部 `set_kind`
         能让条目从 Web 与日报同时消失，而这里返回 `{"undone": true}`）。
         409 而不是 400：请求本身是合法的，与**日志当前状态**冲突的是这次撤销。
+
+        ⚠️ **两种 `OverlayError` 必须分开映**（M5 收尾 scoped re-review A2）。
+        `overrides.UndoConflict` = 与日志状态冲突 ⇒ **409**（换一条编辑撤就能成，
+        有自救路径）。其余 `OverlayError` = overlay 的**基础设施故障**
+        （文件缺失/挂不上/路径非法）⇒ **5xx**：客户端重试多少次都一样，
+        报 409 会把排障引向「是不是有人并发改了日志」，而真相是服务端自己坏了。
+        ⚠️ 顺序是承重的：**子类必须在前**，否则 `UndoConflict` 会被下面那支吞掉。
         """
         target = _edit_id_of(body)
         ov = overrides.connect()
@@ -354,8 +361,17 @@ def create_app(config: Config) -> FastAPI:
                 target = last[0]
             try:
                 return {"undone": overrides.undo(ov, edit_id=target)}
-            except overrides.OverlayError as exc:
+            except overrides.UndoConflict as exc:
                 raise HTTPException(status_code=409, detail=str(exc))
+            except overrides.OverlayError as exc:
+                # ⚠️ 显式 500 而不是「让它冒出去」：一是给客户端一句**说清方向的**
+                # 话（「不是冲突，是服务端」），二是它必须是**可断言的响应**——
+                # `TestClient` 默认 `raise_server_exceptions=True`，未捕获的异常
+                # 在测试里是「错误」而不是 500 响应，「映成 5xx」这件事就没人守得住。
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"overlay 基础设施故障（**不是**与日志状态冲突）：{exc}",
+                )
         finally:
             ov.close()
 

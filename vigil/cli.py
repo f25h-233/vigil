@@ -740,6 +740,18 @@ def cmd_downgrade(args) -> int:
 
     ⚠️ 写库必须持锁（rc=2 = 已有实例在跑，等着就行）；只读清单不上锁——
     给只读检查上锁会凭空造出一个**假拒绝**（与 `deadline-audit` 同）。
+
+    ⚠️ **`--fields` 的默认值是 `deadline`，不是 `both`**（M5 收尾 scoped
+    re-review A1 实测的**破坏性默认值**）。修复前默认 `both`：
+    将来有人只是照着 `--apply` 这个惯例敲一遍、**不带 flag**，
+    就会**连带把 7 条 place 也置 NULL**——而用户 2026-09-17 只批准了 deadline
+    那一次。真库操作不可逆，这种「顺手多清一列」没有任何一步会报错。
+    ⇒ 判据是：**不带 `--fields` 跑 `--apply` 不可能意外清掉 place。** 两条守卫钉着
+    （`tests/test_cli.py`）：① 解析层默认值逐字 == `deadline`；
+    ② 行为层——造一条「两条闸门都过不了」的条目，不带 flag 跑 `--apply`，
+    place **一个字不动**，再用 `--fields both` 做阳性对照证明那条目确实可降级。
+    ⚠️ 这一改**只动默认值**，`choices` 与 `both` 的语义一字未动：
+    要清 place 就得显式写出来——不可逆的范围必须有人**说出来**，不能由默认值代办。
     """
     config = _load_config_only()
     db = _require_export_db(config)
@@ -967,9 +979,11 @@ def main(argv: list[str] | None = None) -> int:
     )
     p_dg.add_argument("--apply", action="store_true", help="真的写库（默认只出清单）")
     p_dg.add_argument(
-        "--fields", choices=("both", "place", "deadline"), default="both",
-        help="降级哪些字段（默认 both）。判据是数据层的两道闸门："
-        "place 要在源文里找得到依据；deadline 不早于 event 那天",
+        "--fields", choices=("both", "place", "deadline"), default="deadline",
+        help="降级哪些字段（**默认 deadline**）。⚠️ 最激进的范围 `both` 必须"
+        "**显式**指定：默认值这样定，是为了让「不带 --fields 跑 --apply」"
+        "**不可能**意外清掉 place（见 cmd_downgrade 的 docstring）。"
+        "判据是数据层的两道闸门：place 要在源文里找得到依据；deadline 不早于 event 那天",
     )
     p_dg.set_defaults(func=cmd_downgrade)
 
