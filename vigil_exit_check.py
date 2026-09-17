@@ -1,10 +1,15 @@
-"""M1 出口标准的**机械**核验 —— 不调模型、不写库，只查。
+"""M1 出口标准的**机械**核验 —— 不调模型、**不写 `data/vigil.db`**，只查。
 
 人工判不了的那几条（覆盖无遗漏、来源可回溯、类目不越界）在这里一次算清；
 需要人判的「分类准确率 ≥80%」由 `vigil_acceptance.py` 出材料。
 
 存在的理由：这几条以前是靠一次性 SQL 手敲的，敲完就没留下痕迹，
 下一轮要重验时得重新拼。固化成脚本，每次跑完 refine 一条命令复核。
+
+⚠️ M6 T5 起「类目越界」那一项走 `store.kind_counts`（**有效类目**口径），
+而读取路径会在 overlay 库**不存在**时就地建一个**空的**（`attach_readonly` 的既有
+语义）——所以严格说本脚本可能建出 `data/overrides.db`（空库，零行）。
+主库仍然是全程 `mode=ro`，不写一个字节。
 
 跑法（仓库根）：
     PYTHONIOENCODING=utf-8 .venv/Scripts/python.exe vigil_exit_check.py
@@ -17,13 +22,39 @@ import sqlite3
 import sys
 from pathlib import Path
 
+from vigil import store
 from vigil.categories import load_categories
+
+
+def _bad_kind_count(conn: sqlite3.Connection, live: set[str]) -> int:
+    """**有效类目**越界的条数（Fix loop 1 / FIX 4）。
+
+    ⚠️ 它**必须**与四条读路径同源（`store.kind_counts` 用的就是
+    `store._EFFECTIVE_KIND`，含 overlay 与两级别名），**不能**自己写一句
+    `WHERE kind NOT IN (...)`：那句读的是**库里的原值**，于是双向都不可信——
+
+      · **误报**：合法改名之后它报 `bad_kind > 0`（条目显示的其实是新 slug，
+        一切正常）⇒ 会把一次正确操作判成出口不合格；
+      · **漏报**：`ost.kind` 是个废 slug 时它报 0（界面上那条正显示着一个
+        不存在的类目）⇒ 悬空条目从验收里溜过去。
+
+    而本脚本是**冒烟 / 出口检查的仪器**：判据坏了会**误导里程碑验收**，
+    比一个普通函数的 bug 更贵。
+
+    ⚠️ 口径与读路径一致 ⇒ **不含软删**（D15：软删的条目在所有读取路径上都不存在，
+    它的类目再越界也不构成任何可观测的问题）。
+    """
+    return sum(n for k, n in store.kind_counts(conn).items() if k not in live)
 
 
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--db", default="data/vigil.db")
     args = ap.parse_args()
+
+    # ⚠️ 类目表**在这里现读**，不再是 import 期的模块级常量：一个在 import 时读
+    # 真实仓库文件的常量，测试够不着它（要测就得改仓库里那份 categories.toml）。
+    live = {c.slug for c in load_categories()}
 
     if not Path(args.db).is_file():
         sys.exit(f"找不到库：{args.db}")
@@ -50,11 +81,7 @@ def main() -> int:
     ok = one("SELECT COUNT(*) FROM refine_runs WHERE status = 'ok'")
     err = one("SELECT COUNT(*) FROM refine_runs WHERE status = 'error'")
     items = one("SELECT COUNT(*) FROM items")
-    bad_kind = one(
-        "SELECT COUNT(*) FROM items WHERE kind NOT IN (%s)"
-        % ",".join("?" * len(KINDS)),
-        *KINDS,
-    )
+    bad_kind = _bad_kind_count(conn, live)
     orphan = one(
         "SELECT COUNT(*) FROM items i "
         "WHERE NOT EXISTS (SELECT 1 FROM item_sources s WHERE s.item_id = i.item_id)"
@@ -85,7 +112,7 @@ def main() -> int:
         ("1. 「无遗漏」每条消息都有 refine_runs 记录", f"{covered:,} / {total:,}", missing == 0),
         ("2. 无来源的 items", str(orphan), orphan == 0),
         ("3. 指向不存在消息的来源", str(dangling), dangling == 0),
-        ("4. 类目越界（不在 categories.toml 里）", str(bad_kind), bad_kind == 0),
+        ("4. 类目越界（**有效**类目不在 categories.toml）", str(bad_kind), bad_kind == 0),
         ("5. item_sources 重复行", str(dup), dup == 0),
         ("6. refine_runs 里的孤儿行（消息已不在）", str(orphan_runs), orphan_runs == 0),
         ("7. 失败批次（记录在案，非致命）", str(err), None),
@@ -118,8 +145,6 @@ def main() -> int:
           "vigil_acceptance.py --n 100 --m 20 > 新抽样.md")
     return 0
 
-
-KINDS = tuple(c.slug for c in load_categories())
 
 if __name__ == "__main__":
     raise SystemExit(main())

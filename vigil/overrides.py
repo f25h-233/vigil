@@ -404,12 +404,26 @@ def pop_config_snapshot(conn: sqlite3.Connection) -> tuple[int, str] | None:
     return (int(row[0]), str(row[1]))
 
 
+def peek_config_snapshot(conn: sqlite3.Connection) -> tuple[int, str] | None:
+    """看最近一条快照**但不消费它**；空栈返回 `None`。
+
+    ⚠️ 与 `pop_config_snapshot` 分成两个函数的理由是**校验必须在消费之前**
+    （Fix loop 1 / FIX 5）：`api_category_undo` 要先校验快照内容再落盘，
+    而校验不过时**不能把它从撤销栈里拿走**——否则用户下一次撤销会**多退一格**
+    （跳过更早那次编辑），而接口只说了「配置未被改动」——**那句话只对文件成立**。
+    """
+    row = conn.execute(
+        "SELECT snapshot_id, body FROM config_snapshots ORDER BY snapshot_id DESC LIMIT 1"
+    ).fetchone()
+    return (int(row[0]), str(row[1])) if row else None
+
+
 # ── slug 别名（M6 T5）───────────────────────────────────────────────
 #
 # ⚠️ 它解决的是一个**结构性**矛盾：spec §4.2 ④ 要求「slug 重命名/删除必须级联」，
 # 而 §7/§9 又说 `data/vigil.db` 只读 ⇒ **级联只能发生在读取层**。
-# 于是 `store._EFFECTIVE_KIND` 写成 `COALESCE(ost.kind, ka.new_kind, i.kind)`，
-# 而这张表就是那个 `ka`。
+# 于是 `store._EFFECTIVE_KIND` 写成
+# `COALESCE(ka2.new_kind, ost.kind, ka.new_kind, i.kind)`，而这张表就是 `ka`/`ka2`。
 
 
 def set_kind_alias(
@@ -478,6 +492,46 @@ def kind_aliases(conn: sqlite3.Connection) -> dict[str, str]:
     return {
         str(a): str(b) for a, b in conn.execute("SELECT old_kind, new_kind FROM kind_alias")
     }
+
+
+def prune_kind_aliases(
+    conn: sqlite3.Connection, *, live_slugs: Sequence[str]
+) -> int:
+    """把别名表剪到与**当前**类目表一致。返回删了几行。
+
+    **删条件**：`old_kind in live_slugs or new_kind not in live_slugs`。
+
+    ⭐ **不变量是承重的：一行的 `old_kind` 若仍是现存 slug，该行必须删掉。**
+    因为 `store._EFFECTIVE_KIND` 里作用在 overlay 值之上的那个 `ka2`
+    （`LEFT JOIN ov.kind_alias ka2 ON ka2.old_kind = ost.kind`）**无条件优先于
+    `ost.kind`**——只要「表里不可能有 `old_kind` ∈ 现存 slug 的行」，`ka2`
+    就不可能把用户手工选的**合法**类目顶掉（`ost.kind` 是合法 slug 时匹配不到
+    任何行 ⇒ `ka2.new_kind` 是 NULL ⇒ 落回 `ost.kind`）。
+    **反例（实测）**：删掉 `life` 再把它加回来之后，旧行 `life→life_v2` 还在 ⇒
+    界面上手工选的 `life` 会被顶成 `life_v2`。⇒ **剪枝与 `ka2` 是同一个修复的两半。**
+
+    另一条：`new_kind` 不在现存 slug 里 ⇒ 该行指向一个不存在的目标 ⇒ 删掉
+    （它映射不出任何合法类目，留着只会把条目引到裸 slug）。
+
+    ⚠️ **它还是「改回原名」那条路的必需品，不只是清理**：改名 `A→B` 之后再把
+    `B` 改回 `A`，若 `A→B` 还在表里，`set_kind_alias(B, A)` 的第一步就会跟到
+    `A→B` ⇒ 判成**环** ⇒ 抛 `OverlayError`（从前这里是 500，用户**永远回不去**）。
+    先剪枝（`A` 已在 live 集里）就没有这个环。
+
+    ⚠️ 调用方的 `live_slugs` 是**即将生效的那套 slug**；调用时机见
+    `api.commit_categories` 与 `api_update_category` / `api_delete_category`
+    （后者多含一个待废 slug，理由写在那里）。
+    """
+    live = set(live_slugs)
+    rows = [
+        (str(a), str(b))
+        for a, b in conn.execute("SELECT old_kind, new_kind FROM kind_alias")
+    ]
+    dead = [old for old, new in rows if old in live or new not in live]
+    for old_kind in dead:
+        conn.execute("DELETE FROM kind_alias WHERE old_kind = ?", (old_kind,))
+    conn.commit()
+    return len(dead)
 
 
 def _state_of(conn: sqlite3.Connection, item_id: int) -> tuple[str | None, int]:

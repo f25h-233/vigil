@@ -1581,15 +1581,22 @@ def test_dedupe_batch_key_is_exact_not_normalized():
 
 @pytest.fixture
 def con_with_two_items():
-    """两条 `kind='life'` 的条目（内存库 + overlay 就位）。
+    """两条**原始 kind 不同**、但**有效 kind 相同**的条目（内存库 + overlay 就位）。
 
-    ⚠️ 两条而不是一条：`kind_counts` / `total` 那几处断言若只有一条，
-    「按 kind 分桶错成整表计数」之类会看不出来。
+    ⚠️ 「原始 kind 必须不同」是 Fix loop 1 / FIX 3 实测出来的**必需条件**：
+    从前两条都写 `kind='life'`，于是 `kind_counts` 的 **SELECT 与 GROUP BY
+    在那组数据上答案相同** ⇒ 「只回退 GROUP BY 那一半」全量 708 绿，
+    而它的后果是角标报 1、`window_items` 报 2（**静默少数**）。
+
+    现在两条分别走 `life` 与 `notice` 两个旧 slug、由用例把它们都映射到 `daily`：
+      · E（有效类目）= `daily` / `daily` ⇒ **同一个分组**
+      · R（只含 `ost`/`i.kind` 的旧写法）= `life` / `notice` ⇒ **两个不同的键**
+    ⇒ 只回退 SELECT、只回退 GROUP BY、两处一起回退——**三种都红**。
     """
     conn = sqlite3.connect(":memory:", uri=True)
     store.ensure_schema(conn)
     _seed(conn, title="甲", kind="life")
-    _seed(conn, title="乙", kind="life")
+    _seed(conn, title="乙", kind="notice")
     yield conn
     conn.close()
 
@@ -1607,13 +1614,17 @@ def test_kind_alias_applies_to_every_reading_path(con_with_two_items):
       · 把 `_item_filters` 那处换回 ⇒ 红
       · 把 `kind_counts` 那处换回（**两处都要**）⇒ 红
       · 把 `window_items:419` 那处换回 ⇒ 红
+    ⚠️ Fix loop 1 追加（reviewer 实测的漏法）：**只换 `kind_counts` 的一半**也要红
+    （夹具因此改成「原始 kind 不同、有效 kind 相同」，见 `con_with_two_items`）。
     """
     from vigil import overrides
 
     overrides.attach_readonly(con_with_two_items)
     ov = overrides.connect()
     try:
+        # 两个**不同的旧 slug** 都映射到同一个新 slug —— 这正是 FIX 3 要的形状。
         overrides.set_kind_alias(ov, old_kind="life", new_kind="daily")
+        overrides.set_kind_alias(ov, old_kind="notice", new_kind="daily")
     finally:
         ov.close()
 

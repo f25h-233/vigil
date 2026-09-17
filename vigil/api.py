@@ -240,15 +240,58 @@ def create_app(config: Config) -> FastAPI:
         """
         return {c.slug: c for c in current_categories()}
 
+    def live_slugs_of(cats: Sequence[Category], *, keep: str | None = None) -> list[str]:
+        """**即将生效**的那套 slug（＋可选地保留一个"此刻还得在"的旧名）。
+
+        ⚠️ `keep` 是给改名/删除用的：那个**马上要被废掉**的旧 slug。
+        多含它的理由**只有一个、且是实测的**（Fix loop 1）：别名链 `X → 旧名`
+        必须活到 `set_kind_alias` 那一次扁平 UPDATE 跑完，否则 X 的条目会退化成
+        裸 slug（`test_api_rename_keeps_the_alias_chain_alive` 钉着它）。
+        最终的不变量由**收尾那一刀**保证：`commit_categories` 用的是
+        **不含 `keep`** 的 candidate 集。
+        """
+        return [c.slug for c in cats] + ([keep] if keep else [])
+
+    def prune_aliases(
+        cats: Sequence[Category], *, keep: str | None = None
+    ) -> int:
+        """按 `live_slugs_of(cats, keep=…)` 把别名表剪到一致。
+
+        ⚠️ 为什么必须有它（Fix loop 1 / FIX 1+2）：`store._EFFECTIVE_KIND` 里的
+        `ka2`（作用在 `ost.kind` 上的那条别名）**无条件优先于** `ost.kind`，
+        所以**不变量「别名行的 `old_kind` 必不是现存 slug」就是 `ka2` 的安全前提**
+        ——完整论证在 `overrides.prune_kind_aliases` 的 docstring 里。
+        """
+        ov = overrides.connect()
+        try:
+            return overrides.prune_kind_aliases(
+                ov, live_slugs=live_slugs_of(cats, keep=keep)
+            )
+        finally:
+            ov.close()
+
     def snapshot_categories() -> None:
         """把**当前** `categories.toml` 的原文存进 overlay。每次改动**之前**调。
 
-        ⚠️ 文件不存在时静默跳过：那意味着这份配置还没被创建过，
-        而"撤销到一个不存在的文件"没有意义。
+        ⚠️ **文件不存在 ⇒ 500，不静默跳过**（Fix loop 1 / FIX 6）。
+        口径与 `current_categories()` 统一：`categories` 这一族的既有约定就是
+        **快速失败**（Global Constraint 5：`persons` / `llm` 返回默认值，
+        `groups` / `categories` 快速失败）——"文件不存在"与"文件写错"是两回事，
+        但两者都不该被当成"没有干预"咽下去。
+
+        ⚠️ 静默跳过的后果是**具体的**：这条路径上写文件**照旧发生**，只是撤销栈
+        少了一格 ⇒ 用户下一次「撤销」会**跳过这次编辑、多退一格**，而接口什么
+        都没说。今天它不可达（每个调用点前面都已经 `current_categories()` 成功读过
+        同一个文件），所以它是一条**兜底**——而兜底要么响亮、要么不存在，
+        "静默地少做一件事"是最坏的那种。
         """
         path = categories_path()
         if not path.is_file():
-            return
+            raise HTTPException(
+                status_code=500,
+                detail=f"{path} 在本次请求中途消失了（写之前读不到它）——"
+                "**没有任何改动落盘**；请检查 config/ 是否被别的程序动过。",
+            )
         ov = overrides.connect()
         try:
             overrides.save_config_snapshot(ov, body=path.read_text(encoding="utf-8"))
@@ -286,6 +329,11 @@ def create_app(config: Config) -> FastAPI:
             raise HTTPException(status_code=400, detail=str(exc))
 
     def commit_categories(cats: Sequence[Category]) -> None:
+        # ⚠️ **写文件之前先剪枝**（Fix loop 1 / FIX 1c）。这是「收尾那一刀」：
+        # 用的是**不含 `keep`** 的这套 slug，落盘之后表里不会再有
+        # `old_kind ∈ 现存 slug` 的行 ⇒ `store._EFFECTIVE_KIND` 里的 `ka2` 安全。
+        # 放在这里（而不是只放在端点里）是因为它是**写文件**这条路上唯一的收口。
+        prune_aliases(cats)
         try:
             categories_mod.save_categories(cats, categories_path())
         except categories_mod.CategoryError as exc:
@@ -331,11 +379,23 @@ def create_app(config: Config) -> FastAPI:
         配置就是它们的载荷 / 前提，读不出来必须让人看见。
         ⚠️ 但降级**必须留痕**：静默降级等于把「配置坏了」藏起来，
         用户只会看到一屏裸群号而不知道为什么。
+
+        ⚠️ **捕 `Exception` 而不是 `HTTPException`**（Fix loop 1 / FIX 8，controller
+        裁定；T4 那轮只捕了 `HTTPException`，于是这条缝没人守）：上面说的
+        「读不出来」**不止** `ConfigError → HTTPException` 一种形态——
+        `OSError`（权限、文件被占、路径异常）同样读不出来，而它**不是**
+        `HTTPException` ⇒ 从前会一路冒成 500，把主页面整页黑掉。
+        实测（T4 re-reviewer 的探针）：`load_config` 抛 `OSError(13)` ⇒ `/api/items` = 500。
+
+        ⚠️ 捕宽是安全的，因为这里能吞的**只有显示用的增强项**（群名 → 退化成裸群号，
+        `item_out` 的 `names.get(..., str(gid))` 本来就是这么兜底的）；
+        **配置本身的问题不会被藏起来**：`/api/groups` 与四个写端点走
+        `current_config()`，照旧响亮地 500。
         """
         try:
             cfg = current_config()
-        except HTTPException as exc:
-            logs.emit(f"[警告] 群名读取失败，信息流退回裸群号：{exc.detail}")
+        except Exception as exc:  # noqa: BLE001
+            logs.emit(f"[警告] 群名读取失败，信息流退回裸群号：{exc!r}")
             return {}
         return {g.id: g.name for g in cfg.groups}
 
@@ -475,10 +535,26 @@ def create_app(config: Config) -> FastAPI:
             candidate = tuple(merged if c.slug == slug else c for c in existing)
             validate_or_400(candidate)
 
+            # ⚠️ **顺序：先剪枝、再写别名**（Fix loop 1 / FIX 1c，承重）。
+            # 反过来的话「改回原名」（A→B 之后再把 B 改回 A）会因为表里还留着
+            # `A→B` 而跟成一个**环** ⇒ `set_kind_alias` 抛错 ⇒ 用户永远回不去。
+            # 剪枝用的 live 集**多含一个 `slug`**（那个马上要废的旧名）：
+            # 别名链 `X→slug` 必须活到下面那次扁平 UPDATE 跑完，否则 X 的条目
+            # 会退化成裸 slug。完整的 live 集语义见 `live_slugs_of`。
             if new_slug != slug:
+                prune_aliases(candidate, keep=slug)
                 ov = overrides.connect()
                 try:
-                    overrides.set_kind_alias(ov, old_kind=slug, new_kind=new_slug)
+                    try:
+                        overrides.set_kind_alias(ov, old_kind=slug, new_kind=new_slug)
+                    except overrides.OverlayError as exc:
+                        # 剪枝之后这里**理论上**不可达（环要靠"老行"才能形成，
+                        # 而它刚被剪掉）——但兜底必须响亮且**方向正确**：
+                        # 500 会让排障指向"服务坏了"，而真相是「当前别名表与这次
+                        # 改名冲突」，用户有自救路径（再撤一次 / 换个名字）。
+                        raise HTTPException(
+                            status_code=409, detail=f"改不了名：{exc}"
+                        )
                 finally:
                     ov.close()
             snapshot_categories()
@@ -530,10 +606,18 @@ def create_app(config: Config) -> FastAPI:
                 )
 
             if migrate_to:
-                # ⚠️ 先写别名（见 `api_update_category` 的 docstring）
+                # ⚠️ 先剪枝、再写别名（同 `api_update_category`，Fix loop 1 / FIX 1c），
+                # live 集同样多含那个马上要废的 `slug`（别名链 `X→slug` 要活到
+                # 扁平 UPDATE 跑完）。
+                prune_aliases(candidate, keep=slug)
                 ov = overrides.connect()
                 try:
-                    overrides.set_kind_alias(ov, old_kind=slug, new_kind=migrate_to)
+                    try:
+                        overrides.set_kind_alias(ov, old_kind=slug, new_kind=migrate_to)
+                    except overrides.OverlayError as exc:
+                        raise HTTPException(
+                            status_code=409, detail=f"迁移不了：{exc}"
+                        )
                 finally:
                     ov.close()
             snapshot_categories()
@@ -550,29 +634,39 @@ def create_app(config: Config) -> FastAPI:
         与 `/api/undo` 对齐，但**不接受 `edit_id`**——快照没有"中间某一条"，
         只有"上一格"。
         """
-        ov = overrides.connect()
-        try:
-            popped = overrides.pop_config_snapshot(ov)
-        finally:
-            ov.close()
-        if popped is None:
-            return {"undone": False}
-
-        _, body = popped
-        # ⚠️ 恢复的是一份**手里没有第二份**的内容：先校验再落盘。
-        # 直接 `atomic_write_text` 的话，一份坏快照会把配置永久写坏
-        # （原子写、无回滚），而 `categories.toml` 是 refine 与 api 的硬依赖。
-        try:
-            raw = tomllib.loads(body)
-            categories_mod.validate_categories(
-                raw.get("categories"), categories_path()
-            )
-        except (tomllib.TOMLDecodeError, categories_mod.CategoryError) as exc:
-            raise HTTPException(
-                status_code=500,
-                detail=f"快照内容已损坏，拒绝写回（配置未被改动）：{exc}",
-            )
+        # ⚠️ **整段在 `write_lock` 里**（Fix loop 1 / FIX 5）：`pop` 在锁外时，
+        # 两个并发撤销各自 peek 到同一格 ⇒ 一个格的快照被消费两次 / 丢一格。
         with write_lock:
+            ov = overrides.connect()
+            try:
+                row = overrides.peek_config_snapshot(ov)
+                if row is None:
+                    return {"undone": False}
+                _, body = row
+                # ⚠️ **校验在消费之前**（Fix loop 1 / FIX 5）：恢复的是一份
+                # **手里没有第二份**的内容，所以要先校验再落盘——直接
+                # `atomic_write_text` 的话，一份坏快照会把配置永久写坏
+                # （原子写、无回滚），而 `categories.toml` 是 refine 与 api 的硬依赖。
+                # ⚠️ 而**校验不过时不许消费**：从前是先 `pop` 再校验 ⇒ 坏快照被
+                # 悄悄从栈里吃掉，用户下一次撤销会**多退一格**（跳过更早那次编辑），
+                # 而响应只说「配置未被改动」——**那句话只对文件成立**。
+                try:
+                    raw = tomllib.loads(body)
+                    restored = categories_mod.validate_categories(
+                        raw.get("categories"), categories_path()
+                    )
+                except (tomllib.TOMLDecodeError, categories_mod.CategoryError) as exc:
+                    raise HTTPException(
+                        status_code=500,
+                        detail=f"快照内容已损坏，拒绝写回（配置未改动、**快照也没被消费**）：{exc}",
+                    )
+                overrides.pop_config_snapshot(ov)
+            finally:
+                ov.close()
+            # ⚠️ 剪枝按**即将生效的那套 slug**（= 快照里那份，Fix loop 1 / FIX 1c）：
+            # 撤销一次改名之后，那条 `旧名→新名` 的别名必须跟着消失——否则
+            # 配置里的名字回来了、条目却还走在改名后的 slug 上（悬空）。
+            prune_aliases(restored)
             atomic_write_text(categories_path(), body)
         return {"undone": True}
 

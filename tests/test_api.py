@@ -1862,3 +1862,191 @@ def test_a_broken_config_degrades_the_display_paths_but_not_the_config_payload(
     assert client.get("/api/groups").status_code == 500, (
         "`/api/groups` 读不出配置必须响亮——否则它会回一句「还没有快照」的假话"
     )
+
+
+# ── M6 T5 Fix loop 1：别名剪枝 + `ka2`（C-1 / I-1 / I-2）─────────────
+#
+# 四条用例是一条链上的四格，各自的「删掉它什么会红」写在 docstring 里。
+
+
+def test_api_renaming_a_category_then_undoing_moves_the_items_back(client_factory):
+    """⭐ C-1：改名 ⇒ **撤销** ⇒ 条目必须跟着回到旧 slug（不许悬空）。
+
+    ⚠️ 从前这条会留下一个**悬空 slug**：配置回到了 `academic`，而 `academic→life_v2`
+    那条别名还在 ⇒ 条目显示 `life_v2`（一个配置里已经不存在的类目）、角标 `academic=0`。
+    **撤销必须把这一次改名整体退掉**——别名也是这次改名的一部分。
+
+    ⚠️ 变异反证：把 `api_category_undo` 里的 `prune_aliases(restored)` 删掉
+    ⇒ 本条**必红**（条目仍显示 `life_v2`、aliases 仍有那一行）。
+    """
+    c = client_factory()
+    item_id = client_factory.item_ids[0]
+    old_kind = c.get(f"/api/items/{item_id}").json()["kind"]
+
+    assert c.put(f"/api/categories/{old_kind}", json={"slug": "life_v2"}).status_code == 200
+    assert c.get(f"/api/items/{item_id}").json()["kind"] == "life_v2"
+
+    assert c.post("/api/categories/undo").status_code == 200
+    assert c.get(f"/api/items/{item_id}").json()["kind"] == old_kind, (
+        "撤销之后条目还走在改名后的 slug 上：配置里已经没有它了"
+    )
+    assert c.get("/api/categories").json()["aliases"] == {}, (
+        "撤销只退了配置文件、没退别名：表里留着一条指向不存在目标的映射"
+    )
+
+
+def test_api_renaming_back_to_the_original_name_is_not_an_error(client_factory):
+    """⭐ I-1：`A→B` 之后再把 `B` 改回 `A`，**不许成环**。
+
+    ⚠️ 从前这里是 500（`set_kind_alias` 跟到旧行 `A→B` 判成环），而报错还赖
+    「这张表是程序维护的，出现环说明有人手工改过它」——**那句话是假的**，
+    是程序自己写出来的环；用户**此后永远回不去**。
+
+    ⚠️ 变异反证：把 `api_update_category` 里那次 `prune_aliases(candidate, keep=slug)`
+    删掉 ⇒ 本条**必红**（409/500）。
+    """
+    c = client_factory()
+    item_id = client_factory.item_ids[0]
+    old_kind = c.get(f"/api/items/{item_id}").json()["kind"]
+
+    assert c.put(f"/api/categories/{old_kind}", json={"slug": "academic_v2"}).status_code == 200
+    back = c.put("/api/categories/academic_v2", json={"slug": old_kind})
+    assert back.status_code == 200, f"改回原名必须能成功，实际：{back.status_code} {back.text}"
+    assert c.get(f"/api/items/{item_id}").json()["kind"] == old_kind
+    aliases = c.get("/api/categories").json()["aliases"]
+    assert old_kind not in aliases, (
+        "表里留了一条 `old_kind` 是**现存 slug** 的行——不变量破了，它是下一个环的种子"
+    )
+
+
+def test_api_re_adding_a_slug_does_not_steal_a_manual_kind(client_factory):
+    """⭐ I-2：删掉又加回来的 slug，**不许**被旧别名顶掉（`ka2` 的安全前提）。
+
+    场景：① 手工把一条条目的类目改成 `life`；② 删掉 `life`（迁移到 `notice`）
+    ⇒ 别名 `life→notice`（**必需**：那条条目的 `ost.kind='life'` 已经不存在了）；
+    ③ 把 `life` 加回来。
+    ⇒ 此时 `life` 又是**合法**类目 ⇒ 那条条目必须显示 `life`。
+    ⚠️ 旧行 `life→notice` 若还在，`ka2`（作用在 `ost.kind` 上、无条件优先）会把它
+    顶成 `notice`——**用户的手工选择被静默改掉**，这正是 FIX 2 的反例。
+
+    ⚠️ 变异反证：把 `commit_categories` 里的 `prune_aliases(cats)` 删掉 ⇒ 本条**必红**。
+    """
+    c = client_factory()
+    item_id = client_factory.item_ids[1]
+    assert c.post(f"/api/items/{item_id}/kind", json={"kind": "life"}).status_code == 200
+    assert c.get(f"/api/items/{item_id}").json()["kind"] == "life"
+
+    assert c.delete("/api/categories/life?migrate_to=notice").status_code == 204
+    assert c.get(f"/api/items/{item_id}").json()["kind"] == "notice", (
+        "迁移之后那条条目该跟着走（`ka2` 的正当用途）"
+    )
+
+    r = c.post("/api/categories", json={"slug": "life", "desc": "加回来"})
+    assert r.status_code == 201
+    assert c.get(f"/api/items/{item_id}").json()["kind"] == "life", (
+        "手工选的合法类目被旧别名顶掉了：不变量（alias.old_kind 不许是现存 slug）没被维持"
+    )
+    assert "life" not in c.get("/api/categories").json()["aliases"]
+
+
+def test_api_a_manual_kind_follows_a_later_rename(client_factory):
+    """⭐ FIX 2：手工改过的类目**也要**跟着 slug 改名走（我上一轮报的 C2）。
+
+    ⚠️ 没有 `ka2` 的话：把那条条目手工改成 `life`、再把 `life` 改名成 `life_v2`
+    ⇒ 它**永远停在 `life`**——一个已经不存在的 slug（spec §4.2 ④ 点名要禁）。
+
+    ⚠️ 变异反证：把 `store._EFFECTIVE_KIND` 里的 `ka2.new_kind` 去掉
+    （连同那条 JOIN）⇒ 本条**必红**（显示 `life`）。
+    """
+    c = client_factory()
+    item_id = client_factory.item_ids[1]
+    assert c.post(f"/api/items/{item_id}/kind", json={"kind": "life"}).status_code == 200
+
+    assert c.put("/api/categories/life", json={"slug": "life_v2"}).status_code == 200
+    assert c.get(f"/api/items/{item_id}").json()["kind"] == "life_v2", (
+        "手工改过的类目没跟着改名走：界面上它指着一条不存在的 slug"
+    )
+
+
+def test_api_rename_keeps_the_alias_chain_alive(client_factory):
+    """⭐ `prune_aliases(..., keep=slug)` 里那个 `keep` 的**理由**（实测）。
+
+    链条：① 删 `academic`（迁移到 `life`）⇒ 别名 `academic→life`；
+    ② 把 `life` 改名成 `life_v2` ⇒ 那条 `academic→life` 会被**扁平**成
+    `academic→life_v2`（`set_kind_alias` 的第二步），条目走到 `life_v2`。
+
+    ⚠️ 剪枝若用的 live 集**不含那个待废的 `life`**，`academic→life` 会在
+    `set_kind_alias` **之前**被删掉 ⇒ 扁平的 UPDATE 找不到它 ⇒ 条目退化成
+    裸 slug `academic`。⇒ `keep=slug` 不是顺手多传一个参数。
+
+    ⚠️ 变异反证：把那次调用的 `keep=slug` 去掉 ⇒ 本条**必红**。
+    """
+    c = client_factory()
+    item_id = client_factory.item_ids[0]          # 库里的 raw kind = academic
+    assert c.delete("/api/categories/academic?migrate_to=life").status_code == 204
+    assert c.get(f"/api/items/{item_id}").json()["kind"] == "life"
+
+    assert c.put("/api/categories/life", json={"slug": "life_v2"}).status_code == 200
+    assert c.get(f"/api/items/{item_id}").json()["kind"] == "life_v2", (
+        "别名链在改名时被剪断了：条目退化成裸 slug（`keep=slug` 的意义就在这里）"
+    )
+
+
+def test_api_items_survives_an_unreadable_config(client, monkeypatch):
+    """⭐ FIX 8：显示路径的降级必须**真的**降级——`OSError` 也算「读不出来」。
+
+    ⚠️ T4 那轮只捕 `HTTPException`，于是「配置读不出来」里**只有** TOML 语法错
+    会被降级；`OSError`（权限 / 文件被占 / 路径异常）**不是** `HTTPException`
+    ⇒ 它一路冒成 500，把主页面整页黑掉。T4 的 re-reviewer 实测探针证实了这一点。
+
+    ⚠️ 变异反证：把 `group_names_map()` 的 `except` 改回 `except HTTPException`
+    ⇒ 本条**必红**（500）。⚠️ E7 判据：**放宽成 `except Exception` 之前，
+    全仓没有任何东西会红**——这条缝从前没人守。
+
+    ⚠️ 阳性对照的另一半在 `test_a_broken_config_degrades_the_display_paths_but_not_
+    the_config_payload`：`/api/groups`（配置就是它的载荷）仍**保持响亮**。
+    """
+    import vigil.api as _api
+
+    def boom(*_a, **_kw):
+        raise OSError(13, "Permission denied")
+
+    monkeypatch.setattr(_api, "load_config", boom)
+
+    r = client.get("/api/items")
+    assert r.status_code == 200, "`OSError` 也是「读不出来」，不许把信息流整页黑掉"
+    assert r.json()["items"][0]["group_name"] == "12345", (
+        "降级必须是**裸群号字符串**——不是空串、不是 None、更不是 500"
+    )
+
+
+def test_api_undo_refuses_a_corrupt_snapshot_without_consuming_it(client_factory):
+    """⭐ FIX 5：坏快照被拒时**不许**把它从撤销栈里吃掉。
+
+    ⚠️ 从前的顺序是 `pop` → 校验 ⇒ 坏快照被**静默消费**，用户下一次撤销会
+    **多退一格**（跳过更早那次编辑），而响应只说「配置未被改动」——
+    **那句话只对文件成立**。现在校验在消费之前：拒了就是拒了，栈原样。
+
+    ⚠️ 变异反证：把 `pop_config_snapshot` 挪到校验**之前** ⇒ 本条**必红**
+    （第二次撤销会回 `{"undone": false}` 而不是 500）。
+    """
+    from vigil import overrides as _ov
+
+    c = client_factory()
+    w = _ov.connect()
+    try:
+        _ov.save_config_snapshot(w, body="[[categories]\n", now=1)   # 坏 TOML
+    finally:
+        w.close()
+
+    r = c.post("/api/categories/undo")
+    assert r.status_code == 500 and "快照" in r.json()["detail"]
+    # ⚠️ 关键：**第二次仍然是同一个错误**（栈没被消费），而不是「没有可撤销的」
+    assert c.post("/api/categories/undo").status_code == 500, (
+        "坏快照被静默消费了：第二次撤销退回「没得撤」，用户永远看不到那句 500 的原因"
+    )
+    w = _ov.connect()
+    try:
+        assert _ov.peek_config_snapshot(w) is not None, "peek 说栈空了——它被消费掉了"
+    finally:
+        w.close()

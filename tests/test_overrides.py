@@ -715,3 +715,61 @@ def test_kind_alias_refuses_to_build_a_cycle(ov):
     overrides.set_kind_alias(ov, old_kind="a", new_kind="b", now=1)
     with pytest.raises(overrides.OverlayError, match="环"):
         overrides.set_kind_alias(ov, old_kind="b", new_kind="a")
+
+
+# ── M6 T5 Fix loop 1：剪枝（不变量）与 peek ─────────────────────────
+
+
+def test_prune_drops_a_row_whose_old_kind_is_live_again(ov):
+    """⭐ **不变量**：一行的 `old_kind` 若仍是现存 slug，必须删掉（FIX 1a）。
+
+    ⚠️ 为什么承重：`store._EFFECTIVE_KIND` 里的 `ka2` 作用在 `ost.kind` 上且
+    **无条件优先**——只要表里不可能有 `old_kind ∈ 现存 slug` 的行，`ka2` 就
+    不可能把用户手工选的**合法**类目顶掉。完整论证在 `prune_kind_aliases` 的
+    docstring 里；这条钉的是函数本身。
+
+    变异反证：把删条件里的 `old in live` 去掉 ⇒ 本条**必红**（`life→life_v2` 会留下）。
+    """
+    overrides.set_kind_alias(ov, old_kind="life", new_kind="life_v2", now=1)
+    overrides.set_kind_alias(ov, old_kind="academic", new_kind="life_v2", now=2)
+
+    # `life` 又变回现存 slug ⇒ 那一行必须走（另一行不动）
+    assert overrides.prune_kind_aliases(ov, live_slugs=["life", "life_v2"]) == 1
+    assert overrides.kind_aliases(ov) == {"academic": "life_v2"}
+
+
+def test_prune_drops_a_row_pointing_outside_the_live_set(ov):
+    """第二条删条件：`new_kind` 不在现存 slug 里 ⇒ 那行映射不出任何合法类目。
+
+    变异反证：把删条件里的 `new not in live` 去掉 ⇒ 本条**必红**。
+    """
+    overrides.set_kind_alias(ov, old_kind="ghost", new_kind="life_v2", now=1)
+    assert overrides.prune_kind_aliases(ov, live_slugs=["life"]) == 1
+    assert overrides.kind_aliases(ov) == {}
+
+
+def test_prune_keeps_a_row_that_is_still_doing_work(ov):
+    """阴性对照：两条删条件都不成立时**一行都不许动**。
+
+    ⚠️ 没有这条的话，「剪枝 = 清空整张表」也能让上面两条绿。
+    """
+    overrides.set_kind_alias(ov, old_kind="academic", new_kind="life", now=1)
+    assert overrides.prune_kind_aliases(ov, live_slugs=["life", "notice"]) == 0
+    assert overrides.kind_aliases(ov) == {"academic": "life"}
+
+
+def test_peek_does_not_consume_the_snapshot(ov):
+    """⚠️ FIX 5 的另一半：`peek` 只看不拿（校验必须在**消费之前**）。
+
+    变异反证：把 `peek_config_snapshot` 改成 `pop_config_snapshot` 的实现
+    ⇒ 本条**必红**（第二次 peek 变成 None）。
+    """
+    overrides.save_config_snapshot(ov, body="第一版", now=1)
+    assert overrides.peek_config_snapshot(ov) == (1, "第一版")
+    assert overrides.peek_config_snapshot(ov) == (1, "第一版"), "peek 把快照消费掉了"
+    assert overrides.pop_config_snapshot(ov) == (1, "第一版")
+    assert overrides.peek_config_snapshot(ov) is None
+
+
+def test_peek_on_an_empty_stack_is_none(ov):
+    assert overrides.peek_config_snapshot(ov) is None
