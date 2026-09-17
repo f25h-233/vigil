@@ -2127,9 +2127,13 @@ _NEW_KIND = "notice"
 # 假模型的响应：**三条消息各一条**（与种子一一对应）。
 #
 # ⚠️ 第三条**不是承重的**——这里原先写着一个错的理由（"不加它有一批永远什么都不
-# 产出、进度与取消就没意义了"），**实测不成立**：删掉第三条，`-k "reorder or
-# cancel or progress or bulk or revive"` 仍然 **18 passed**（`_scan_payload` 把
-# 匹配不上的条目只记进 `dropped_unmatched`，不抛异常）。
+# 产出、进度与取消就没意义了"），**实测不成立**：删掉第三条，
+#   `uv run pytest tests/test_api.py tests/test_reorder.py -k "reorder or cancel or progress or bulk or revive"`
+# 仍然全绿（`_scan_payload` 把匹配不上的条目只记进 `dropped_unmatched`，不抛异常）。
+# ⚠️ 那个数字**必须连同命令一起读**：本轮核过一次，同一条命令今天是 **19 passed**
+# （原先记的是 18——因为当时我自己的 FIX 2 用例 `…starts_before_submit_returns`
+# 还没写，它命中 `reorder` 这个关键词）。**换个筛选词就换一个数字**，
+# 所以「N passed」单独写出来就是一句不可复核的话。
 # ⇒ 真正承重的是**第 3 条种子条目在 222 群**（`_seed_items_db`），它给出"两批"。
 # 留着第三条的理由只剩"与种子一一对应、读的人不用猜为什么少一条"。
 # （复审 FIX 3：删掉一句已知错的论证与修一个 bug 同样是交付。）
@@ -2362,13 +2366,20 @@ class _GatedLLM:
         return LLMResult(payload=self.payload, input_tokens=1, output_tokens=1)
 
 
+# 假模型第 2 批起的**尾延迟**（秒）。它把"放行之后、写 overlay 之前"那段拉宽，
+# 于是"worker 还没写"这件事是**确定**的——否则 session 级不变式
+# （`tests/conftest.py::_real_overlay_stays_untouched`）会变成"看谁先跑"的守卫，
+# 而那种守卫最后都会被人注释掉。
+_GATED_TAIL_DELAY = 0.3
+
+
 @pytest.fixture
 def gated_llm(monkeypatch):
     """见 `_GatedLLM`。⚠️ 同时换掉 `api.load_llm_key`（理由同 `fake_llm`）。"""
     from vigil import api as _api
     from vigil import reorder as _reorder
 
-    llm = _GatedLLM(_REORDER_PAYLOAD)
+    llm = _GatedLLM(_REORDER_PAYLOAD, tail_delay=_GATED_TAIL_DELAY)
     monkeypatch.setattr(_reorder, "chat_json", llm)
     monkeypatch.setattr(_api, "load_llm_key", lambda *a, **k: "k-llm")
     yield llm
@@ -2874,6 +2885,30 @@ def test_the_release_helper_drains_before_the_isolation_is_undone(
         "worker 在隔离撤销**之后**才写 overlay —— 真实场景里那就是 "
         "`data/overrides.db`（隔离之外的那个库）"
     )
+
+
+def test_a_blocked_job_is_left_for_the_teardown_to_release(client_factory, gated_llm):
+    """⭐ fix loop 3 的**载体**用例：把"用例自己不收尾、由夹具 teardown 收尾"那条路径走一遍。
+
+    ⚠️ 它**自己不持有任何"有没有写进真实库"的判据**——这恰恰是上一轮的要害
+    （那条判据"等 worker 结束"用的就是 `_drain_jobs` 自己，于是把 `_drain_jobs`
+    改成 `return True` 它照样全绿）。判据搬到了**独立于被测物**的地方：
+    `tests/conftest.py::_real_overlay_stays_untouched`（会话级、只读、量文件本身）。
+
+    ⚠️ 所以这里**故意不放行**：自己放行就变成"测试自己收尾"，而这条路
+    （teardown 放行 → worker 在隔离撤销之后才写）就**没有人走**了。
+    """
+    c = client_factory()
+    job_id = c.post("/api/reorder").json()["job_id"]
+    assert gated_llm.entered.wait(5), "假模型没被调到——teardown 那条路径根本没被走到"
+    assert c.get(f"/api/jobs/{job_id}").json()["state"] == "running", (
+        "job 已经结束了 ⇒ teardown 的放行是空操作，本用例没覆盖到目标路径"
+    )
+    # ⚠️ 把"放行之后、写 overlay 之前"那段拉宽：伤害的形状是"worker 比 monkeypatch
+    # 的还原**慢一步**"，而夹具收尾偶尔会超过默认的 0.3s（实测：全套跑时就有一次
+    # 没被复现出来）⇒ 变异反证会变成"看运气"的。1.5s 让它在任何调度下都成立。
+    # ⚠️ 改得动是因为 worker 每次调用都**现读** `tail_delay`，而它此刻正卡在第 1 批。
+    gated_llm.tail_delay = 1.5
 
 
 def test_api_reorder_survives_a_worker_that_starts_before_submit_returns(

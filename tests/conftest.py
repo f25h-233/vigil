@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import pathlib
 import sqlite3
 import sys
@@ -420,6 +421,94 @@ def _isolate_jobs_registry(monkeypatch):
     from vigil import jobs as _jobs
 
     monkeypatch.setattr(_jobs, "registry", _jobs.JobRegistry())
+
+
+def _overlay_fingerprint(db: pathlib.Path) -> tuple:
+    """`(主文件 sha256, item_edits 行数, MAX(edit_id), item_state 行数)`。**只读**。
+
+    ⚠️ `mode=ro` **且不建库**：量它的动作本身一个字节都不许写
+    （`ensure_schema` / `connect` 都会建文件——那是写，不是量）。
+    ⚠️ **不量 `-shm`**：任何连接（**含只读的**）挂上去都可能动它，它一变就会产生
+    「与环境相关」的假红，而假红的守卫最后都会被人注释掉。
+    ⚠️ `-wal` 里的行**由行数反映**（只读连接看得见 WAL 里的已提交行）——
+    所以"只比较主文件字节"是够的，没有"写进 WAL 看不见"的缺口。
+    ⚠️ 库在但表不在（半成品/坏文件）⇒ 记一个哨兵值而不是抛：那种状态下
+    **主文件 sha256 已经变了**，断言照样会红；在这里抛只会得到一句不像判据的 traceback。
+    """
+    if not db.is_file():
+        return ("<missing>", 0, 0, 0)
+    main = hashlib.sha256(db.read_bytes()).hexdigest()
+    con = sqlite3.connect(f"file:{db.as_posix()}?mode=ro", uri=True)
+    try:
+        n, mx = con.execute(
+            "SELECT COUNT(*), IFNULL(MAX(edit_id), 0) FROM item_edits"
+        ).fetchone()
+        st = con.execute("SELECT COUNT(*) FROM item_state").fetchone()[0]
+        return (main, int(n), int(mx), int(st))
+    except sqlite3.Error as exc:
+        return (main, f"<读不出来：{type(exc).__name__}>", 0, 0)
+    finally:
+        con.close()
+
+
+def _default_overlay_paths() -> list[pathlib.Path]:
+    """会话开始时**「默认写入目标」**那条路径（正常情况就是仓库里 `data/overrides.db`）。
+
+    ⚠️ 取 `overrides.OVERRIDES_DB` 的**会话初始值**（此时还没打任何隔离夹具），
+    而不是写死 `REPO_ROOT / "data" / "overrides.db"`：前者正是 `monkeypatch` 在
+    teardown 里把默认路径**还原成**的那一个——**伤害落的就是它**。
+    （两者在正常环境里是同一条路径：这时两条都量，见下。）
+    """
+    from vigil import overrides as _ov
+
+    paths = [pathlib.Path(_ov.OVERRIDES_DB)]
+    repo_path = pathlib.Path(_ov.REPO_ROOT) / "data" / "overrides.db"
+    if repo_path not in paths:
+        paths.append(repo_path)
+    return paths
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _real_overlay_stays_untouched():
+    """⭐ 会话级不变式：**真实的** `data/overrides.db` 在整个测试会话里一个字都不许变。
+
+    **为什么需要它**（M6 T6 fix loop 3，复审 Important）：此前那条「夹具 teardown
+    要等 worker 结束」的判据，**等的就是 `_drain_jobs` 自己**。复审用两个改法证明了
+    它守不住任何东西：
+
+      * 把 `_drain_jobs` 的 while 改成 `return True` ⇒ 时序子集 **6 passed 全绿**；
+      * 把两个夹具 teardown 换回裸 `gate.set()` ⇒ 只有故意失败的探针红，而**同一
+        形状下 worker 真的把 2 条 `item_edits` 写进了隔离之外的库**。
+
+    ⇒ 这正是 M5 那条教训的原形：**判据用它要守的那套机制当仪器，就永远证明不了
+    那套机制**（"探针被写进被测物内部"）。
+
+    **为什么这条独立于被测物**：它不读 `jobs.registry`、不调 `_drain_jobs`、
+    不看任何夹具 teardown 的行为——它只在会话的**一头一尾**各量一次**那个文件
+    本身**（sha256 + 行数），量具与 Python 侧的机制**没有任何共享状态**。
+
+    **为什么必须是会话级**：伤害发生在**夹具 teardown 之后**（worker 是异步的），
+    function 级的量具会在伤害发生**之前**就把结论定了——那正是上一轮那条空守卫
+    的形态（"断言跑在伤害之前"）。
+
+    ⚠️ **只读**：全程 `mode=ro` 打开，**不在仓库里写任何东西**（连建库都不做）。
+
+    ⚠️ 它红了先排除一件事：**服务在本轮测试期间被人工操作过**（那会真的改写这个
+    文件——那是环境动的，不是测试写的）。确认没人动过，那就是**测试写进了真实
+    资产**，按本项目第一条规矩处理（`conftest.py` 顶上那两道隔离夹具就是为它写的）。
+    """
+    targets = _default_overlay_paths()
+    before = {p: _overlay_fingerprint(p) for p in targets}
+    yield
+    after = {p: _overlay_fingerprint(p) for p in targets}
+    changed = [p for p in before if before[p] != after[p]]
+    assert not changed, (
+        "测试写进了**隔离之外**的 overlay 库（本项目第一条规矩：测试不碰真实资产）：\n"
+        + "\n".join(f"  {p}\n    会话开始：{before[p]}\n    会话结束：{after[p]}" for p in changed)
+        + "\n⚠️ 先排除：服务在测试期间被人工操作过（那是环境动的）。"
+        "确认没有的话，就是**夹具 teardown 之后仍有 worker 在写**——"
+        "查 `tests/test_api.py::_release_and_wait` 与两道 teardown 是否真的等到了终态。"
+    )
 
 
 @pytest.fixture
