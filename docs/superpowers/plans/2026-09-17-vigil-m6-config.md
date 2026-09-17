@@ -6688,6 +6688,143 @@ git commit -m "fix(refine,api,overrides): M5 遗留清理 #4/#7/#9/#10/#23/#25/#
 
 ---
 
+## Task 11: 重排界面（spec §4.2 ④ 的收口）——**计划补遗**
+
+> ⚠️ **这一条不在原计划里。** 原计划的 T9 只写了「四节——群/人物/LLM/类目 + 导入导出」，
+> **漏了重排界面**，而 spec §4.2 ④ 明写「重排 = LLM 重判 + `界面上多选批量改`」。
+> T9 的审查把它查了出来（且比 controller 说的多两层：`/api/jobs/{id}/cancel`、`/api/items/kinds`、
+> `/api/bulk-undo` 在 `web/` 里**也**零引用；**CLI 也没有 `reorder` 子命令**）。
+> **用户 2026-09-18 裁定：补这一条。**
+
+**后果的严重性**（写在最前面，因为它决定了这条的优先级）：
+出口判据 7「重排后**撤销**能回到重排前」在 **API 层成立**（`test_api_reorder_undo_returns_to_the_previous_kinds` 等 5 条），
+但 **用户够不到**——后端做了、前端没做、CLI 也没有 ⇒ **那个特性事实上不存在。**
+
+**Files:**
+- Modify: `web/src/api.ts`（补 `cancelJob` / `bulkSetKind` / `bulkUndo`）
+- Modify: `web/src/views/Settings.tsx`（加「重排」一节）
+- Modify: `web/src/views/Feed.tsx` + `web/src/components/ItemCard.tsx`（多选）
+- Create: `web/src/__tests__/Reorder.dom.test.tsx`
+
+**Interfaces:**
+- Consumes（**全部已存在且已测**，T6 交付）：`POST /api/reorder`（**202** → `JobRow`）、
+  `GET /api/jobs/{job_id}`、`POST /api/jobs/{job_id}/cancel`、`POST /api/jobs/{job_id}/undo`、
+  `POST /api/items/kinds`（body `{item_ids, kind}` → `{actor, count}`）、
+  `POST /api/bulk-undo`（body `{actor}` → `{undone, count}`）
+- Produces: `api.cancelJob(jobId)` / `api.bulkSetKind(itemIds, kind)` / `api.bulkUndo(actor)`
+
+---
+
+- [ ] **Step 1: `web/src/api.ts` 补三个函数**
+
+```ts
+export const cancelJob = (jobId: string) =>
+  sendJSON<JobRow>(`/api/jobs/${jobId}/cancel`, 'POST')
+
+/** 人工多选批量改类目（D16 的「界面上多选批量改」那一半）。
+ *  ⚠️ 返回的 `actor` 是**撤销的键**——丢了它就再也撤不回这一批。 */
+export const bulkSetKind = (itemIds: number[], kind: string) =>
+  sendJSON<{ actor: string; count: number }>('/api/items/kinds', 'POST', {
+    item_ids: itemIds,
+    kind,
+  })
+
+export const bulkUndo = (actor: string) =>
+  sendJSON<{ undone: boolean; count: number }>('/api/bulk-undo', 'POST', { actor })
+```
+
+- [ ] **Step 2: `Settings.tsx` 加「重排」一节**
+
+⚠️ **三件事必须做对**（每一件都有一个具体的坏法）：
+
+```tsx
+function ReorderSection() {
+  const KEY = 'vigil.reorder.job'
+  const [job, setJob] = useState<JobRow | null>(null)
+  const [err, setErr] = useState<string | null>(null)
+  const [msg, setMsg] = useState<string | null>(null)
+
+  // ⚠️ **刷新即丢**：重排要跑 1–2 分钟，用户很可能刷新页面去看别的。
+  // 把 job_id 落 localStorage，挂载时读回来**继续轮询**——
+  // 不这么做的话，刷新一次就再也看不到那个 job 的结果了，而它**还在服务端跑着**
+  // （而且占着唯一的 JobBusy 名额：用户再点「重排」会拿到 409，却不知道为什么）。
+  useEffect(() => {
+    const saved = window.localStorage.getItem(KEY)
+    if (!saved) return
+    api.fetchJob(saved).then(setJob).catch(() => window.localStorage.removeItem(KEY))
+  }, [])
+
+  // ⚠️ **轮询只在 running 时开**，且**依赖里放 `job?.job_id` 与 `job?.state`**——
+  // 放整个 `job` 对象会每 1 秒重建一次 interval（对象每次都变），
+  // 而放 `job_id` 又会漏掉"状态变了要停"这件事。两个都要。
+  useEffect(() => {
+    if (job === null || job.state !== 'running') return
+    const t = setInterval(() => {
+      api.fetchJob(job.job_id)
+        .then((j) => {
+          setJob(j)
+          if (j.state !== 'running') window.localStorage.removeItem(KEY)
+        })
+        .catch((e: unknown) => setErr(e instanceof Error ? e.message : String(e)))
+    }, 1000)
+    return () => clearInterval(t)
+  }, [job?.job_id, job?.state])
+
+  async function start() {
+    setErr(null); setMsg(null)
+    try {
+      const j = await api.startReorder()
+      setJob(j)
+      window.localStorage.setItem(KEY, j.job_id)
+      setMsg('已开始。重排要跑 1–2 分钟，可以离开这个页面（刷新也不会丢）。')
+    } catch (e: unknown) {
+      // ⚠️ 409 = 已有 job 在跑。**要说清"等它结束"而不是当成错误弹**——
+      // 后端那句 detail 已经写清楚了，原样显示即可。
+      setErr(e instanceof Error ? e.message : String(e))
+    }
+  }
+  ...
+}
+```
+
+⚠️ **取消按钮**：只在 `running` 时显示，调 `api.cancelJob`。
+⚠️ **撤销按钮**：只在**非 running 且 `actor` 非空**时显示，调 `api.undoJob(job.job_id)`。
+⚠️ **进度**：`done/total`（T6 的 fix 轮把 `on_progress` 接上了）。⚠️ **`done` 是"最后成功批次的序号"**，
+不是完成批次数——**照实显示，别自己加一**（那会变成另一句假话）。
+
+- [ ] **Step 3: `Feed.tsx` + `ItemCard.tsx` 多选批量改**
+
+```tsx
+// Feed.tsx：一个 Set<number>，跨分页保留（用户会先选几条再往下翻）
+const [selected, setSelected] = useState<Set<number>>(new Set())
+const [bulkActor, setBulkActor] = useState<string | null>(null)
+```
+```tsx
+// ItemCard.tsx：加一个可选的 checkbox（不改既有行为——不传就不渲染）
+{onSelect && (
+  <input type="checkbox" checked={selected} onChange={() => onSelect(item.item_id)}
+         className="mt-1" aria-label={`选择 ${item.title}`} />
+)}
+```
+⚠️ **撤销**：`bulkSetKind` 返回的 `actor` **必须存下来**（`bulkActor`），
+否则"改了 5 条、发现改错了"只能一条条改回去。撤销调 `api.bulkUndo(bulkActor)`。
+⚠️ 批量改成功之后要**清空选中**并**重取第一页**（照 `reload()` 的既有做法——
+**别复用 `retry()`**，那是往后追加，不会刷新屏幕上那条已经变了的条目；M5 的 A-Minor-7 就是这个）。
+
+- [ ] **Step 4: `web/src/__tests__/Reorder.dom.test.tsx`（≥4 条）**
+
+⚠️ 照抄 **T8 建立的 `installFetch` 范式**（假 fetch + 记 calls），**别新造一套**。
+
+必须覆盖：
+1. **起 job → 轮询到 done → 显示结果**（断言轮询真的发生了，且 `localStorage` 里有 job_id）
+2. **刷新（卸载重挂）→ 从 localStorage 恢复并继续轮询**（这条钉的正是"刷新即丢"那个坏法）
+3. **取消** ⇒ 调了 `/api/jobs/{id}/cancel`
+4. **多选批量改 → 撤销用的是同一个 actor**（断言 `/api/bulk-undo` 的 body 里的 actor == `bulkSetKind` 返回的那个）
+
+⇒ **每条配变异反证**：删掉轮询 / 不存 localStorage / 撤销用错 actor ⇒ **各自必红**。
+
+---
+
 ## 阶段① 自审三件套
 
 > 按 `superpowers:writing-plans` 的要求，写完计划后对着 spec 重看一遍。
