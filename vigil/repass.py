@@ -78,6 +78,10 @@ class RepassPlan:
     # (item_id, place, deadline_ts) —— 保留但需要降级的条目
     downgrades: list[tuple[int, str | None, int | None]] = field(default_factory=list)
     verdicts: dict[int, int] = field(default_factory=dict)   # msg_id -> 新产出条数
+    # item_id -> 死法（a0 / a2 / quota），只对 `to_delete` 里的条目算
+    deaths: dict[int, str] = field(default_factory=dict)
+    # 被 `--subset` 挡下、**本轮不动**的条目（它们仍在清单里，只是不执行）
+    deferred: list[int] = field(default_factory=list)
 
 
 @dataclass
@@ -93,6 +97,8 @@ class RepassStats:
     downgraded: int = 0
     batches: int = 0             # **成功**跑完的批次
     failed_batches: int = 0
+    tombstones: int = 0          # 落下的墓碑行数（= 被软删条目的源消息总数）
+    downgrades_deferred: int = 0  # 本轮**没执行**的降级条数（overlay 不支持 set_field）
     # ── 可审计性（诊断挖出来的三个缺口）──────────────────────────
     items_raw: int = 0           # 模型返回的 item 条数（原始）
     items_landed: int = 0        # 落地条数（去重后）
@@ -242,25 +248,132 @@ def _plan_downgrades(
     return out
 
 
-def apply_plan(conn: sqlite3.Connection, plan: RepassPlan) -> RepassStats:
-    """执行计划。**整批一个事务**——要么全成要么全废，不留半个状态。
+def _source_msg_ids(conn: sqlite3.Connection, item_id: int) -> list[int]:
+    """这条 item 的**每一条**源消息 id（按 `(ts, msg_id)` 升序）。"""
+    return [int(r.msg_id) for r in store.source_messages(conn, item_id)]
 
-    ⚠️ 只读 `to_delete` 与 `downgrades` 两栏：`to_keep` / 三只 skip 桶
-    在这里**没有任何写路径**，清单里写什么就只做什么。
+
+def apply_plan(
+    conn: sqlite3.Connection,
+    plan: RepassPlan,
+    *,
+    overlay: sqlite3.Connection | None = None,
+    actor: str = "repass",
+    now: int | None = None,
+) -> RepassStats:
+    """执行计划：**软删**（D15）——只写 overlay，**绝不写 `data/vigil.db`**。
+
+    ⚠️ 这是 Fix loop 第 2 轮的**核心修正**：原实现走 `store.delete_items`，那是
+    **物理删**，而 D15 的定义是「删除 = 软删，库里行仍在，且永不被重抽复活」。
+    存量重判自己的删也必须是软的，理由三条：
+
+    * **可撤销**：`undo` 路径现成（T4/T8），误杀（如 item 84）可单独恢复；
+    * **可机械断言**：不碰主库 ⇒ `data/vigil.db` 的主文件 + `-wal` + `-shm`
+      指纹前后必须**逐字节相同**（T8 那套守卫的同一判据）；
+    * 与 D11 一致：主库由 Web/CLI 的**只读**连接看，写只发生在 overlay。
+
+    ⚠️ **每一条源消息都落墓碑**（T8 的 E7）：`store.dedupe_batch` 的来源取**并集**，
+    所以一个 item 可以有 ≥2 条源消息；只墓碑化第一条的话，`refine --redo` 重抽
+    兄弟消息会让条目**以新 item_id 复活**（直接违反 D15）。墓碑行垫在 delete 行
+    之前，`undo` 才救得回来（见 `overrides.delete_item` 的 docstring）。
+
+    ⚠️ **没有"整批一个事务"了**（与物理删那版不同）：`overrides.delete_item`
+    逐事件 commit（它自己的设计，为的是不被调用方未提交的事务吞掉）。
+    代价是中途失败会留下**部分软删**——但那是**可撤销**的（undo / 再跑一次补齐），
+    与物理删的"删一半"完全不同量级。这条取舍写在报告里。
+
+    ⚠️ **降级（`plan.downgrades`）本轮不执行**：overlay 目前不支持 `set_field`
+    （`_apply_to_state` 对未知 action 静默忽略），而改主库的 `items.place` 会打破
+    "主库一字未改"。⇒ 记进 `stats.downgrades_deferred`，留给后续决定，**不硬做**。
     """
+    from . import overrides
+
     stats = RepassStats()
-    with store.transaction(conn):
-        stats.deleted = store.delete_items(conn, plan.to_delete)
-        stats.downgraded = store.downgrade_item_fields(conn, plan.downgrades)
+    owns = overlay is None
+    if overlay is None:
+        overlay = overrides.connect()
+    try:
+        for item_id in plan.to_delete:
+            srcs = _source_msg_ids(conn, item_id)
+            overrides.delete_item(
+                overlay,
+                item_id=item_id,
+                msg_id=srcs[0] if srcs else None,
+                extra_msg_ids=srcs[1:],
+                actor=actor,
+                now=now,
+            )
+            stats.deleted += 1
+            stats.tombstones += len(srcs)
+    finally:
+        if owns:
+            overlay.close()
+    stats.downgrades_deferred = len(plan.downgrades)
     return stats
 
 
+def _classify_deaths(
+    plan: RepassPlan,
+    items_by_msg: dict[int, list[int]],
+    *,
+    a0_msgs: set[int],
+    a2_msgs: set[int],
+) -> None:
+    """给 `to_delete` 里的每条 item 标一个**死法**（用户裁定「只上 a2」的判据）。
+
+    * `a0` —— 它的源消息所在的**整批返回空**：没有批内对照，分不清「整批真垃圾」
+      与「批次级整批放弃」。诊断实测：39 个空批的**候选**条数中位 8（与非空批的 9
+      一样）⇒ 更像是模型把 ~8-9 条预筛判过「值得抽」的消息**整批放弃**。
+    * `a2` —— **同批为别的消息产出了、唯独没为这条产出**：有批内对照，
+      是「在能产出的语境里没为这条产出」，**可逐条复核**。
+    * `quota` —— 消息在别处有产出，只是旧条目数超过保留名额（重复项一类）。
+
+    一条 item 挂多条源消息时：**全部落在 a0 批里才算 a0**，否则只要有任一条是 a2
+    就算 a2（a2 是要人去复核的那一类，宁可多标）。
+    """
+    msgs_of: dict[int, list[int]] = {}
+    for mid, ids in items_by_msg.items():
+        for iid in ids:
+            msgs_of.setdefault(int(iid), []).append(int(mid))
+    plan.deaths = {}
+    for iid in plan.to_delete:
+        ms = msgs_of.get(int(iid), [])
+        if ms and all(m in a0_msgs for m in ms):
+            plan.deaths[int(iid)] = "a0"
+        elif any(m in a2_msgs for m in ms):
+            plan.deaths[int(iid)] = "a2"
+        else:
+            plan.deaths[int(iid)] = "quota"
+
+
+def _restrict_subset(plan: RepassPlan, subset: str | None) -> None:
+    """`--subset` 过滤：只执行指定死法的那一批，其余进 `plan.deferred`（**本轮不动**）。
+
+    ⚠️ 被挡下的条目**仍在清单里**（`deferred`），不是"没看见"——报告与打印都要显示，
+    否则「只删了 46 条」会被读成「只有 46 条该删」。
+    """
+    if subset is None:
+        return
+    if subset not in ("a0", "a2"):
+        raise ValueError(f"--subset 只认 a0 / a2，收到 {subset!r}")
+    keep, deferred = [], []
+    for iid in plan.to_delete:
+        (keep if plan.deaths.get(int(iid)) == subset else deferred).append(iid)
+    plan.to_delete, plan.deferred = keep, deferred
+
+
 def _fill_plan_counts(stats: RepassStats, plan: RepassPlan) -> None:
+    """把清单上的条数搬进 stats。
+
+    ⚠️ `downgraded` **不在这里填**：本轮降级一条都不执行（overlay 没有 `set_field`），
+    所以它的真值恒为 0，而"清单上有几条待降级"进 `downgrades_deferred`。
+    把两者填成同一个数会让报告自相矛盾（"降级了 4 条" + "待降级 4 条"）。
+    """
     stats.kept = len(plan.to_keep)
     stats.skipped_referenced = len(plan.skipped_referenced)
     stats.skipped_soft_deleted = len(plan.skipped_soft_deleted)
     stats.unjudged_items = len(plan.unjudged)
-    stats.downgraded = len(plan.downgrades)
+    stats.downgrades_deferred = len(plan.downgrades)
 
 
 def collect_source_messages(conn: sqlite3.Connection) -> list[store.PendingMessage]:
@@ -420,6 +533,7 @@ def repass(
     model: str = DEFAULT_MODEL,
     enable_thinking: bool | None = False,
     apply: bool = False,
+    subset: str | None = None,
     audit_path=None,
     on_progress=print,
 ) -> tuple[RepassPlan, RepassStats]:
@@ -428,6 +542,8 @@ def repass(
     ⚠️ 返回 `(plan, stats)`：即使 apply，调用方也拿得到清单去写报告。
     ⚠️ `audit_path` 给了就把每一批的**模型原话与判定**逐条落成 JSONL——不可逆操作的
     事前可见 + 事后可复核，是同一个需求的两半。
+    ⚠️ `apply=True` 走的是 **overlay 软删**（D15），**不写 `data/vigil.db`**。
+    ⚠️ `subset`（`"a2"` / `"a0"` / None）只执行指定死法的那一批，其余进 `plan.deferred`。
     """
     cats = load_categories()
     known_kinds = frozenset(c.slug for c in cats)
@@ -477,6 +593,8 @@ def repass(
 
         verdicts: dict[int, int] = {}
         judged: dict[int, store.ExtractedItem] = {}
+        a0_msgs: set[int] = set()   # 整批返回空的那批里的源消息
+        a2_msgs: set[int] = set()   # 有产出批里被判 0 的源消息
         for index, batch in enumerate(batches, start=1):
             if budget_tokens is not None and stats.total_tokens >= budget_tokens:
                 stats.budget_hit = True
@@ -529,9 +647,11 @@ def repass(
             stats.dropped_by_gate += outcome.dropped_by_gate
             if outcome.empty_payload:
                 stats.empty_payloads += 1      # a0：整批没产出
+                a0_msgs.update(outcome.counts)
             else:
                 # a2：模型明明产出了东西，但没为**这条**产出
                 stats.msgs_no_output += sum(1 for v in outcome.counts.values() if v == 0)
+                a2_msgs.update(m for m, v in outcome.counts.items() if v == 0)
 
             for mid, n in outcome.counts.items():
                 verdicts[mid] = n
@@ -560,14 +680,21 @@ def repass(
         # （不另立计数器）：失败、预算提前停止、不在任何上下文批次里、
         # 将来的任何新 `continue` 都会自动落进这个集合，不需要有人记得去登记。
         unjudged_ids = [m.msg_id for m in src_msgs if m.msg_id not in verdicts]
-        plan = build_plan(
-            conn, verdicts=verdicts, judged=judged, unjudged_msg_ids=unjudged_ids
+        items_by_msg = store.existing_items_for_messages(
+            conn, [*verdicts, *unjudged_ids]
         )
+        plan = build_plan(
+            conn, verdicts=verdicts, judged=judged,
+            item_ids_by_msg=items_by_msg, unjudged_msg_ids=unjudged_ids,
+        )
+        _classify_deaths(plan, items_by_msg, a0_msgs=a0_msgs, a2_msgs=a2_msgs)
+        _restrict_subset(plan, subset)
         _fill_plan_counts(stats, plan)
         if apply:
             applied = apply_plan(conn, plan)
-            stats.deleted = applied.deleted            # DB 的实际行数说了算
-            stats.downgraded = applied.downgraded
+            stats.deleted = applied.deleted            # overlay 里真的软删了几条
+            stats.tombstones = applied.tombstones
+            stats.downgrades_deferred = applied.downgrades_deferred
         return plan, stats
     finally:
         if audit_file is not None:

@@ -187,19 +187,59 @@ def test_plan_skips_items_referenced_by_digests(con):
     assert plan.skipped_referenced == [iid]
 
 
-def test_apply_plan_actually_deletes(con):
+def test_apply_soft_deletes_and_leaves_the_row_in_place(con):
+    """⭐ D15：删除 = **软删**——库里行仍在，只是视图层看不见（Fix loop 第 2 轮）。
+
+    ⚠️ 变异判据：把 `apply_plan` 改回 `store.delete_items`（**物理删**）⇒ 本条红
+    （`items` / `item_sources` 的行会消失）。这正是本轮的形状。
+    """
     _msg(con, 1, "校园卡办理，需要的联系我")
     iid = _item(con, 1, title="校园卡办理")
     plan = repass.build_plan(con, verdicts={1: 0})
-    repass.apply_plan(con, plan)
+
+    stats = repass.apply_plan(con, plan)
+
+    assert (stats.deleted, stats.tombstones) == (1, 1)
+    assert con.execute(
+        "SELECT COUNT(*) FROM items WHERE item_id=?", (iid,)
+    ).fetchone()[0] == 1, "行必须在——D15 说「库里行仍在」"
+    assert con.execute(
+        "SELECT COUNT(*) FROM item_sources WHERE item_id=?", (iid,)
+    ).fetchone()[0] == 1, "来源行也在（它不是物理删，没有悬空一说）"
+
+    # 视图层：读路径必须看不到它（否则软删等于没删）
+    got, total = store.search_items(con, q="校园卡", limit=50, offset=0)
+    assert (got, total) == ([], 0)
+    assert store.get_item(con, iid) is None
+
+    # 墓碑集：`refine` 重抽时跳过的唯一依据（D15）
+    ov = overrides.connect()
+    try:
+        assert overrides.deleted_msg_ids(ov) == frozenset({1})
+    finally:
+        ov.close()
+
+
+def test_store_delete_items_is_still_the_physical_path(con):
+    """`store.delete_items` 仍是**物理删**的唯一实现（repass 已不再用它）。
+
+    ⚠️ 留一条用例钉住它：软删上线之后它就成了「没有调用方」的代码，
+    而没有调用方的代码**最容易在下一次重构里被改坏而无人发现**。
+    """
+    _msg(con, 1, "校园卡办理，需要的联系我")
+    iid = _item(con, 1, title="校园卡办理")
+    with store.transaction(con):
+        n = store.delete_items(con, [iid])
+    assert n == 1
     assert con.execute("SELECT COUNT(*) FROM items WHERE item_id=?", (iid,)).fetchone()[0] == 0
     assert con.execute(
         "SELECT COUNT(*) FROM item_sources WHERE item_id=?", (iid,)
     ).fetchone()[0] == 0, "⚠️ 来源行必须一起删——否则留下悬空的 item_sources"
 
 
-def test_apply_plan_downgrades_place(con):
-    """存量条目上未经新闸门的 place 要降级（否则出口判据 3 达不到）。
+def test_downgrades_are_computed_but_not_written(con):
+    """降级值仍要**算出来**（它进清单），但本轮**不执行**——overlay 没有 `set_field`，
+    写主库会打破「`vigil.db` 一字未改」。
 
     ⚠️ `judged` **必须传**：降级值是从「新判据下那条消息产出的条目」算出来的，
     不传就等于没有任何降级可言（brief 的那一版漏了它，断言必红）。
@@ -214,9 +254,14 @@ def test_apply_plan_downgrades_place(con):
         )
     }
     plan = repass.build_plan(con, verdicts={1: 1}, judged=judged)
-    assert plan.downgrades == [(iid, None, None)]
-    repass.apply_plan(con, plan)
-    assert con.execute("SELECT place FROM items WHERE item_id=?", (iid,)).fetchone()[0] is None
+    assert plan.downgrades == [(iid, None, None)], "清单上必须写着这条要降级"
+
+    stats = repass.apply_plan(con, plan)
+
+    assert (stats.downgraded, stats.downgrades_deferred) == (0, 1)
+    assert con.execute(
+        "SELECT place FROM items WHERE item_id=?", (iid,)
+    ).fetchone()[0] == "立德楼1阶", "本轮不许写主库——降级留给后续决定"
 
 
 def test_upsert_fts_after_delete(con):
@@ -268,6 +313,10 @@ def test_repass_dedupes_produced_items_before_counting(con, monkeypatch):
     assert plan.verdicts == {1: 1}, "重抽两次不算产出两条——那是同一份数据"
     assert plan.to_delete == [second]
     assert plan.to_keep == [first]
+    assert plan.deaths == {second: "quota"}, (
+        "重复项的死法是 quota（旧条目超额），**不是 a2**——"
+        "它跟「模型没为这条产出」是两回事，混起来会让 --subset a2 顺手删掉重复项"
+    )
 
 
 def test_two_distinct_items_from_one_message_still_count_two(con, monkeypatch):
@@ -539,10 +588,11 @@ def test_repass_downgrades_deadline_before_event_ts(con, monkeypatch):
     plan, _ = repass.repass(_cfg(), api_key="k", conn=con)
 
     assert plan.downgrades == [(iid, None, None)]
-    repass.apply_plan(con, plan)
+    stats = repass.apply_plan(con, plan)
+    assert stats.downgrades_deferred == 1
     assert con.execute(
         "SELECT deadline_ts FROM items WHERE item_id=?", (iid,)
-    ).fetchone()[0] is None
+    ).fetchone()[0] == 1_746_000_000, "本轮不写主库：降级只在清单上"
 
 
 def test_repass_does_not_rebuild_items(con, monkeypatch):
@@ -572,22 +622,29 @@ def test_repass_does_not_rebuild_items(con, monkeypatch):
 
 
 def test_repass_is_idempotent(con, monkeypatch):
-    """出口判据 5：重判跑两次，第二次清单应为空（且不烧第二次的 token）。"""
+    """出口判据 5：重判跑两次，第二次**清单为空**。
+
+    ⚠️ 软删之后这条的含义变了：`item_sources` 的行**还在**（D15），所以第二轮
+    照样会重判这些消息——但它们的条目已经是「软删过」的，按 E6 的优先级进
+    `skipped_soft_deleted`、**不再进 `to_delete`**。也就是说幂等性由**软删状态**保证，
+    不再由「源消息被删光」保证。
+    """
     content = "校园卡办理，需要的联系我"
     _msg(con, 1, content)
-    _item(con, 1, title="校园卡办理")
+    iid = _item(con, 1, title="校园卡办理")
     _stub_llm(monkeypatch, {"items": []})
 
     first, _ = repass.repass(_cfg(), api_key="k", conn=con, apply=True)
-    assert first.to_delete
+    assert first.to_delete == [iid]
 
     second, stats = repass.repass(_cfg(), api_key="k", conn=con, apply=True)
-    assert second.to_delete == []
-    assert stats.scanned_msgs == 0, "产出过条目的源消息已被清空 ⇒ 第二轮没有可重判的东西"
+    assert second.to_delete == [], "第二轮不该再删一次"
+    assert second.skipped_soft_deleted == [iid], "它已经是软删态 ⇒ 进保护桶"
+    assert stats.scanned_msgs == 1, "源消息还在（软删不删行）——第二轮照样重判"
 
 
-def test_repass_applies_whole_plan_atomically(con, monkeypatch):
-    """一次 `--apply` 把删除与降级都做掉，且 stats 如实报数。"""
+def test_repass_apply_soft_deletes_the_whole_plan(con, monkeypatch):
+    """一次 `--apply` 把清单上的删除都做掉（软删），且 stats 如实报数。"""
     content = "大概这周会有面试 到时候具体时间通知大家"
     _msg(con, 1, content)
     doomed = _item(con, 1, title="面试通知", place="立德楼1阶")
@@ -605,14 +662,19 @@ def test_repass_applies_whole_plan_atomically(con, monkeypatch):
 
     assert plan.to_delete == [junk]
     assert plan.downgrades == [(doomed, None, None)]
-    assert stats.deleted == 1
-    assert stats.downgraded == 1
+    assert stats.deleted == 1, "软删 1 条"
+    assert stats.tombstones == 1
+    assert stats.downgraded == 0 and stats.downgrades_deferred == 1
     assert stats.kept == 1
     assert stats.input_tokens == 3 and stats.output_tokens == 4
     assert con.execute(
         "SELECT place FROM items WHERE item_id=?", (doomed,)
-    ).fetchone()[0] is None
-    assert con.execute("SELECT COUNT(*) FROM items").fetchone()[0] == 1
+    ).fetchone()[0] == "立德楼1阶", "降级本轮不执行"
+    assert con.execute("SELECT COUNT(*) FROM items").fetchone()[0] == 2, (
+        "软删不删行——两条都还在（看不见的那条只是不再出现在视图里）"
+    )
+    assert store.get_item(con, junk) is None
+    assert store.get_item(con, doomed) is not None
 
 
 def test_build_plan_does_not_write(con):
@@ -635,46 +697,224 @@ def test_build_plan_does_not_write(con):
     )
 
 
-def test_apply_plan_rolls_back_everything_when_one_step_fails(con, monkeypatch):
-    """删除与降级必须在**同一个事务**里：中途炸掉不许留下「删了一半」的库。
+def test_partial_soft_delete_is_recoverable(con, monkeypatch):
+    """中途炸掉会留下**部分软删**——但它**可撤销**，与物理删的「删一半」不同量级。
 
-    ⚠️ 这是本任务唯一**不可逆**的那一步的守卫。半途崩掉之后清单已经打印出去了、
-    读它的人心里的结论是「这几条要删、那条降级」，而库里的状态与它对不上——
-    且**没有任何东西会报错**。
+    ⚠️ 这是本轮的**已知取舍**（写在 `apply_plan` 的 docstring 里）：
+    `overrides.delete_item` 逐事件 commit（它自己的设计），所以没有"整批一个事务"。
+    换来的性质是：**每一条软删都能单独 undo**，而且主库一字未改。
 
-    变异：把 `with store.transaction(conn):` 拆成两步各自 commit ⇒ 本条红
-    （`doomed` 已经被删，而异常来自后面那一步）。
+    变异：把 `apply_plan` 改回物理删 ⇒ 本条红（行没了 ⇒ 撤销只能撤出个空）。
     """
-    content = "大概这周会有面试 到时候具体时间通知大家"
-    _msg(con, 1, content)
-    keep = _item(con, 1, title="面试通知", place="立德楼1阶")
-    _msg(con, 2, "校园卡办理，需要的联系我", ts=1_700_000_100)
-    doomed = _item(con, 2, title="校园卡办理", event_ts=1_700_000_100)
-    judged = {
-        1: store.ExtractedItem(
-            kind="notice", title="面试通知", detail=None, event_ts=1_700_000_000,
-            deadline_ts=None, group_id=100, actor_uid="u_1", place=None,
-            links=(), amount=None, confidence=0.9, src_msg_ids=(1,),
-        )
-    }
-    plan = repass.build_plan(con, verdicts={1: 1, 2: 0}, judged=judged)
-    assert (plan.to_delete, plan.downgrades) == ([doomed], [(keep, None, None)]), (
-        "造场景失败：这一步本来该同时有删除与降级"
-    )
+    for i, content in ((1, "校园卡办理，需要的联系我"), (2, "办卡的来")):
+        _msg(con, i, content, ts=1_700_000_000 + i)
+        _item(con, i, title=f"广告{i}", event_ts=1_700_000_000 + i)
+    plan = repass.build_plan(con, verdicts={1: 0, 2: 0})
+    assert len(plan.to_delete) == 2
 
-    def boom(*a, **kw):
-        raise RuntimeError("降级那一步炸了")
+    from vigil import overrides as ov_mod
 
-    monkeypatch.setattr(store, "downgrade_item_fields", boom)
+    real_delete = ov_mod.delete_item
+    calls = {"n": 0}
+
+    def flaky(conn, **kw):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise RuntimeError("第二条写到一半炸了")
+        return real_delete(conn, **kw)
+
+    monkeypatch.setattr(ov_mod, "delete_item", flaky)
     with pytest.raises(RuntimeError):
         repass.apply_plan(con, plan)
 
+    # 第一条已经软删（部分状态），但——行还在、可以撤回来
+    first = plan.to_delete[0]
     assert con.execute(
-        "SELECT COUNT(*) FROM items WHERE item_id=?", (doomed,)
-    ).fetchone()[0] == 1, "同一个事务里的删除必须跟着回滚——不许留半个状态"
-    assert con.execute(
-        "SELECT place FROM items WHERE item_id=?", (keep,)
-    ).fetchone()[0] == "立德楼1阶"
+        "SELECT COUNT(*) FROM items WHERE item_id=?", (first,)
+    ).fetchone()[0] == 1, "部分软删也**不许**变成物理删"
+    ov = overrides.connect()
+    try:
+        assert overrides.deleted_msg_ids(ov) == frozenset({1})
+        last = overrides.last_edit(ov)
+        assert last is not None and last[1] == first
+        assert overrides.undo(ov, edit_id=last[0]) is True
+        assert overrides.deleted_msg_ids(ov) == frozenset()
+    finally:
+        ov.close()
+    assert store.get_item(con, first) is not None, "撤销之后条目回到视图里"
+
+
+def test_tombstones_cover_every_source_message(con):
+    """⭐ E7：一个 item 有 ≥2 条源消息时，**每一条**都要落墓碑。
+
+    否则 `refine --redo` 重抽兄弟消息会让条目**以新 item_id 复活**（违反 D15）。
+    变异：`extra_msg_ids=srcs[1:]` → `extra_msg_ids=()` ⇒ 本条红。
+    """
+    _msg(con, 1, "校园卡办理，需要的联系我")
+    _msg(con, 2, "办卡找我", ts=1_700_000_100)
+    iid = _item(con, 1, title="校园卡办理")
+    con.execute("INSERT INTO item_sources (item_id, msg_id) VALUES (?,?)", (iid, 2))
+    con.commit()
+    assert [r.msg_id for r in store.source_messages(con, iid)] == [1, 2], "造场景失败"
+
+    repass.apply_plan(con, repass.build_plan(con, verdicts={1: 0}))
+
+    ov = overrides.connect()
+    try:
+        assert overrides.deleted_msg_ids(ov) == frozenset({1, 2}), (
+            "只墓碑化了第一条源消息——refine --redo 重抽兄弟消息会让条目复活"
+        )
+        # 反向：undo 之后条目回来、**墓碑全消失**（不是"撤了一条、还剩一条"）
+        last = overrides.last_edit(ov)
+        assert overrides.undo(ov, edit_id=last[0]) is True
+        assert overrides.deleted_msg_ids(ov) == frozenset()
+    finally:
+        ov.close()
+    assert store.get_item(con, iid) is not None
+
+
+def test_refine_redo_does_not_revive_soft_deleted_items(con, monkeypatch):
+    """⭐ D15 的**机械判据**：软删之后 `refine --redo` 重抽同一条消息，条目不复活。
+
+    这是「墓碑」存在的唯一理由（`refine._tombstoned_msg_ids` 读的就是它）。
+    变异：`apply_plan` 少落墓碑（`msg_id=None` + 无 extra）⇒ 本条红（条目会以新 id 复活）。
+    """
+    content = "校园卡办理，需要的联系我"
+    _msg(con, 1, content)
+    iid = _item(con, 1, title="校园卡办理")
+    repass.apply_plan(con, repass.build_plan(con, verdicts={1: 0}))
+    assert store.get_item(con, iid) is None
+
+    from vigil import refine as refine_mod
+    from vigil.llm import LLMResult
+
+    def fake(cfg, *, system, user, **kw):
+        return LLMResult(
+            payload={"items": [{"quote": content, "kind": "notice",
+                                "title": "校园卡办理", "confidence": 0.9}]},
+            input_tokens=1, output_tokens=1,
+        )
+
+    monkeypatch.setattr(refine_mod, "chat_json", fake)
+    stats = refine_mod.refine(
+        _cfg(), api_key="k", conn=con, batch_size=1, redo=True,
+        on_progress=lambda *_: None,
+    )
+
+    assert stats.skipped_deleted == 1, "墓碑没起作用——它会被重抽"
+    assert stats.items_saved == 0
+    assert con.execute("SELECT COUNT(*) FROM items").fetchone()[0] == 1, (
+        "复活的判定就是「items 多了一行」——那正是 D15 要拦的"
+    )
+
+
+def test_apply_does_not_touch_vigil_db_bytes(tmp_path):
+    """⭐ 机械断言：apply 跑完，`vigil.db`（主文件 + `-wal` + `-shm`）**逐字节相同**。
+
+    ⚠️ 全部写操作都发生在 overlay，主库只有 SELECT ⇒ D11 的保证在 repass 上也成立。
+    变异：`apply_plan` 改回 `store.delete_items`（会写主库）⇒ 本条红。
+
+    ⚠️ 取指纹时**保持一条读连接开着**（T8 的实测教训）：生产里 reader 与写者并发，
+    写者 close 时不是最后一个连接 ⇒ 不 checkpoint ⇒ 证据只留在 `-wal` 里。
+    先「预热」一次读再取 before，是为了不让「侧车刚被建出来」被读成「写过了」。
+
+    ⚠️⚠️ 这条连接**刻意是「可写」的**（与 `repass()` 里那条一样）：
+    用 `mode=ro` 的话，物理删会直接抛 `attempt to write a readonly database`
+    ——测试确实会红，但**指纹断言本身一辈子没被考验过**（假红掩盖零守护）。
+    可写连接下，物理删会**成功**⇒ 唯一能拦住它的就是这条指纹断言。
+    """
+    import hashlib
+
+    db = tmp_path / "vigil.db"
+    conn = sqlite3.connect(str(db), uri=True)
+    store.ensure_schema(conn)
+    conn.executescript(_MESSAGE_TABLES_DDL)
+    _msg(conn, 1, "校园卡办理，需要的联系我")
+    _item(conn, 1, title="校园卡办理")
+    conn.commit()
+    conn.close()
+
+    def fingerprint() -> dict:
+        out = {}
+        for suffix in ("", "-wal", "-shm"):
+            p = db if not suffix else db.with_name(db.name + suffix)
+            out[suffix or "main"] = (
+                hashlib.sha256(p.read_bytes()).hexdigest() if p.is_file() else "<missing>"
+            )
+        return out
+
+    rw = sqlite3.connect(str(db), uri=True)       # 与生产同形：可写连接
+    try:
+        rw.execute("SELECT COUNT(*) FROM items").fetchone()   # 预热
+        before = fingerprint()
+        plan = repass.build_plan(rw, verdicts={1: 0})
+        stats = repass.apply_plan(rw, plan)
+        after = fingerprint()
+    finally:
+        rw.close()
+
+    assert stats.deleted == 1
+    changed = [k for k in before if before[k] != after[k]]
+    assert not changed, (
+        f"apply 动了 data/vigil.db：{ {k: (before[k], after[k]) for k in changed} }"
+    )
+    # 效果对照：软删**确实生效了**（否则"指纹没变"可能只是"什么都没做"）
+    check = sqlite3.connect(f"file:{db.as_posix()}?mode=ro", uri=True)
+    try:
+        assert check.execute("SELECT COUNT(*) FROM items").fetchone()[0] == 1, "行还在"
+        assert store.get_item(check, 1) is None, "但视图层已经看不到它了"
+    finally:
+        check.close()
+    ov = overrides.connect()
+    try:
+        assert overrides.deleted_msg_ids(ov) == frozenset({1})
+    finally:
+        ov.close()
+
+
+def test_subset_a2_only_touches_the_contrastive_class(con, monkeypatch):
+    """⭐ 用户裁定「本轮只上 a2 的 46 条」的机械判据。
+
+    造形：批一（群 100）整批返回空 ⇒ a0；批二（群 200）为 B 产出了、唯独没为 C 产出 ⇒ a2。
+    `subset="a2"` 之后：只有 C 的条目被软删，A 的条目进 `plan.deferred`（**本轮不动**）。
+
+    变异：`_restrict_subset` 直接 `return`（不做过滤）⇒ 本条红（A 也被删）。
+    """
+    _msg(con, 1, "通知：明天的讲座", group_id=100)
+    a0_item = _item(con, 1, title="讲座通知", group_id=100)
+    _msg(con, 2, "通知：报到时间", group_id=200, ts=1_700_000_100)
+    b_item = _item(con, 2, title="报到时间", group_id=200, event_ts=1_700_000_100)
+    _msg(con, 3, "那我要不要空着肚子去", group_id=200, ts=1_700_000_200)
+    c_item = _item(con, 3, title="疑问", group_id=200, event_ts=1_700_000_200)
+
+    def fake(cfg, *, system, user, **kw):
+        from vigil.llm import LLMResult
+        if "讲座" in user:
+            return LLMResult(payload={"items": []}, input_tokens=1, output_tokens=1)
+        return LLMResult(
+            payload={"items": [_raw("通知：报到时间", title="报到时间")]},
+            input_tokens=1, output_tokens=1,
+        )
+
+    monkeypatch.setattr(repass, "chat_json", fake)
+    plan, stats = repass.repass(_cfg(), api_key="k", conn=con, subset="a2", apply=True)
+
+    assert plan.deaths == {c_item: "a2", a0_item: "a0"}
+    assert plan.to_delete == [c_item]
+    assert plan.deferred == [a0_item], "a0 的条目必须留在清单里但不执行"
+    assert stats.deleted == 1
+    assert store.get_item(con, c_item) is None, "a2 的软删掉了"
+    assert store.get_item(con, a0_item) is not None, "a0 本轮不动"
+    assert store.get_item(con, b_item) is not None, "B 有产出 ⇒ 保留"
+
+
+def test_subset_rejects_unknown_names(con):
+    """`--subset` 只认 a2 / a0——写错就响亮报错，不许静默当成"不过滤"。"""
+    _msg(con, 1, "通知：明天体检")
+    _item(con, 1, title="体检通知")
+    with pytest.raises(ValueError, match="subset"):
+        repass.repass(_cfg(), api_key="k", conn=con, subset="a3",
+                      on_progress=lambda *_: None)
 
 
 def test_collect_source_messages_scope_is_only_messages_with_items(con):
