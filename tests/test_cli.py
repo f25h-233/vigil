@@ -957,6 +957,43 @@ def test_repass_apply_returns_2_and_never_runs_when_the_lock_is_held(
     assert calls and calls[0]["apply"] is True
 
 
+def test_repass_plan_prints_deferred_and_downgrades_as_not_executed(
+    cli_env, monkeypatch, capsys
+):
+    """⭐ `--subset` 挡下的条目与「本轮不执行的降级」都必须**显式打出来**。
+
+    混着不报的话，「只删了 46 条」会被读成「只有 46 条该删」，
+    而「降级 4 条」会被读成「降级做了」——两者都是假话。
+
+    变异：删掉 `if plan.deferred:` 那一段 ⇒ 本条红。
+    """
+    plan, stats = _repass_result()
+    plan.deaths = {1: "a2", 2: "a0"}
+    plan.deferred = [2]
+    plan.downgrades = [(3, None, None)]
+    stats.downgrades_deferred = 1
+    stats.tombstones = 1
+    seen: dict = {}
+
+    def fake(config, **kw):
+        seen.update(kw)
+        return plan, stats
+
+    monkeypatch.setattr("vigil.repass.repass", fake)
+
+    assert cli.main(["repass", "--subset", "a2"]) == 0
+
+    out = capsys.readouterr().out
+    assert "死法拆分" in out and "a2 1 条" in out and "a0 1 条" in out
+    assert "本轮不动" in out and "item 2" in out
+    assert "本轮不执行" in out and "字段降级" in out
+    # ⚠️ **接线**也要钉：`--subset` 必须真的传进 `repass()`。
+    # 只断言打印的话，`subset=args.subset` → `subset=None` 这种变异**全绿**
+    # ——而那意味着 a0 的 53 条会一起被删（安全相关的静默失效）。
+    assert seen["subset"] == "a2", "--subset 没接进 repass()：过滤开关是死的"
+    assert seen["audit_path"], "默认也要落审计文件"
+
+
 def test_repass_returns_nonzero_when_a_batch_failed(cli_env, monkeypatch):
     """⭐ 有批次失败 ⇒ 非零：那一批这一轮**没有取得判定**（勘误 E5），
     清单因此是**不完整**的——这件事需要人来看，不许报成功。

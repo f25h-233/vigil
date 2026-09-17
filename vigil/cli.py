@@ -378,6 +378,7 @@ def cmd_repass(args) -> int:
         batch_size=args.batch,
         context=args.context,
         budget_tokens=args.budget,
+        subset=args.subset,
         model=args.model or refine_mod.DEFAULT_MODEL,
         enable_thinking=args.think,
         audit_path=audit,
@@ -433,7 +434,31 @@ def _print_repass_plan(plan, stats) -> None:
     print(f"  将删除 {len(plan.to_delete)} 条：")
     for iid in plan.to_delete:
         print(f"    - item {iid}")
-    print(f"  保留 {len(plan.to_keep)} 条；字段降级 {len(plan.downgrades)} 条")
+    print(f"  保留 {len(plan.to_keep)} 条")
+    if plan.deaths:
+        from collections import Counter as _C
+
+        dist = _C(plan.deaths.values())
+        print(
+            f"  将删的死法拆分：a2 {dist.get('a2', 0)} 条（有批内对照）/ "
+            f"a0 {dist.get('a0', 0)} 条（整批返回空）/ quota {dist.get('quota', 0)} 条"
+        )
+    if plan.deferred:
+        print(
+            f"  ⚠️ **本轮不动** {len(plan.deferred)} 条（被 --subset 挡下，"
+            f"它们仍在清单里）："
+        )
+        for iid in plan.deferred:
+            print(f"    - item {iid}")
+    if plan.downgrades:
+        # ⚠️ 降级本轮**不执行**：overlay 不支持 set_field，而改主库会打破
+        # 「vigil.db 一字未改」。必须显式报出来，否则读清单的人以为它做了。
+        print(
+            f"  ⚠️ 字段降级 {len(plan.downgrades)} 条**本轮不执行**"
+            f"（overlay 暂无 set_field；改主库会破坏「vigil.db 一字未改」）"
+        )
+    if stats.tombstones:
+        print(f"  已落墓碑 {stats.tombstones} 行（= 被软删条目的每条源消息）")
     if plan.skipped_referenced:
         print(
             f"  ⚠️ 跳过 {len(plan.skipped_referenced)} 条"
@@ -798,6 +823,11 @@ def main(argv: list[str] | None = None) -> int:
         "**改小它就等于换条件重判**",
     )
     p_repass.add_argument("--budget", type=int, help="token 预算上限")
+    p_repass.add_argument(
+        "--subset", choices=("a2", "a0"), default=None,
+        help="只执行某一类死法（a2 = 同批有产出、唯独没为这条产出，有批内对照；"
+        "a0 = 整批返回空）。其余照常进清单但不执行",
+    )
     p_repass.add_argument(
         "--audit", default=None,
         help="每批的模型原话与判定落成的 JSONL 路径"
