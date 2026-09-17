@@ -17,6 +17,8 @@ export type Item = {
   group_id: number
   group_name: string
   actor: string | null
+  /** QQ 号（uin）。实名消息才有；匿名消息为 null，且不该被人物筛选中。 */
+  actor_uin: number | null
   place: string | null
   amount: string | null
   links: string[]
@@ -59,4 +61,17 @@ export type DigestSummary = {
 export type DigestDetail = DigestSummary & {
   body_md: string
   items: Item[]
+}
+
+/**
+ * 一个被监视的人物。
+ *
+ * ⚠️ `count` 是"这个 uin 发过的条目数"，由后端算好——前端不要在拿到
+ * 全部条目后自己数：那需要把整个库拉下来，而且计数会随筛选条件漂移。
+ */
+export type Person = {
+  uin: number
+  label: string
+  note: string
+  count: number
 }
