@@ -6,10 +6,19 @@
 存在的理由：这几条以前是靠一次性 SQL 手敲的，敲完就没留下痕迹，
 下一轮要重验时得重新拼。固化成脚本，每次跑完 refine 一条命令复核。
 
-⚠️ M6 T5 起「类目越界」那一项走 `store.kind_counts`（**有效类目**口径），
-而读取路径会在 overlay 库**不存在**时就地建一个**空的**（`attach_readonly` 的既有
-语义）——所以严格说本脚本可能建出 `data/overrides.db`（空库，零行）。
-主库仍然是全程 `mode=ro`，不写一个字节。
+⚠️ M6 T5 起「类目越界」那一项走**有效类目**口径（overlay + 别名），
+所以它会挂 overlay 库。两条边界如实写在这里（Fix loop 2 / FIX 4）：
+
+  · **overlay 库不存在时本脚本不建它**（只读仪器不该有副作用）：
+    那时确定没有任何干预/别名，"有效类目"与"库里的原值"**可证等价**，
+    于是退化成一句 `NOT IN` 的原值判据。
+  · overlay **挂不上 / 读不了**时，这一项报 **✗「判不了」+ 原因**，
+    **不是**裸 traceback——判不了的判据不许被算成通过。
+  · ⚠️ 还有一条**知情接受**的副作用：读取路径会做一次
+    `overrides.reconcile_if_stale()`（把 `kind_alias` 对齐到当前的 slug 集），
+    所以若 `config/categories.toml` 被手改过，本脚本会**顺带对平** overlay
+    ——与任何一次 `/api/items` 请求做的事一模一样。
+    主库 `data/vigil.db` 仍然是全程 `mode=ro`，一个字节都不写。
 
 跑法（仓库根）：
     PYTHONIOENCODING=utf-8 .venv/Scripts/python.exe vigil_exit_check.py
@@ -26,8 +35,25 @@ from vigil import store
 from vigil.categories import load_categories
 
 
-def _bad_kind_count(conn: sqlite3.Connection, live: set[str]) -> int:
-    """**有效类目**越界的条数（Fix loop 1 / FIX 4）。
+def _raw_bad_kind(conn: sqlite3.Connection, live: set[str]) -> int:
+    """库里的**原值**越界的条数。
+
+    ⚠️ **只在一种情形下用它**：overlay 库整个不存在（那时"有效类目"与"原值"
+    **可证等价**，见 `_bad_kind_count`）。单独拿它当判据就是 Fix loop 1 修掉的
+    那个双向不可信的判据——合法改名会**误报**、悬空的 `ost.kind` 会**漏报**。
+    """
+    marks = ",".join("?" * len(live))
+    return int(
+        conn.execute(
+            f"SELECT COUNT(*) FROM items WHERE kind NOT IN ({marks})", sorted(live)
+        ).fetchone()[0]
+    )
+
+
+def _bad_kind_count(
+    conn: sqlite3.Connection, live: set[str]
+) -> tuple[int | None, str]:
+    """`(越界条数, 说明)`。**判不了时返回 `(None, 原因)`，绝不抛异常**。
 
     ⚠️ 它**必须**与四条读路径同源（`store.kind_counts` 用的就是
     `store._EFFECTIVE_KIND`，含 overlay 与两级别名），**不能**自己写一句
@@ -43,8 +69,26 @@ def _bad_kind_count(conn: sqlite3.Connection, live: set[str]) -> int:
 
     ⚠️ 口径与读路径一致 ⇒ **不含软删**（D15：软删的条目在所有读取路径上都不存在，
     它的类目再越界也不构成任何可观测的问题）。
+
+    ⚠️ **Fix loop 2 / FIX 4 的两条收紧**：
+      ① **overlay 库不存在时不建它**：`store.kind_counts` 经 `attach_readonly`
+         会**就地建一个空的** overlay 库——只读仪器不该有副作用。而"库不存在"
+         ⇒ 确定没有任何干预/别名（`_EFFECTIVE_KIND` 的三处来源都没有行）
+         ⇒ 改用 `_raw_bad_kind`，两者**可证等价**（且此时没有任何软删）。
+      ② **挂不上/读不了 ⇒ 返回 `(None, 原因)`**，让调用方把它印成一条 ✗ 的判据
+         ——从前是**裸 traceback 退出**，那等于"仪器坏了却什么都没判"。
     """
-    return sum(n for k, n in store.kind_counts(conn).items() if k not in live)
+    from vigil import overrides
+
+    if not overrides.OVERRIDES_DB.is_file():
+        return _raw_bad_kind(conn, live), "无 overlay 库（还没有过任何人工干预/改名的记录）"
+    try:
+        counts = store.kind_counts(conn)
+    except overrides.OverlayError as exc:
+        return None, f"overlay 挂不上：{exc}"
+    except sqlite3.Error as exc:
+        return None, f"overlay 读不了：{exc}"
+    return sum(n for k, n in counts.items() if k not in live), ""
 
 
 def main() -> int:
@@ -81,7 +125,7 @@ def main() -> int:
     ok = one("SELECT COUNT(*) FROM refine_runs WHERE status = 'ok'")
     err = one("SELECT COUNT(*) FROM refine_runs WHERE status = 'error'")
     items = one("SELECT COUNT(*) FROM items")
-    bad_kind = _bad_kind_count(conn, live)
+    bad_kind, bad_note = _bad_kind_count(conn, live)
     orphan = one(
         "SELECT COUNT(*) FROM items i "
         "WHERE NOT EXISTS (SELECT 1 FROM item_sources s WHERE s.item_id = i.item_id)"
@@ -112,7 +156,13 @@ def main() -> int:
         ("1. 「无遗漏」每条消息都有 refine_runs 记录", f"{covered:,} / {total:,}", missing == 0),
         ("2. 无来源的 items", str(orphan), orphan == 0),
         ("3. 指向不存在消息的来源", str(dangling), dangling == 0),
-        ("4. 类目越界（**有效**类目不在 categories.toml）", str(bad_kind), bad_kind == 0),
+        # ⚠️ `bad_kind` 为 `None` = **判不了**（overlay 挂了）⇒ 照样是 ✗：
+        # 一条判不了的判据**不能**被算成通过，那正是"仪器坏了却静默"的形状。
+        (
+            "4. 类目越界（**有效**类目不在 categories.toml）",
+            "判不了" if bad_kind is None else str(bad_kind),
+            bad_kind == 0,
+        ),
         ("5. item_sources 重复行", str(dup), dup == 0),
         ("6. refine_runs 里的孤儿行（消息已不在）", str(orphan_runs), orphan_runs == 0),
         ("7. 失败批次（记录在案，非致命）", str(err), None),
@@ -120,6 +170,9 @@ def main() -> int:
     for label, value, verdict in checks:
         mark = "✓" if verdict is True else ("—" if verdict is None else "✗")
         print(f"  {mark} {label:<44} {value:>18}")
+
+    if bad_note:
+        print(f"    ⚠️ 第 4 项说明：{bad_note}")
 
     print(f"\n  items 总数：{items:,}（其中 status=ok 的消息 {ok:,} 条）")
     print("\n  refine_runs 分版：")

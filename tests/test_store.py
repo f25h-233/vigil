@@ -1644,3 +1644,77 @@ def test_kind_alias_applies_to_every_reading_path(con_with_two_items):
     # ④ window_items（日报）
     win = store.window_items(con_with_two_items, since=0, until=2**31)
     assert {w.kind for w in win} == {"daily"}
+
+
+# ── M6 T5 Fix loop 2：手改配置的对账（FIX 2）────────────────────────
+
+
+def _cats_toml(*slugs: str) -> str:
+    """一份最小类目表（对账只取 slug 集）。"""
+    return "".join(
+        f'[[categories]]\nslug = "{s}"\nlabel = "{s}"\ndesc = "d"\n\n' for s in slugs
+    )
+
+
+def test_a_hand_edited_config_reconciles_the_alias_table(monkeypatch):
+    """⭐ FIX 2：**手改 `categories.toml`** 也要把别名表对平（本里程碑明确邀请手改）。
+
+    场景（reviewer 实测的那一条）：
+      ① 人工把某条条目的类目改成 `life`（`ost.kind`）；
+      ② **改名** `life→life_v2` ⇒ 别名 `life→life_v2`，配置里只剩 `life_v2`；
+      ③ **手改**把 `life` 加回配置——它不经过任何写端点 ⇒ 剪枝跑不到。
+    ⇒ 不清账的话 `ka2` 会把合法的 `life` 顶成 `life_v2`：条目显示 `life_v2`、
+    `life` 角标 0，而**出口检查也看不见**（它读的是有效类目）。
+
+    ⚠️ 判据必须是**条目那一侧**的 `kind`（不是"别名表有几行"）：后者只说明
+    "表里没有那一行"，而用户看到的是条目的类目。
+
+    ⚠️ 变异反证：把 `store._ensure_overlay` 里那句 `reconcile_if_stale()`
+    删掉 ⇒ 本条**必红**（条目仍是 `life_v2`）。
+    """
+    from vigil import categories as categories_mod
+    from vigil import overrides
+
+    # ① 改名的结果：现存 slug 里**没有** life（那条别名才因此是合法的）
+    path = categories_mod.DEFAULT_CATEGORIES
+    path.write_text(_cats_toml("notice", "life_v2"), encoding="utf-8")
+
+    conn = sqlite3.connect(":memory:", uri=True)
+    try:
+        store.ensure_schema(conn)
+        iid = _seed(conn, title="甲", kind="notice")
+        # ⚠️ **必须显式 commit**（实测，见下）：`_seed` 自己不 commit，于是
+        # `conn` 上开着一段**未提交的写事务**，而 SQLite 的读快照是**按连接**
+        # 取的——后面那个 `ov` 的读会一直停在**那一刻**的快照上，对账在另一个
+        # 连接里做的删除**看不见**（实测：不 commit 时 `ov.kind_alias` 里始终
+        # 还看得见那一行，而新连接查同一个文件是空的；
+        # `conn.rollback()` 之后立刻就能看见 ⇒ 就是快照被冻住）。
+        # ⚠️ 生产侧不受影响：`api.connect()` **每请求一条新连接**。
+        conn.commit()
+        w = _ov_conn()
+        try:
+            overrides.set_kind(w, item_id=iid, kind="life")          # 人工选 life
+            overrides.set_kind_alias(w, old_kind="life", new_kind="life_v2")
+        finally:
+            w.close()
+
+        assert store.get_item(conn, iid).kind == "life_v2", (
+            "第一次读就不对：对账把一条**合法**的别名剪掉了（old_kind 不在现存集里）"
+        )
+
+        # ② **手改**配置：把 life 加回来（mtime 与 size 都变了 ⇒ 闸门开）
+        path.write_text(_cats_toml("notice", "life_v2", "life"), encoding="utf-8")
+        _w = overrides.connect()
+        _w.close()
+
+        assert store.get_item(conn, iid).kind == "life", (
+            "手改配置之后别名表没对平：手工选的**合法** life 被旧别名顶成了 life_v2"
+        )
+        # 而且表里那一行确实走了（不变量：old_kind 不许是现存 slug）
+        w = overrides.connect()
+        try:
+            assert "life" not in overrides.kind_aliases(w)
+        finally:
+            w.close()
+    finally:
+        conn.close()

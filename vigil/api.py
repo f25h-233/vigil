@@ -495,17 +495,20 @@ def create_app(config: Config) -> FastAPI:
             raise HTTPException(status_code=400, detail=str(exc))
 
     def commit_categories(cats: Sequence[Category]) -> None:
-        # ⚠️ **写文件之前先剪枝**（Fix loop 1 / FIX 1c）。这是「收尾那一刀」：
-        # 用的是**不含 `keep`** 的这套 slug，落盘之后表里不会再有
-        # `old_kind ∈ 现存 slug` 的行 ⇒ `store._EFFECTIVE_KIND` 里的 `ka2` 安全。
-        # 放在这里（而不是只放在端点里）是因为它是**写文件**这条路上唯一的收口。
-        prune_aliases(cats)
         try:
             categories_mod.save_categories(cats, categories_path())
         except categories_mod.CategoryError as exc:
             # 走到这里说明 `validate_or_400` 放行了一份 `save_categories` 拒绝的
             # 东西——那是**程序自己的 bug**，500 才对（400 会把排障引向用户输入）。
             raise HTTPException(status_code=500, detail=f"内部错误：{exc}")
+        # ⚠️ **先写文件、后剪枝**（Fix loop 2 / FIX 3；Fix loop 1 时是反的）。
+        # 反过来的话，**写失败**（Windows 上文件被占用是真实可发生的）会留下
+        # 「别名已按新 slug 集剪掉、文件还是旧集」——那正是要维持的不变量被破。
+        # 这个顺序下失败只意味着"别名暂时保守地多留了一行"，而
+        # `reconcile_if_stale`（读路径、按 mtime）会在下一次读时把它对平。
+        # ⚠️ 剪枝用的是**不含 `keep`** 的这套 slug（收尾那一刀），落盘之后表里
+        # 不会再有 `old_kind ∈ 现存 slug` 的行 ⇒ `ka2` 安全。
+        prune_aliases(cats)
 
     def persons_path() -> pathlib.Path:
         """⚠️ 路径**每次现读** `REPO_ROOT` 全局，不许在 `create_app` 时算好冻进闭包。
@@ -644,10 +647,13 @@ def create_app(config: Config) -> FastAPI:
     # （没有任何并发用例）。它守的是一个**单线程测试看不见**的性质，
     # 与上面 `categories_path()` 那条是同一族的诚实标注（勘误 E7）。
     #
-    # ⚠️ 快照的**位置**也是承重的：`snapshot_categories()` 必须在
-    # `commit_categories()` **之前**。反过来（先 commit 再拍快照）实测 ⇒
-    # `test_api_category_undo_restores_the_previous_file` **红**：撤销会"回滚"到
-    # 刚写进去的那一份，即点了撤销什么都没发生。
+    # ⚠️ 快照的**位置**是双重承重的，两条都是实测：
+    #   ① 在 `commit_categories()` **之前**——反过来实测 ⇒
+    #      `test_api_category_undo_restores_the_previous_file` **红**：
+    #      撤销会"回滚"到刚写进去的那一份，即点了撤销什么都没发生。
+    #   ② 在**写别名之前**（Fix loop 2 / FIX 1）——快照存的是「文件原文 +
+    #      别名表」这一**对**，拍在别名写之后就会把「旧文件 + 新别名表」装回去，
+    #      `old_kind` 又变成现存 slug ⇒ 不变量破、条目显示悬空 slug。
     #
     # ⚠️ `api_update_category` / `api_delete_category` 里「**先写别名、再写配置**」
     # 的顺序**没有测试**（两种顺序在单请求里都绿）：它防的是**两次写之间崩溃**
@@ -701,6 +707,13 @@ def create_app(config: Config) -> FastAPI:
             candidate = tuple(merged if c.slug == slug else c for c in existing)
             validate_or_400(candidate)
 
+            # ⚠️ **快照必须拍在"别名表被改"之前**（Fix loop 2 / FIX 1，承重）。
+            # 快照存的是「文件原文 + 别名表」这一**对**，两者必须来自同一时刻；
+            # 拍在别名写之后的话，撤销会把「旧文件 + 新别名表」装回去
+            # ⇒ `old_kind` 又变成现存 slug ⇒ 不变量破、条目显示悬空 slug
+            # ——那正是这次要修的 C-1。
+            snapshot_categories()
+
             # ⚠️ **顺序：先剪枝、再写别名**（Fix loop 1 / FIX 1c，承重）。
             # 反过来的话「改回原名」（A→B 之后再把 B 改回 A）会因为表里还留着
             # `A→B` 而跟成一个**环** ⇒ `set_kind_alias` 抛错 ⇒ 用户永远回不去。
@@ -723,7 +736,6 @@ def create_app(config: Config) -> FastAPI:
                         )
                 finally:
                     ov.close()
-            snapshot_categories()
             commit_categories(candidate)
         return {"slug": merged.slug, "label": merged.label}
 
@@ -771,6 +783,9 @@ def create_app(config: Config) -> FastAPI:
                     status_code=400, detail=f"迁移目标 {migrate_to!r} 不是一个现存类目"
                 )
 
+            # ⚠️ **快照拍在"别名表被改"之前**（同 `api_update_category`，FIX 1）。
+            snapshot_categories()
+
             if migrate_to:
                 # ⚠️ 先剪枝、再写别名（同 `api_update_category`，Fix loop 1 / FIX 1c），
                 # live 集同样多含那个马上要废的 `slug`（别名链 `X→slug` 要活到
@@ -786,7 +801,6 @@ def create_app(config: Config) -> FastAPI:
                         )
                 finally:
                     ov.close()
-            snapshot_categories()
             commit_categories(candidate)
         return None
 
@@ -802,13 +816,18 @@ def create_app(config: Config) -> FastAPI:
         """
         # ⚠️ **整段在 `write_lock` 里**（Fix loop 1 / FIX 5）：`pop` 在锁外时，
         # 两个并发撤销各自 peek 到同一格 ⇒ 一个格的快照被消费两次 / 丢一格。
+        # ⚠️ **边界（Fix loop 2 / FIX 5，知情接受）**：这把锁是**进程内**的，
+        # 所以 peek→pop 之间只有**本服务**的请求被串起来；若另一个**进程**
+        # （比如有人同时在跑 CLI）插在中间撤销一次，两边的 peek 可能看到同一格。
+        # 这是**单用户自用**工具的已知边界——跨进程那把锁是 `lock.SingleInstance`，
+        # 它保护的是 QQ 库与主库，语义不同、别混用（见 `write_lock` 上面的论证）。
         with write_lock:
             ov = overrides.connect()
             try:
                 row = overrides.peek_config_snapshot(ov)
                 if row is None:
                     return {"undone": False}
-                _, body = row
+                _, body, aliases = row
                 # ⚠️ **校验在消费之前**（Fix loop 1 / FIX 5）：恢复的是一份
                 # **手里没有第二份**的内容，所以要先校验再落盘——直接
                 # `atomic_write_text` 的话，一份坏快照会把配置永久写坏
@@ -816,9 +835,11 @@ def create_app(config: Config) -> FastAPI:
                 # ⚠️ 而**校验不过时不许消费**：从前是先 `pop` 再校验 ⇒ 坏快照被
                 # 悄悄从栈里吃掉，用户下一次撤销会**多退一格**（跳过更早那次编辑），
                 # 而响应只说「配置未被改动」——**那句话只对文件成立**。
+                # ⚠️ 这里**只校验**、不用它的返回值：恢复走的是下面的整表替换，
+                # 不是"按这个 slug 集剪枝"（剪枝还原不了被压平 UPDATE 抹掉的旧行）。
                 try:
                     raw = tomllib.loads(body)
-                    restored = categories_mod.validate_categories(
+                    categories_mod.validate_categories(
                         raw.get("categories"), categories_path()
                     )
                 except (tomllib.TOMLDecodeError, categories_mod.CategoryError) as exc:
@@ -829,11 +850,26 @@ def create_app(config: Config) -> FastAPI:
                 overrides.pop_config_snapshot(ov)
             finally:
                 ov.close()
-            # ⚠️ 剪枝按**即将生效的那套 slug**（= 快照里那份，Fix loop 1 / FIX 1c）：
-            # 撤销一次改名之后，那条 `旧名→新名` 的别名必须跟着消失——否则
-            # 配置里的名字回来了、条目却还走在改名后的 slug 上（悬空）。
-            prune_aliases(restored)
+            # ⚠️ **先写文件、后换别名表**（Fix loop 2 / FIX 3 的同一条理由）：
+            # 写失败时别名表一动不动 = **保守**；反过来的话失败会留下
+            # 「文件是旧的、表是新的」——正是要维持的不变量被破，
+            # 而 `reconcile_if_stale` 只会在**下一次**读时才把它对平。
             atomic_write_text(categories_path(), body)
+            if aliases is None:
+                # ⚠️ **旧格式快照（M6 T5 之前存的）没有别名表**：这时**不许**
+                # 当成空表去清（那会让所有改过名的条目一起退化成裸 slug）。
+                # 保持现状 + 说一句：这是**知情接受**的降级，不是静默。
+                logs.emit(
+                    "[警告] 这份配置快照没有别名表（M6 T5 之前的旧格式）："
+                    "本次撤销**只回滚了配置文件**，kind_alias 保持现状。"
+                    "若条目显示的类目与配置对不上，再撤一次或重启服务即可对平。"
+                )
+            else:
+                ov = overrides.connect()
+                try:
+                    overrides.replace_kind_aliases(ov, aliases)
+                finally:
+                    ov.close()
         return {"undone": True}
 
     @app.get("/api/items")

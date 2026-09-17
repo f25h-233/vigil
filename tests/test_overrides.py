@@ -679,8 +679,11 @@ def test_pop_removes_the_row_so_undo_walks_backwards(ov):
     """
     overrides.save_config_snapshot(ov, body="第一版", now=1)
     overrides.save_config_snapshot(ov, body="第二版", now=2)
-    assert overrides.pop_config_snapshot(ov) == (2, "第二版")
-    assert overrides.pop_config_snapshot(ov) == (1, "第一版")
+    # ⚠️ 返回**三元组**（Fix loop 2 / FIX 1：快照里多了别名表）。
+    # 这个夹具的别名表是空的 ⇒ 第三项是 `{}`（**不是** `None`：`None` 是
+    # 「这份快照没有别名表」= 旧格式，两者必须区分——见 `_decode_aliases`）。
+    assert overrides.pop_config_snapshot(ov) == (2, "第二版", {})
+    assert overrides.pop_config_snapshot(ov) == (1, "第一版", {})
     assert overrides.pop_config_snapshot(ov) is None
     assert overrides.list_config_snapshots(ov) == []
 
@@ -765,9 +768,9 @@ def test_peek_does_not_consume_the_snapshot(ov):
     ⇒ 本条**必红**（第二次 peek 变成 None）。
     """
     overrides.save_config_snapshot(ov, body="第一版", now=1)
-    assert overrides.peek_config_snapshot(ov) == (1, "第一版")
-    assert overrides.peek_config_snapshot(ov) == (1, "第一版"), "peek 把快照消费掉了"
-    assert overrides.pop_config_snapshot(ov) == (1, "第一版")
+    assert overrides.peek_config_snapshot(ov) == (1, "第一版", {})
+    assert overrides.peek_config_snapshot(ov) == (1, "第一版", {}), "peek 把快照消费掉了"
+    assert overrides.pop_config_snapshot(ov) == (1, "第一版", {})
     assert overrides.peek_config_snapshot(ov) is None
 
 
@@ -822,3 +825,138 @@ def test_undo_batch_stops_at_a_different_actor(con):
     assert overrides._state_of(con, 3) == (None, 0)
     assert overrides._state_of(con, 2) == ("academic", 0), "别人的事件不许被碰"
     assert overrides._state_of(con, 1) == ("life", 0), "更早的那条也不许被碰"
+
+
+def _cats_toml(slugs: tuple[str, ...]) -> str:
+    """一份最小类目表（`reconcile_if_stale` 只取 slug 集）。"""
+    return "".join(
+        f'[[categories]]\nslug = "{s}"\nlabel = "{s}"\ndesc = "d"\n\n' for s in slugs
+    )
+
+
+# ── M6 T5 Fix loop 2：快照带上别名表 + 对账（FIX 1 / FIX 2）──────────
+
+
+def test_snapshot_carries_the_alias_table(ov):
+    """⭐ FIX 1：快照存的是「文件原文 + **当时的别名表**」这一**对**。
+
+    ⚠️ 为什么必须一起存：`set_kind_alias` 的**压平 UPDATE 会改写别的行**
+    （`X→A` 在 `A→B` 之后变成 `X→B`），那一步丢掉的信息**从文件名反推不出来**
+    ⇒ 只回滚文件的撤销会留下「配置回到中间名、条目却是裸 slug」。
+
+    变异反证：把 `save_config_snapshot` 里 `aliases` 那一列的写入去掉
+    （只写 `body`）⇒ 本条**必红**（第三项会是 `None`）。
+    """
+    overrides.set_kind_alias(ov, old_kind="life", new_kind="life_v2", now=1)
+    overrides.save_config_snapshot(ov, body="第一版", now=2)
+    overrides.set_kind_alias(ov, old_kind="life_v2", new_kind="life_v3", now=3)
+
+    assert overrides.pop_config_snapshot(ov) == (1, "第一版", {"life": "life_v2"})
+
+
+def test_a_snapshot_without_an_alias_column_reads_back_as_none(ov):
+    """⭐ **NULL ≠ 空表**（FIX 1）——直接往表里塞一行"旧格式"快照。
+
+    ⚠️ 把 NULL 当成空表，撤销就会**静默清空整张 `kind_alias`**：所有改过名的
+    条目一起退化成裸 slug——比"不动它"危险得多。`api_category_undo` 对
+    `None` 的处理是「保持现状 + 写一句日志」。
+
+    变异反证：把 `_decode_aliases` 的 `if raw is None: return None` 改成
+    `return {}` ⇒ 本条**必红**。
+    """
+    ov.execute("INSERT INTO config_snapshots (saved_at, body) VALUES (1, '旧格式')")
+    ov.commit()
+    assert overrides.pop_config_snapshot(ov) == (1, "旧格式", None)
+
+
+def test_replace_kind_aliases_swaps_the_whole_table(ov):
+    """⭐ FIX 1：整表替换——**删掉快照里没有的**，也**恢复快照里有而表里没有的**。
+
+    ⚠️ 只剪枝做不到后半句：`X→A` 被压平成 `X→B` 之后，"还原成 `X→A`"
+    需要的是一条**已经不存在**的行。
+
+    变异反证：把 `replace_kind_aliases` 改成"只 INSERT 不 DELETE"
+    ⇒ 本条**必红**（`c→d` 会留下）。
+    """
+    overrides.set_kind_alias(ov, old_kind="c", new_kind="d", now=1)
+    assert overrides.replace_kind_aliases(ov, {"x": "y"}) == 1
+    assert overrides.kind_aliases(ov) == {"x": "y"}
+
+    # 反向：把 `x→y` 换成空表（= 撤销到"还没有任何别名"的那一刻）
+    assert overrides.replace_kind_aliases(ov, {}) == 0
+    assert overrides.kind_aliases(ov) == {}
+
+
+def test_reconcile_is_gated_by_the_config_file_state(tmp_path, monkeypatch):
+    """⭐ FIX 2 的闸门：`(mtime_ns, size)` 没变 ⇒ **一次都不剪**。
+
+    ⚠️ 这是它能挂在**每一次查询入口**上的前提；也是"手改才触发"的判据。
+
+    ⚠️ **第二段放进去的行必须是「该剪的」**（实测踩过）：放一条**合法**的行
+    （`ghost2→live`）进去的话，把闸门拿掉、剪枝照跑，可它一行都不删
+    ⇒ 断言照样绿 ⇒ **变异不红**（reviewer 说的"反证落在执行路径之外"的另一种形态：
+    变异跑了，但它要剪的东西不在那儿）。
+
+    变异反证：把 `reconcile_if_stale` 里的
+    `if key == _LAST_RECONCILE: return 0` 删掉 ⇒ 本条**必红**
+    （第二次调用会返回 1、把那行剪掉）。
+    """
+    from vigil import categories as categories_mod
+
+    path = tmp_path / "categories.toml"
+    # `ghost` **还在**现存 slug 里 ⇒ `ghost→live` 那一行破了不变量 ⇒ 该被剪
+    path.write_text(_cats_toml(("live", "ghost")), encoding="utf-8")
+    monkeypatch.setattr(categories_mod, "DEFAULT_CATEGORIES", path)
+    monkeypatch.setattr(overrides, "_LAST_RECONCILE", None)
+
+    overrides.ensure_schema()
+    w = overrides.connect()
+    try:
+        overrides.set_kind_alias(w, old_kind="ghost", new_kind="live", now=1)
+    finally:
+        w.close()
+    assert overrides.reconcile_if_stale() == 1, "第一次（文件没看过）必须对账"
+
+    # 再把**同一条该剪的行**放回去，但**不动文件** ⇒ 闸门关着 ⇒ 一次都不许剪
+    # （它此刻仍然"该剪"——所以"没被剪"只能是闸门拦下的）
+    w = overrides.connect()
+    try:
+        overrides.set_kind_alias(w, old_kind="ghost", new_kind="live", now=2)
+    finally:
+        w.close()
+    assert overrides.reconcile_if_stale() == 0
+    w = overrides.connect()
+    try:
+        assert "ghost" in overrides.kind_aliases(w), "闸门失效：文件没变却又剪了一次"
+    finally:
+        w.close()
+
+    # **手改**文件：把 `ghost` 从现存 slug 里去掉 ⇒ 那行变成**合法**的 ⇒ 不该剪
+    path.write_text(_cats_toml(("live",)), encoding="utf-8")
+    assert overrides.reconcile_if_stale() == 0
+    w = overrides.connect()
+    try:
+        assert "ghost" in overrides.kind_aliases(w), "剪枝把一条合法的行剪掉了"
+    finally:
+        w.close()
+
+    # 再**手改**回来（`ghost` 又是现存 slug）⇒ 闸门开 ⇒ 这次真剪
+    path.write_text(_cats_toml(("live", "ghost")), encoding="utf-8")
+    assert overrides.reconcile_if_stale() == 1
+    w = overrides.connect()
+    try:
+        assert overrides.kind_aliases(w) == {}
+    finally:
+        w.close()
+
+
+def test_reconcile_does_nothing_when_the_config_is_missing(tmp_path, monkeypatch):
+    """⚠️ 配置**不存在**⇒ 什么都不做（绝不能把查询入口炸掉）。
+
+    它挂在每一次查询上，而 `load_categories` 对"文件不存在"是**抛**。
+    """
+    from vigil import categories as categories_mod
+
+    monkeypatch.setattr(categories_mod, "DEFAULT_CATEGORIES", tmp_path / "没有这个文件.toml")
+    monkeypatch.setattr(overrides, "_LAST_RECONCILE", None)
+    assert overrides.reconcile_if_stale() == 0

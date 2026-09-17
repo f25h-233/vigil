@@ -18,11 +18,12 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import pathlib
 import sqlite3
 import time
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 
 from .config import REPO_ROOT
 
@@ -65,7 +66,8 @@ CREATE TABLE IF NOT EXISTS item_state (
 CREATE TABLE IF NOT EXISTS config_snapshots (
     snapshot_id INTEGER PRIMARY KEY,
     saved_at    INTEGER NOT NULL,
-    body        TEXT    NOT NULL
+    body        TEXT    NOT NULL,
+    aliases     TEXT
 );
 
 CREATE TABLE IF NOT EXISTS kind_alias (
@@ -79,6 +81,15 @@ CREATE TABLE IF NOT EXISTS kind_alias (
 # 而 `_qualified_ddl` 的索引处理有一条极易踩的坑——索引名要限定 schema、
 # 但**表名不许带 schema**（SQLite 语法限制，见 `_qualified_ddl` 的实测记录）。
 # 不加索引就不会碰到它。
+
+# 补列语句（升级已存在的库用；新库由 `_TABLES_DDL` 的 CREATE 直接带上）。
+# ⚠️ **不是 _TABLES_DDL 的一部分**：`_qualified_ddl` 会把 `CREATE TABLE` 加上
+# schema 前缀，而 `ALTER TABLE` 要多一层处理（`ALTER TABLE ov.x` 合法，但语句里
+# 还带 `IF NOT EXISTS` 之类就没法拼）——更重要的是**内存兜底库不需要它**
+# （`CREATE TABLE` 已经带上了那一列）。
+_MIGRATIONS = (
+    "ALTER TABLE config_snapshots ADD COLUMN aliases TEXT",
+)
 
 
 class OverlayError(RuntimeError):
@@ -142,8 +153,19 @@ def _attach_empty_overlay(conn: sqlite3.Connection) -> None:
 
 
 def ensure_tables(conn: sqlite3.Connection) -> None:
-    """建表。幂等。**不 commit**——调用方决定事务边界。"""
+    """建表 + 补列。幂等。**不 commit**——调用方决定事务边界。"""
     conn.executescript(_TABLES_DDL)
+    for stmt in _MIGRATIONS:
+        try:
+            conn.execute(stmt)
+        except sqlite3.OperationalError:
+            # ⚠️ `duplicate column name: aliases` —— **正常路径，不是错误**：
+            # SQLite 没有 `ADD COLUMN IF NOT EXISTS`（Fix loop 2 / FIX 1），
+            # 升级已有的库只能"试着加，重复了就当没有"。
+            # ⚠️ 而**新库**走的是 `_TABLES_DDL` 里那句带 `aliases` 的 CREATE
+            # ⇒ 它们这里必然抛一次；把 `_TABLES_DDL` 改成"重建表"是错的
+            # （会丢 `config_snapshots` 里已有的数据）。
+            pass
 
 
 def ensure_schema(path: pathlib.Path | None = None) -> None:
@@ -356,18 +378,48 @@ def delete_item(
 # slug 显示"这种静默的错分类）。
 
 
+def _decode_aliases(raw: object) -> dict[str, str] | None:
+    """快照里那一列 → `{旧 slug: 新 slug}`。
+
+    ⚠️ **NULL 与"解析不了"一律返回 `None`**（=「这份快照没有别名表」），
+    **绝不返回空字典**：把旧格式当成"空表"会让撤销**静默清空整张 `kind_alias`**
+    ——所有改过名的条目一起退化成裸 slug，比"不动它"危险得多。
+    """
+    if raw is None:
+        return None
+    try:
+        data = json.loads(str(raw))
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    return {str(k): str(v) for k, v in data.items()}
+
+
 def save_config_snapshot(
-    conn: sqlite3.Connection, *, body: str, now: int | None = None
+    conn: sqlite3.Connection, *, body: str, aliases: Mapping[str, str] | None = None,
+    now: int | None = None,
 ) -> int:
-    """存一份配置文件的**原文**。返回 `snapshot_id`。
+    """存一份配置的**原文**＋**当时的别名表**。返回 `snapshot_id`。
 
     ⚠️ 存**原文**而不是解析后的结构：撤销要还原的是**那份文件**，
     重新序列化会丢掉用户手工加的注释（而 `_CATEGORIES_HEADER` 之外的东西
     正是「用户改过这里」的痕迹）。
+
+    ⚠️ **为什么要连别名表一起存**（Fix loop 2 / FIX 1）：撤销只把文件写回去是
+    **不够**的——`set_kind_alias` 的压平 UPDATE 会**改写别的行**（`X→A` 在
+    `A→B` 之后变成 `X→B`），那一步丢掉的信息**无法从文件名反推**
+    （改两次名再撤销一次，配置停在中间名上，而条目显示的是**裸 slug**）。
+    ⇒ 撤销要还原的是「**文件 + 别名表**」这一对，两者必须来自**同一时刻**。
+
+    ⚠️ `aliases=None` 表示"**读当前表**"（默认）。调用方若想表达"这份快照没有
+    别名表"（旧格式），必须显式传一个值——`None` 不是那个意思。
     """
     stamp = int(time.time()) if now is None else now
+    payload = kind_aliases(conn) if aliases is None else dict(aliases)
     cur = conn.execute(
-        "INSERT INTO config_snapshots (saved_at, body) VALUES (?, ?)", (stamp, body)
+        "INSERT INTO config_snapshots (saved_at, body, aliases) VALUES (?,?,?)",
+        (stamp, body, json.dumps(payload, ensure_ascii=False, sort_keys=True)),
     )
     conn.commit()
     return int(cur.lastrowid)
@@ -387,25 +439,33 @@ def list_config_snapshots(
     ]
 
 
-def pop_config_snapshot(conn: sqlite3.Connection) -> tuple[int, str] | None:
-    """取最近一条快照**并删掉它**，返回 `(snapshot_id, body)`；空栈返回 `None`。
+def pop_config_snapshot(
+    conn: sqlite3.Connection,
+) -> tuple[int, str, dict[str, str] | None] | None:
+    """取最近一条快照**并删掉它**，返回 `(snapshot_id, body, aliases)`；空栈 `None`。
+
+    ⚠️ `aliases` 为 `None` = **这份快照没有别名表**（M6 T5 之前的旧格式），
+    不是"空表"——调用方必须区别对待（`_decode_aliases` 的 docstring 有论证）。
 
     ⚠️ **必须删掉那一行**，否则「撤销 → 再撤销」会无限撤销同一个状态
     （用户看到的是"点了没反应"）。删行之后每一次撤销都真的往回走一格——
     这与 `undo` 删事件是同一个思路（两者都是"往回走一格"）。
     """
     row = conn.execute(
-        "SELECT snapshot_id, body FROM config_snapshots ORDER BY snapshot_id DESC LIMIT 1"
+        "SELECT snapshot_id, body, aliases FROM config_snapshots"
+        " ORDER BY snapshot_id DESC LIMIT 1"
     ).fetchone()
     if row is None:
         return None
     conn.execute("DELETE FROM config_snapshots WHERE snapshot_id = ?", (row[0],))
     conn.commit()
-    return (int(row[0]), str(row[1]))
+    return (int(row[0]), str(row[1]), _decode_aliases(row[2]))
 
 
-def peek_config_snapshot(conn: sqlite3.Connection) -> tuple[int, str] | None:
-    """看最近一条快照**但不消费它**；空栈返回 `None`。
+def peek_config_snapshot(
+    conn: sqlite3.Connection,
+) -> tuple[int, str, dict[str, str] | None] | None:
+    """看最近一条快照**但不消费它**；空栈返回 `None`。返回形状同 `pop`。
 
     ⚠️ 与 `pop_config_snapshot` 分成两个函数的理由是**校验必须在消费之前**
     （Fix loop 1 / FIX 5）：`api_category_undo` 要先校验快照内容再落盘，
@@ -413,9 +473,35 @@ def peek_config_snapshot(conn: sqlite3.Connection) -> tuple[int, str] | None:
     （跳过更早那次编辑），而接口只说了「配置未被改动」——**那句话只对文件成立**。
     """
     row = conn.execute(
-        "SELECT snapshot_id, body FROM config_snapshots ORDER BY snapshot_id DESC LIMIT 1"
+        "SELECT snapshot_id, body, aliases FROM config_snapshots"
+        " ORDER BY snapshot_id DESC LIMIT 1"
     ).fetchone()
-    return (int(row[0]), str(row[1])) if row else None
+    return (int(row[0]), str(row[1]), _decode_aliases(row[2])) if row else None
+
+
+def replace_kind_aliases(
+    conn: sqlite3.Connection, aliases: Mapping[str, str]
+) -> int:
+    """把 `kind_alias` **整表换成** `aliases`。返回写进去的行数。
+
+    ⚠️ **撤销必须用它，不能只剪**（Fix loop 2 / FIX 1）：剪枝只能删"与当前
+    slug 集冲突"的行，而成不了**被压平 UPDATE 抹掉的那些旧行**
+    （`X→A` 在 `A→B` 之后已经变成 `X→B`，信息没了）——那正是「改两次名再撤销
+    一次」时配置停在中间名、条目显示裸 slug 的根因。
+    整表替换还原的是**快照那一刻的表**，信息完整。
+
+    ⚠️ `created_at` 用写入时刻（快照里没存它）：它只是留痕字段，
+    没有任何读路径依赖它（`kind_aliases` 只取两列）。
+    """
+    stamp = int(time.time())
+    conn.execute("DELETE FROM kind_alias")
+    for old_kind, new_kind in sorted(aliases.items()):
+        conn.execute(
+            "INSERT INTO kind_alias (old_kind, new_kind, created_at) VALUES (?,?,?)",
+            (str(old_kind), str(new_kind), stamp),
+        )
+    conn.commit()
+    return len(aliases)
 
 
 # ── slug 别名（M6 T5）───────────────────────────────────────────────
@@ -532,6 +618,68 @@ def prune_kind_aliases(
         conn.execute("DELETE FROM kind_alias WHERE old_kind = ?", (old_kind,))
     conn.commit()
     return len(dead)
+
+
+# 上一次对账时 `categories.toml` 的 `(mtime_ns, size)`。`None` = 还没对过账。
+#
+# ⚠️ 做成**模块级**是因为对账挂在**每一次查询入口**上（`store._ensure_overlay`），
+# 而闸门必须跨调用、跨连接记住"这份文件我看过了"。
+# ⚠️ 并发下最坏情况只是**两个线程各对一次账**（剪枝幂等），不需要锁。
+_LAST_RECONCILE: tuple[int, int] | None = None
+
+
+def reconcile_if_stale() -> int:
+    """配置若被**外部**改过，就把 `kind_alias` 对齐到当前的 slug 集。返回剪了几行。
+
+    ⚠️ **这一条是为了「手改 `categories.toml`」**（Fix loop 2 / FIX 2）：
+    本里程碑**明确邀请手改**（`api.py`：「配置仍是唯一真相源…只是从此有了一个比
+    手写更常见的来源」；`refine.py`：「改 categories.toml 即改提示词」），
+    而手改**不经过任何写端点** ⇒ 剪枝跑不到 ⇒ 不变量破。
+    实测的破法：手工把某条条目的类目改成 `life` → 改名 `life→life_v2` →
+    **手改把 `life` 加回配置** ⇒ 条目仍显示 `life_v2`（`ka2` 顶掉了合法的
+    `life`），而 `life` 的角标是 0、出口检查也看不见。
+
+    ⚠️ **不能用 `ov` 那个 attach**：读路径 attach 的是 `mode=ro`（设计如此，
+    见 `attach_readonly`），剪枝是**写** ⇒ 这里自己开一条可写的
+    `overrides.connect()`，而且**只在真的要剪时才开**（见下面的闸门）。
+
+    ⚠️ **闸门是 `stat`**：文件没变 ⇒ 立刻返回，不连库、不解析。判据取
+    `(st_mtime_ns, st_size)` **两个都记**：只记 mtime 的话，同一秒内的两次写入
+    （或某些文件系统上粗糙的 mtime 粒度）会被漏掉；只记 size 的话，
+    「`life` 换成 `life_v2` 又换回来」这种等长的改动会被漏掉。
+
+    ⚠️ 与 `_ensure_overlay` 的局部 import 同形，这里也**局部 import `categories`**：
+    `overrides` 与 `categories` 谁先被 import 都不该出问题。
+    ⚠️ 配置文件**不存在 / 读不出来**⇒ **什么都不做**：这是挂在**每一次查询**上的
+    函数，绝不能让它把查询入口炸掉（真正要报错的是 `/api/categories` 与
+    `save_categories`，它们照旧响亮）。
+    """
+    global _LAST_RECONCILE
+
+    from . import categories as categories_mod
+
+    path = categories_mod.DEFAULT_CATEGORIES
+    try:
+        st = path.stat()
+    except OSError:
+        # 文件不在（或读不到 stat）⇒ 没有配置可对账。
+        # ⚠️ 不设闸门：文件出现时（mtime/size 变了）下一次就轮到它了。
+        return 0
+    key = (st.st_mtime_ns, st.st_size)
+    if key == _LAST_RECONCILE:
+        return 0
+    # ⚠️ 先记闸门再动手：解析失败时也记，免得**每一句查询**都去解析一份坏文件
+    # （文件被修好时 mtime 会变，那时自然重来）。
+    _LAST_RECONCILE = key
+    try:
+        cats = categories_mod.load_categories(path)
+    except categories_mod.CategoryError:
+        return 0
+    conn = connect()
+    try:
+        return prune_kind_aliases(conn, live_slugs=[c.slug for c in cats])
+    finally:
+        conn.close()
 
 
 def _state_of(conn: sqlite3.Connection, item_id: int) -> tuple[str | None, int]:

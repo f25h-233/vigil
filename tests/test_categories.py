@@ -14,9 +14,16 @@ def _write(tmp_path, body: str):
     return p
 
 
-def test_loads_real_project_config():
-    """真实配置文件必须能加载，且正是用户裁定的七类。"""
-    cats = categories.load_categories()
+def test_loads_real_project_config(shipped_categories_toml):
+    """真实配置文件必须能加载，且正是用户裁定的七类。
+
+    ⚠️ 传入 `shipped_categories_toml` 是**刻意的**（M6 T5 Fix loop 2）：
+    conftest 从 FIX 2 起把 `DEFAULT_CATEGORIES` 挪到了一个**自带内容**的 tmp 文件，
+    而**这一条**断言的是**仓库资产**（出厂那份必须合法、且就是那七类），
+    不是"产品读得到什么"。不传的话它会在断言夹具，而名字还叫 real——
+    那正是「名字与它实际测的东西不是一回事」。
+    """
+    cats = categories.load_categories(shipped_categories_toml)
     assert [c.slug for c in cats] == [
         "notice",
         "academic",

@@ -870,6 +870,13 @@ def _ensure_overlay(conn: sqlite3.Connection) -> None:
     from . import overrides
 
     overrides.attach_readonly(conn)
+    # ⚠️ **对账**（Fix loop 2 / FIX 2）：`categories.toml` 是可以**手改**的
+    # （本里程碑明确邀请），而手改不经过任何写端点 ⇒ 剪枝跑不到 ⇒
+    # 「别名行的 old_kind 不许是现存 slug」这条不变量会破
+    # （实测：手改把 life 加回来之后，手工选的 life 会被旧别名顶成 life_v2）。
+    # ⚠️ 它是**幂等**的，且自带 `stat` 闸门（文件没变 ⇒ 立刻返回、连库都不连）
+    # ——这是它能挂在每一次查询入口上的前提。
+    overrides.reconcile_if_stale()
 
 
 # ⚠️ **「有效类目」的唯一表达式**（M6 T5）。四条来源的优先级是**承重的**：

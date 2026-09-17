@@ -35,6 +35,10 @@ from vigil import config  # noqa: E402
 # `config/categories.toml`：抄一份等于把「测试红绿取决于用户的类目配置」留着，
 # 而 M6 的整个卖点就是把那份文件交给用户在网页上编辑。
 #
+# ⚠️ **图标也照抄出厂文件**：`digest.render_markdown` 的章节标题是
+# `{icon} {label}`，`tests/test_digest.py` 直接断言 `📚 学业` 那一节存在——
+# 少了 icon 就会红（实测：740 passed / 1 failed）。
+#
 # ⚠️ 七个 slug 与**顺序**（`notice` 在第一个）是 `tests/test_api.py` 里
 # `test_categories_carry_counts` 断言的东西；`academic` 的中文名是
 # `test_items_returns_the_frozen_field_set` 断言 `kind_label == "学业"` 要的。
@@ -42,36 +46,43 @@ from vigil import config  # noqa: E402
 _ISOLATED_CATEGORIES_TOML = """\
 [[categories]]
 slug = "notice"
+icon = "📋"
 label = "通知公告"
 desc = "隔离用类目：通知公告"
 
 [[categories]]
 slug = "academic"
+icon = "📚"
 label = "学业"
 desc = "隔离用类目：学业"
 
 [[categories]]
 slug = "activity"
+icon = "🎤"
 label = "活动"
 desc = "隔离用类目：活动"
 
 [[categories]]
 slug = "life"
+icon = "🏠"
 label = "生活"
 desc = "隔离用类目：生活"
 
 [[categories]]
 slug = "secondhand"
+icon = "🛒"
 label = "二手"
 desc = "隔离用类目：二手"
 
 [[categories]]
 slug = "lostfound"
+icon = "🔍"
 label = "失物招领"
 desc = "隔离用类目：失物招领"
 
 [[categories]]
 slug = "job"
+icon = "💼"
 label = "兼职招聘"
 desc = "隔离用类目：兼职招聘"
 """
@@ -93,6 +104,52 @@ desc = "隔离用类目：兼职招聘"
 #        而外部断言全都在看 tmp 根 ⇒ **空守卫**（评审已复现这条链）。
 #
 #   同理一律 `.as_posix()`：反斜杠在 TOML 基本字符串里是转义字符。
+
+
+@pytest.fixture(autouse=True)
+def _isolate_categories_toml_path(tmp_path_factory, monkeypatch):
+    """把 `categories.DEFAULT_CATEGORIES` 挪到一个**自带内容**的 tmp 文件。
+
+    ⚠️ **M6 T5 Fix loop 2 / FIX 2 起它必须被隔离**：`store._ensure_overlay`
+    （**每一次查询入口**都走它）会调 `overrides.reconcile_if_stale()`，
+    而那个函数按 mtime 读这个常量所指的文件。不隔离的后果是两条：
+
+      ① **环境相关的绿**：对账读的是**仓库里真实的** `config/categories.toml`，
+         于是测试的行为取决于用户的类目配置（正是 E6 那条判据点名要禁的）；
+      ② 更要命：它**会剪** overlay 里的别名——测试自己造的 `life→daily` 之类
+         会被当成"目标不在现存 slug 里"删掉，一批与配置毫无关系的用例会莫名变红。
+
+    ⚠️ 内容**自带**（`_ISOLATED_CATEGORIES_TOML`，与 `_isolate_api_repo_root` 用的是
+    同一份），**不是**指向不存在的路径：`digest` / `refine` / `repass` 都会
+    在内部 `load_categories()`，那是**硬依赖**，指到不存在的路径会让它们抛
+    `CategoryError`。（这与 `_isolate_llm_toml_path` 刻意相反——那份的读侧有默认值。）
+
+    ⚠️ 还要把 `overrides._LAST_RECONCILE` **预置成这个文件当前的状态**（闸门关着）：
+    否则每个用例的第一次查询都会对账一次，把测试自己造的别名剪掉。
+    预置的语义就是「这份文件我看过了、它没变」——与生产里"进程启动后的第一次
+    查询对账一次"**等价地安全**（那一次也是对着**当时**的表剪：表是空的就是零剪）。
+    ⚠️ 想验对账本身的用例**改这个文件**即可：mtime/size 一变闸门就开
+    （`tests/test_store.py` 的 FIX 2 用例就是这么做的）。
+    """
+    from vigil import categories as _cats
+
+    path = tmp_path_factory.mktemp("cats") / "categories.toml"
+    path.write_text(_ISOLATED_CATEGORIES_TOML, encoding="utf-8")
+    monkeypatch.setattr(_cats, "DEFAULT_CATEGORIES", path)
+    st = path.stat()
+    monkeypatch.setattr(overrides, "_LAST_RECONCILE", (st.st_mtime_ns, st.st_size))
+
+
+@pytest.fixture
+def shipped_categories_toml() -> pathlib.Path:
+    """**出厂那份** `config/categories.toml` 的真实路径。
+
+    ⚠️ 只有**明确要断言仓库资产**的用例才用它（`test_categories` 的
+    「出厂文件必须能加载，且正是用户裁定的七类」）。其余用例走默认路径
+    （= 上面那条夹具挪走的自带文件）——它们要的是"有一份能读通的类目表"，
+    不是"用户的类目表长什么样"。
+    """
+    return REPO_ROOT / "config" / "categories.toml"
 
 
 @pytest.fixture(autouse=True)

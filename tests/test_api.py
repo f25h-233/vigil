@@ -2191,3 +2191,86 @@ def test_api_bulk_set_kind_is_one_actor_so_it_can_be_undone_together(client_fact
     job_actor = r.json()["actor"]
     assert c.post("/api/bulk-undo", json={"actor": job_actor}).status_code == 200
     assert [c.get(f"/api/items/{i}").json()["kind"] for i in ids] == before
+
+
+# ── M6 T5 Fix loop 2：撤销要整表还原别名（FIX 1）+ 写失败要保守（FIX 3）──
+
+
+def test_api_undo_restores_the_alias_table_along_with_the_file(client_factory):
+    """⭐ C-1：**改两次名再撤销一次**——配置与别名表必须**一起**回到同一时刻。
+
+    ⚠️ 从前只回滚文件：配置停在中间名 `life_v2`，而条目显示的是**裸 slug**
+    （别名表空、`life_v2` 角标 0）。根因是 `set_kind_alias` 的**压平 UPDATE
+    已经把可复原的信息改掉了**——`life→life_v2` 在第二次改名时被改写成了
+    `life→life_v3`，"上一次的表"从文件名里反推不出来。
+
+    ⚠️ 变异反证：把 `api_category_undo` 里的 `replace_kind_aliases` 换回
+    「按还原后的 slug 集剪枝」（Fix loop 1 的写法）⇒ 本条**必红**（裸 slug）。
+
+    ⚠️ 另外查过：「改名 + **带迁移删除** + 撤销」那条路**不需要**这一步
+    ——剪枝恰好也能修好它（那条 `旧名→迁移目标` 行的 old_kind 一回到现存集里
+    就会被剪掉）。**能区分两种实现的只有这条"连改两次名"**。
+    """
+    c = client_factory()
+    item_id = client_factory.item_ids[1]          # 库里的 raw kind = life
+    assert c.get(f"/api/items/{item_id}").json()["kind"] == "life"
+
+    assert c.put("/api/categories/life", json={"slug": "life_v2"}).status_code == 200
+    assert c.put("/api/categories/life_v2", json={"slug": "life_v3"}).status_code == 200
+    assert c.get(f"/api/items/{item_id}").json()["kind"] == "life_v3"
+
+    assert c.post("/api/categories/undo").status_code == 200
+    assert c.get(f"/api/items/{item_id}").json()["kind"] == "life_v2", (
+        "撤销之后条目显示的是裸 slug：配置文件回去了、别名表没回去"
+    )
+    assert c.get("/api/categories").json()["aliases"] == {"life": "life_v2"}
+    assert "life_v2" in {x["slug"] for x in c.get("/api/categories").json()["categories"]}
+
+
+def test_api_undo_after_a_delete_with_migration_restores_the_alias_table(client_factory):
+    """同上的另一半：**带迁移的删除**撤销之后，条目要回到被删掉的那个 slug。
+
+    ⚠️ 这一条与上一条**不是**同一个判据（上一条才区分得出"整表替换 vs 剪枝"），
+    留着它是因为「删除 + 迁移」是本端点的另一半用法，撤销要一起覆盖。
+    """
+    c = client_factory()
+    item_id = client_factory.item_ids[0]          # 库里的 raw kind = academic
+    assert c.delete("/api/categories/academic?migrate_to=life").status_code == 204
+    assert c.get(f"/api/items/{item_id}").json()["kind"] == "life"
+
+    assert c.post("/api/categories/undo").status_code == 200
+    assert c.get(f"/api/items/{item_id}").json()["kind"] == "academic"
+    assert c.get("/api/categories").json()["aliases"] == {}
+
+
+def test_api_a_failed_write_leaves_the_alias_table_alone(client_factory, monkeypatch):
+    """⭐ FIX 3：**写文件失败时别名表一动不动**（保守），而不是"剪了但没写成"。
+
+    ⚠️ 顺序反过来的话（先剪、后写）：写失败留下的是「别名已按新 slug 集剪掉、
+    文件还是旧集」——**不变量当场破**，而 `reconcile_if_stale` 只会在
+    **下一次读**时才把它对平。Windows 上文件被占用是真实可发生的失败。
+
+    场景：① 删 `academic`（迁移到 `life`）⇒ 别名 `academic→life`；
+    ② 把 `academic` 加回来，但**让写文件失败**。
+    ⇒ 那条别名必须**还在**（它此刻还在把 `academic` 的条目映射到 `life`）。
+
+    ⚠️ 变异反证：把 `commit_categories` 里的顺序换回"先剪枝、后写文件"
+    ⇒ 本条**必红**（条目显示裸 slug `academic`）。
+    """
+    from vigil import categories as categories_mod
+
+    c = client_factory()
+    item_id = client_factory.item_ids[0]          # raw kind = academic
+    assert c.delete("/api/categories/academic?migrate_to=life").status_code == 204
+    assert c.get(f"/api/items/{item_id}").json()["kind"] == "life"
+
+    def boom(*_a, **_kw):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(categories_mod, "atomic_write_text", boom)
+    with pytest.raises(OSError):
+        c.post("/api/categories", json={"slug": "academic", "desc": "加回来"})
+
+    assert c.get(f"/api/items/{item_id}").json()["kind"] == "life", (
+        "写失败却把别名剪掉了：文件里还留着旧状态，条目却已经开始悬空"
+    )
