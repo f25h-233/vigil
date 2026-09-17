@@ -19,7 +19,7 @@ import pathlib
 import sqlite3
 from dataclasses import dataclass, field
 
-from . import media, qqdb, senders, text
+from . import groups_snapshot, media, qqdb, senders, text
 from .config import Config
 
 TABLE = "group_msg_table"
@@ -349,6 +349,33 @@ def export(config: Config, key: str, *, on_progress=print) -> ExportStats:
             sender_map = {}
         n_senders = _write_senders(out, {g.id for g in config.enabled_groups}, sender_map)
         on_progress(f"发信人姓名：{n_senders:,} 人（来自 group_member3）")
+
+        # ⚠️ 顺手刷新群清单快照（M6 T4）。**必须查全库**而不是只列已纳群：
+        # 那个页面的用途正是「从库里挑一个还没纳的群加进来」，只列已纳的
+        # 等于把功能砍掉。
+        # ⚠️ 走 `list_group_message_counts` 的索引查询，实测**不触发表扫描**、
+        # 不受坏页影响（`qqdb.py:94-99` 的 docstring 记着这件事）。
+        # ⚠️ 这段**必须放在上面取发信人姓名之后**：`gi_clear` 只在那个 `try` 里
+        # 被绑定，而「取不到名字」走的是 `except` 分支 ⇒ 它**从头到尾没被定义过**。
+        # 下面的 `except Exception` 会一并吞掉 `NameError`（它继承自 `Exception`），
+        # 这是**刻意**的：群名缺失是正常状态（`group_info.db` 可能落后于
+        # `nt_msg.db`）。但外层**不许**写成裸 `except:`——那会连 `KeyboardInterrupt`
+        # 一起吞掉。
+        # ⚠️ 失败只警告不中断：快照是增强项，export 的主业是把消息导出来。
+        try:
+            counts = qqdb.list_group_message_counts(src)
+            names: dict[str, str] = {}
+            try:
+                names = qqdb.group_names(qqdb.open_group_info(gi_clear, key))
+            except Exception:  # noqa: BLE001 — 群名是锦上添花；gi_clear 未定义也走这支
+                names = {}
+            groups_snapshot.write(
+                groups_snapshot.collect(counts, names),
+                groups_snapshot.default_path(config),
+            )
+            on_progress(f"群清单快照：{len(counts)} 个群")
+        except Exception as exc:  # noqa: BLE001 — 增强项，不该拖垮导出
+            on_progress(f"[警告] 群清单快照写不出去：{str(exc)[:80]}")
 
         # 本地图片缓存索引：只扫一次，所有群共用。图片是增强项，取不到不拖垮导出。
         #

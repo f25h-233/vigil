@@ -24,7 +24,7 @@ from types import SimpleNamespace
 import pytest
 from fastapi.testclient import TestClient
 
-from vigil import digest, overrides, store
+from vigil import digest, overrides, qqdb, store
 from vigil.api import create_app
 from vigil.config import Config, Group
 
@@ -287,3 +287,134 @@ def test_http_write_endpoints_drive_both_consumers(scene, monkeypatch):
         con.close()
     assert got.get(2) == "academic", "HTTP 端点改的类目没进日报的读取路径"
     assert 1 not in got, "被端点软删的条目还在日报的读取路径里"
+
+
+# ── M6 T4：Web 侧**一个文件都不许**在 `data/` 下新增（D11 的完整版）───────
+#
+# 既有的主库指纹守卫在 `tests/test_api.py`（`test_write_kind_does_not_touch_vigil_db`
+# 那三条），它们只盯 `data/vigil.db` 与它的 `-wal`。spec §8 白纸黑字说旧表述
+# 「挡不住『我可以写 `data/cache/` 啊』」，而 §1.6 那个地雷**正是这个形状**
+# （`cmd_groups` 的实现经 `strip_fake_header` 写 `data/cache/nt_msg_clear.db`）。
+# 所以判据升级成「`data/` 下的**文件集合**不变」。
+
+
+def _make_qq_lib(qq_dir: pathlib.Path) -> None:
+    """造一个「带 1024 字节假头」的假 QQ 库（`strip_fake_header` 的输入形状）。
+
+    ⚠️ **不是装饰**：下面那条守卫的变异反证是「让 `api_groups` 去调
+    `qqdb.strip_fake_header(config.qq_db_dir / "nt_msg.db", …)`」，而
+    `strip_fake_header` 的**第一件事**是 `src.is_file()`——源文件不存在时它
+    在写任何东西**之前**就抛 `QQDBError`。也就是说，少了这份假库，那个变异
+    **永远落不了盘**、守卫**永远是绿的**（E4/E5 的形态：变异体没落在被测代码的
+    执行路径上，看起来像证据、其实是空的）。有了它，变异才真的写得出东西。
+    """
+    qq_dir.mkdir(parents=True, exist_ok=True)
+    (qq_dir / "nt_msg.db").write_bytes(
+        qqdb._FAKE_HEADER_MAGIC
+        + b"\x00" * (qqdb.FAKE_HEADER_SIZE - len(qqdb._FAKE_HEADER_MAGIC))
+        + b"\x00" * 512
+    )
+
+
+@pytest.fixture
+def data_root(tmp_path, monkeypatch):
+    """`data/` 的替身（含一份可用的主库）+ 把 `api.REPO_ROOT` 挪到 tmp。
+
+    ⚠️ **两件事必须同时做**，否则守卫是空的：`api.config_path()` **每次现读**
+    `api.REPO_ROOT`，不挪的话 `/api/groups` 拿到的 `current_config()` 来自
+    **仓库里真实的** `config/groups.toml` ⇒ 它的 `output_db.parent` 是真实的
+    `data/`，而用例量的却是这个 tmp 根——「被测端点只碰 tmp」这个前提直接不成立，
+    断言却照样可能绿。
+    """
+    from vigil import api as _api
+
+    root = tmp_path / "fake_root"
+    (root / "config").mkdir(parents=True)
+    data = tmp_path / "data"
+    data.mkdir()
+    qqdb_dir = tmp_path / "qqdb"
+    _make_qq_lib(qqdb_dir)
+    (root / "config" / "groups.toml").write_text(
+        "[settings]\n"
+        # ⚠️ 绝对 + posix：相对路径的解析基准是 `config.REPO_ROOT`（那个全局
+        # 没被挪走），反斜杠则是 TOML 基本字符串里的转义字符。
+        f'qq_db_dir = "{qqdb_dir.as_posix()}"\n'
+        f'output_db = "{(data / "vigil.db").as_posix()}"\n'
+        "\n"
+        "[[groups]]\n"
+        f"id = {GID}\n"
+        'name = "测试群"\n'
+        "enabled = true\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(_api, "REPO_ROOT", root)
+
+    # 一个真库文件 + 一条 item（带源消息）：让 `/api/items/1/kind` 真的走完
+    # 写路径而不是 404 提前返回——否则「跑一遍所有写端点」是句空话。
+    db = data / "vigil.db"
+    conn = sqlite3.connect(str(db))
+    try:
+        store.ensure_schema(conn)
+        conn.executescript(_MESSAGE_TABLES_DDL)
+        conn.execute(
+            "INSERT INTO items (item_id, kind, title, detail, event_ts, deadline_ts,"
+            " group_id, actor_uid, place, amount, links, confidence, model, prompt_ver,"
+            " created_at) VALUES (1, 'notice', '某条', NULL, ?, NULL, ?, 'u1', NULL,"
+            " NULL, '[]', 0.9, 'm', 'v1', 1)",
+            (_D13, GID),
+        )
+        conn.execute(
+            "INSERT INTO messages (msg_id, group_id, ts, sender_uid, content)"
+            " VALUES (101, ?, ?, 'u1', '原文')",
+            (GID, _D13),
+        )
+        conn.execute("INSERT INTO item_sources (item_id, msg_id) VALUES (1, 101)")
+        conn.commit()
+    finally:
+        conn.close()
+    return data
+
+
+@pytest.fixture
+def client(data_root):
+    """跑在 tmp `data/` 上的 TestClient（配置的 `output_db` 也指向那里）。"""
+    cfg = Config(
+        qq_db_dir=data_root.parent / "qqdb",
+        output_db=data_root / "vigil.db",
+        groups=(Group(id=GID, name="测试群"),),
+    )
+    return TestClient(create_app(cfg))
+
+
+def test_no_web_endpoint_creates_anything_at_all_under_data(data_root, client):
+    """⭐ D11 的**完整**版本：Web 侧跑一遍所有写端点，`data/` 下**一个文件都不许多**。
+
+    ⚠️ 为什么不能只盯 `data/vigil.db` 的指纹（既有那条守卫做的事）：
+    spec §8 白纸黑字说旧表述「挡不住『我可以写 `data/cache/` 啊』」，
+    而 §1.6 那个地雷**正是这个形状**。所以判据必须升级成
+    「`data/` 下的文件集合不变」——新增一个文件也算违规。
+
+    ⚠️ 变异反证：让 `api_groups` 改成去调 `qqdb.strip_fake_header(...)`
+    ⇒ `data/cache/` 下多出一个文件 ⇒ 本条**必红**
+    （而只看主库指纹的那条守卫**照样绿**——这就是本条的增量）。
+    """
+    before = {p.relative_to(data_root) for p in data_root.rglob("*") if p.is_file()}
+
+    client.get("/api/groups")
+    client.post("/api/persons", json={"uin": 100000001, "label": "测试"})
+    client.delete("/api/persons/100000001")
+    client.post("/api/items/1/kind", json={"kind": "life"})
+    client.post("/api/undo", json={})
+
+    after = {p.relative_to(data_root) for p in data_root.rglob("*") if p.is_file()}
+    # ⚠️ `data/overrides.db` 是 **D11 明确允许**的例外（人工干预层），
+    # 它连同 `-wal` / `-shm` 都在允许列表里；其余一律不许新增。
+    allowed = {
+        pathlib.Path("overrides.db"),
+        pathlib.Path("overrides.db-wal"),
+        pathlib.Path("overrides.db-shm"),
+    }
+    assert after - before <= allowed, (
+        f"Web 侧往 data/ 里新增了文件：{sorted(after - before - allowed)} —— "
+        "D11 只允许写 data/overrides.db 与 config/"
+    )

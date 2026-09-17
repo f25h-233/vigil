@@ -30,7 +30,7 @@ import sqlite3
 
 import pytest
 
-from vigil import export as export_mod
+from vigil import export as export_mod, groups_snapshot
 from vigil.config import Config, Group
 
 GROUP_ID = 100
@@ -278,3 +278,41 @@ def test_a_group_with_no_messages_stays_a_success(env, monkeypatch):
     assert EMPTY_GROUP_ID not in [gid for gid, _ in stats.failed_groups]
     assert any(f"✓ {EMPTY_GROUP_ID} " in m for m in lines)
     assert stats.failed_groups == []
+
+
+# ── M6 T4：`export()` 结束时顺手刷新群清单快照 ──────────────────────
+
+
+def test_export_refreshes_the_groups_snapshot(env, monkeypatch):
+    """⭐ `export()` 结束时必须把「QQ 库里的群清单」写进快照（M6 T4）。
+
+    ⚠️ 为什么它非要有守卫：快照是 Web「配置」页**唯一**的只读数据源
+    （spec §1.6：Web 永不接触 QQ 库、不拿密钥），而它只有两条产出路径
+    （`vigil export` 与 `vigil groups`）。把其中任何一处删掉，界面就退化成
+    「还没有快照，请先跑 export」——而**没有任何测试会红**。
+
+    ⚠️ 同时钉住 `gi_clear` **未定义**那条路：本夹具的 `qq_db_dir` 里没有
+    `group_info.db` ⇒ 上面取发信人姓名那步先失败（`except` 分支），
+    `gi_clear` **从头到尾没被绑定过** ⇒ 取群名那句抛 `NameError`。
+    那条路必须只是「名字留空串」（`collect` 的契约），**不许**把整个快照
+    或整个导出拖垮——名字缺失是正常状态（`group_info.db` 可能落后于
+    `nt_msg.db`）。
+
+    变异「删掉 `export()` 里那段 `groups_snapshot.write(...)`」→ 本条红。
+    """
+    monkeypatch.setattr(
+        export_mod.qqdb,
+        "list_group_message_counts",
+        lambda conn: [(GROUP_ID, 1, 1_700_000_000)],
+    )
+    cfg = _config(env)
+
+    export_mod.export(cfg, "k-db", on_progress=lambda _m: None)
+
+    snap = groups_snapshot.load(groups_snapshot.default_path(cfg))
+    assert snap is not None, "export 没写群清单快照 ⇒ 配置页永远说「还没有快照」"
+    assert [(g.id, g.messages) for g in snap.groups] == [(GROUP_ID, 1)]
+    assert snap.groups[0].name == "", (
+        "取不到群名时必须是空串（`collect` 的契约）——写成 '?' 会让界面上的"
+        "「(无名)」看起来像一个真名字"
+    )

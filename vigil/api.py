@@ -14,13 +14,26 @@ from __future__ import annotations
 import datetime as dt
 import pathlib
 import sqlite3
+import threading
 
 from fastapi import Body, FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse, HTMLResponse
 
-from . import overrides, store
+from . import groups_snapshot, overrides, store
 from .categories import load_categories
-from .config import REPO_ROOT, Config, Person, load_persons, save_persons
+from .config import (
+    REPO_ROOT,
+    TIER_NORMAL,
+    VALID_TIERS,
+    Config,
+    ConfigError,
+    Group,
+    Person,
+    load_config,
+    load_persons,
+    save_config,
+    save_persons,
+)
 
 WEB_DIST = REPO_ROOT / "web" / "dist"
 
@@ -141,7 +154,7 @@ def create_app(config: Config) -> FastAPI:
 
     db_path = config.output_db
     db_uri = f"file:{db_path.as_posix()}?mode=ro"
-    names = {g.id: g.name for g in config.groups}
+
     cats = load_categories()
     cat_by_slug = {c.slug: c for c in cats}
 
@@ -150,6 +163,38 @@ def create_app(config: Config) -> FastAPI:
     # ⚠️ **不能**在这里调 `store.ensure_schema`——那是写 `vigil.db`，
     # 而本文件的连接是 `mode=ro`（见 connect() 的 docstring）。
     overrides.ensure_schema()
+
+    # ⚠️ **不许用 `create_app` 收到的那个 `config` 去回答「现在有哪些群」**
+    # （它在进程启动那一刻就冻住了）。网页上加了一个群之后，那个对象里没有它
+    # ⇒ 新群在信息流里显示成裸群号，而用户刚从「配置」页把它加进去、
+    # 看着自己的操作没生效。（与 `persons_path()` 同一族：路径与文件内容
+    # 都必须**每次现读**。）
+    #
+    # ⚠️ **`db_uri` 仍然用启动时那份 `config.output_db`**：改它要重启服务。
+    # 这不是妥协——`output_db` 是「这个服务读哪个库」，热切换它意味着
+    # 正在飞的请求读一半换了库，比要求重启糟得多。
+    def config_path() -> pathlib.Path:
+        return REPO_ROOT / "config" / "groups.toml"
+
+    def current_config() -> Config:
+        try:
+            return load_config(config_path())
+        except ConfigError as exc:
+            # 配置文件被手工改坏了 ⇒ 500 而不是 503：后者在浏览器里会被
+            # 读成「服务没起来」，而真相是**配置文件有语法错**，方向完全不同。
+            raise HTTPException(
+                status_code=500, detail=f"config/groups.toml 读不出来：{exc}"
+            )
+
+    # ⚠️ 进程内的写锁。`save_config` 是**整体替换**（读 → 改 → 写），
+    # 两个并发请求各自读到旧版本、各自 append、后写的赢 ⇒ **丢一个群**。
+    # 单用户自用下概率低，但 spec §6 R10 明说「不能因为概率低就不做原子写」——
+    # 而这里的代价只是一把 `threading.Lock`。
+    # ⚠️ 它是**进程内**的：本服务只有一个 uvicorn worker（`uvicorn.run(app, ...)`
+    # 不带 workers 参数），所以够用。跨进程那把是 `lock.SingleInstance`，
+    # 它保护的是 QQ 库与主库，**语义不同、别混用**：CLI 拿不到锁时会拒绝运行，
+    # 而 Web 不该因为「任务计划在跑」就整个不能保存配置。
+    write_lock = threading.Lock()
 
     def persons_path() -> pathlib.Path:
         """⚠️ 路径**每次现读** `REPO_ROOT` 全局，不许在 `create_app` 时算好冻进闭包。
@@ -169,7 +214,19 @@ def create_app(config: Config) -> FastAPI:
         # 建表/重建索引属于写路径（refine / digest），不归这里。
         return sqlite3.connect(db_uri, uri=True)
 
-    def item_out(it: store.ApiItem) -> dict:
+    def group_names_map() -> dict[int, str]:
+        """群号 → 群名，**每次现读**（与 `current_config()` 同一族，M6 T4）。
+
+        ⚠️ **不许用 `create_app` 收到的那份 `config`**：它冻在启动那一刻，
+        而「配置」页可以让用户随时改群名 / 停用 / 加群 —— 冻住的话，刚加的群
+        在信息流里显示成裸群号，用户看着自己的操作没生效。
+
+        ⚠️ 只在**端点入口**读一次、再传进 `item_out`：列表接口一页 50 条，
+        写在 `item_out` 里就是 50 次读同一份 3KB 的 TOML。
+        """
+        return {g.id: g.name for g in current_config().groups}
+
+    def item_out(it: store.ApiItem, names: dict[int, str]) -> dict:
         cat = cat_by_slug.get(it.kind)
         return {
             "item_id": it.item_id,
@@ -227,6 +284,7 @@ def create_app(config: Config) -> FastAPI:
         # since/until 都按**包含该日**理解：内部窗口右端取次日 00:00（左闭右开）。
         # 否则选了 9/13 却搜不到 9/13 当天，是最容易让人不信任搜索的错法。
         q = (q or "").strip()
+        names = group_names_map()
         con = connect()
         try:
             items, total = store.search_items(
@@ -243,7 +301,7 @@ def create_app(config: Config) -> FastAPI:
         finally:
             con.close()
         return {
-            "items": [item_out(it) for it in items],
+            "items": [item_out(it, names) for it in items],
             # ⚠️ total 是**符合筛选条件的总数**，与 limit/offset 无关（不是当页条数）。
             # 前端三处依赖它：分页按钮出不出、「共 N 条」、「还有 N 条」。
             # store.search_items 已经把两者一起返回，这里照传即可。
@@ -254,12 +312,13 @@ def create_app(config: Config) -> FastAPI:
 
     @app.get("/api/items/{item_id}")
     def api_item(item_id: int) -> dict:
+        names = group_names_map()
         con = connect()
         try:
             it = store.get_item(con, item_id)
             if it is None:
                 raise HTTPException(status_code=404, detail=f"没有这条条目：{item_id}")
-            payload = item_out(it)
+            payload = item_out(it, names)
             payload["sources"] = [
                 {
                     "msg_id": s.msg_id,
@@ -427,6 +486,162 @@ def create_app(config: Config) -> FastAPI:
         save_persons(people, path)
         return None
 
+    # ── 群：清单走只读快照（M6 T4 / spec §1.6），增删改走 groups.toml ──────
+
+    @app.get("/api/groups")
+    def api_groups() -> dict:
+        """QQ 库里的群清单 —— **只读快照**（M6 T4 / spec §1.6）。
+
+        ⚠️ 本端点**绝不接触 QQ 库、绝不写 `data/cache/`、也不需要数据库密钥**。
+        它读的是 `vigil export` / `vigil groups` 预生成的
+        `data/groups-snapshot.json`。理由与代价都写在 `groups_snapshot`
+        模块的 docstring 里，改这里之前先读它。
+        """
+        cfg = current_config()
+        snap = groups_snapshot.load(groups_snapshot.default_path(cfg))
+        watched = {g.id: g for g in cfg.groups}
+        if snap is None:
+            # ⚠️ **明说**，绝不回一个空列表：空列表会被读成
+            # 「你的 QQ 库里一个群都没有」——一句假话，而且是最容易让人
+            # 不再信任这个页面的那种（「只说自己有资格说的话」）。
+            return {
+                "available": False,
+                "reason": (
+                    "还没有群清单快照。请先在仓库根目录跑一次 "
+                    "`uv run vigil export`（或 `uv run vigil groups`）——"
+                    "它会把 QQ 库里所有群的清单写成 data/groups-snapshot.json。"
+                    "本服务只读那份产物，不直接读 QQ 库。"
+                ),
+                "generated_at": None,
+                "groups": [],
+            }
+        return {
+            "available": True,
+            "reason": "",
+            "generated_at": snap.generated_at,
+            "groups": [
+                {
+                    "id": g.id,
+                    "name": g.name,
+                    "messages": g.messages,
+                    "last_ts": g.last_ts,
+                    "watched": g.id in watched and watched[g.id].enabled,
+                    "known": g.id in watched,
+                }
+                for g in snap.groups
+            ],
+        }
+
+    @app.post("/api/groups", status_code=201)
+    def api_add_group(body: dict = Body(...)) -> dict:
+        """新增一个监视群，落盘到 `config/groups.toml`（原子、整体替换）。
+
+        ⚠️ **群号必须在这里挡死 `bool`**（`isinstance(True, int)` 为真）：
+        `save_config` 里的 `toml_int` 拦不住它——到那时 id 已经是 `True`、
+        写出去是 `true`，读回来是 `1`。**闸必须在入口。**
+        （与 M5 终审 #22「`uin = true` 被接受」是同一个形状。）
+        """
+        gid = body.get("id")
+        if isinstance(gid, bool) or not isinstance(gid, int) or gid <= 0:
+            raise HTTPException(
+                status_code=400,
+                detail="群号必须是正整数（拒绝 true：bool 是 int 的子类，会静默变成 1）",
+            )
+        name = str(body.get("name", "")).strip()
+        if not name:
+            raise HTTPException(status_code=400, detail="群名不能为空")
+        _reject_controls(name, "name")
+        tier = str(body.get("tier", TIER_NORMAL))
+        if tier not in VALID_TIERS:
+            raise HTTPException(
+                status_code=400, detail=f"tier 只能是 {sorted(VALID_TIERS)}，收到：{tier!r}"
+            )
+
+        path = config_path()
+        with write_lock:
+            cfg = current_config()
+            if any(g.id == gid for g in cfg.groups):
+                raise HTTPException(status_code=409, detail=f"群 {gid} 已经在配置里了")
+            save_config(
+                Config(
+                    qq_db_dir=cfg.qq_db_dir,
+                    output_db=cfg.output_db,
+                    groups=cfg.groups + (Group(id=gid, name=name, tier=tier),),
+                ),
+                path,
+            )
+        return {"id": gid, "name": name, "tier": tier}
+
+    @app.patch("/api/groups/{gid}")
+    def api_patch_group(gid: int, body: dict = Body(...)) -> dict:
+        """改一个已配群的名字 / 启停 / 档位。**不做删除**（见下）。"""
+        path = config_path()
+        with write_lock:
+            cfg = current_config()
+            old = next((g for g in cfg.groups if g.id == gid), None)
+            if old is None:
+                raise HTTPException(status_code=404, detail=f"配置里没有群 {gid}")
+
+            name = old.name
+            if "name" in body:
+                name = str(body["name"]).strip()
+                if not name:
+                    raise HTTPException(status_code=400, detail="群名不能为空")
+                _reject_controls(name, "name")
+            enabled = old.enabled
+            if "enabled" in body:
+                if not isinstance(body["enabled"], bool):
+                    raise HTTPException(status_code=400, detail="enabled 必须是布尔值")
+                enabled = body["enabled"]
+            tier = old.tier
+            if "tier" in body:
+                tier = str(body["tier"])
+                if tier not in VALID_TIERS:
+                    raise HTTPException(
+                        status_code=400, detail=f"tier 只能是 {sorted(VALID_TIERS)}"
+                    )
+
+            updated = Group(id=gid, name=name, enabled=enabled, tier=tier)
+            groups = tuple(updated if g.id == gid else g for g in cfg.groups)
+            save_config(
+                Config(qq_db_dir=cfg.qq_db_dir, output_db=cfg.output_db, groups=groups),
+                path,
+            )
+        return {"id": gid, "name": name, "enabled": enabled, "tier": tier}
+
+    @app.delete("/api/groups/{gid}", status_code=204)
+    def api_delete_group(gid: int) -> None:
+        """从配置里删掉一个群。
+
+        ⚠️ **拒绝删掉最后一个群**：`load_config` 把「一个群都没配」判成
+        配置错误 ⇒ 删掉它 = **把这个服务改成起不来**，而且下一次启动才现形，
+        那时用户已经在网页上点过删除、拿到了「成功」。
+        ⚠️ 正确动作是 `enabled = false`（保留配置、保留已导出的历史），
+        **detail 里必须说清这一点**——只回一句「不能删」是没用的。
+        """
+        path = config_path()
+        with write_lock:
+            cfg = current_config()
+            if not any(g.id == gid for g in cfg.groups):
+                raise HTTPException(status_code=404, detail=f"配置里没有群 {gid}")
+            remaining = tuple(g for g in cfg.groups if g.id != gid)
+            if not remaining:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "这是最后一个群，删掉它会让配置变成「一个群都没配」——"
+                        "而那是致命的配置错误，下次启动服务会直接起不来。"
+                        "要停掉它请改用 enabled = false（保留配置与已导出的历史）。"
+                    ),
+                )
+            save_config(
+                Config(
+                    qq_db_dir=cfg.qq_db_dir, output_db=cfg.output_db, groups=remaining
+                ),
+                path,
+            )
+        return None
+
     @app.get("/api/digests")
     def api_digests(limit: int = Query(30, ge=1, le=MAX_LIMIT)) -> dict:
         con = connect()
@@ -452,6 +667,7 @@ def create_app(config: Config) -> FastAPI:
 
     @app.get("/api/digests/{digest_id}")
     def api_digest(digest_id: int) -> dict:
+        names = group_names_map()
         con = connect()
         try:
             row = store.get_digest(con, digest_id)
@@ -468,7 +684,7 @@ def create_app(config: Config) -> FastAPI:
             "created_at": row.created_at,
             "item_count": row.item_count,
             "body_md": row.body_md,
-            "items": [item_out(it) for it in items],
+            "items": [item_out(it, names) for it in items],
         }
 
     # ⚠️ **不要**用 `app.mount("/assets", StaticFiles(...))` 那一套。

@@ -16,7 +16,7 @@ import sqlite3
 import pytest
 from fastapi.testclient import TestClient
 
-from vigil import store
+from vigil import groups_snapshot, store
 from vigil.api import create_app
 from vigil.config import Config, Group
 
@@ -1388,3 +1388,188 @@ def test_types_ts_item_fields_match_the_frozen_api_contract():
     assert _ts_type_fields("Source") == {
         "msg_id", "ts", "sender", "group_name", "content",
     }
+
+
+# ── M6 T4：群清单（只读快照）+ 加群/改群/退群 ──────────────────────
+#
+# ⚠️ 夹具与既有的 `client` **同一套构造方式**（`_config_for` 式的 Config +
+# `TestClient(create_app(...))`），只多两件事：
+#   ① 把 `api.REPO_ROOT` 挪到 tmp —— `config_path()` **每次现读**这个全局
+#      （`config.DEFAULT_CONFIG` 是 import 期冻住的常量，monkeypatch 够不着）；
+#   ② 可选地预置一份群清单快照。
+#
+# ⚠️ 不挪 REPO_ROOT 的话 `/api/groups` 读的是**仓库里真实的**
+# `config/groups.toml` 与 `data/groups-snapshot.json` —— 测试会跟着用户的
+# 真实配置红绿，而那份配置恰恰是 M6 邀请用户在网页上改的东西。
+
+_GROUPS_TOML = """\
+[settings]
+qq_db_dir = "{qq}"
+output_db = "{out}"
+
+[[groups]]
+id = 111
+name = "甲群"
+enabled = true
+"""
+
+# 「QQ 库里的群」：111 已纳入（config 里有），222 没有。
+_QQ_GROUPS = (
+    groups_snapshot.GroupInfo(id=111, name="甲群", messages=10, last_ts=1_700_000_000),
+    groups_snapshot.GroupInfo(id=222, name="乙群", messages=0, last_ts=0),
+)
+
+
+def _groups_root(tmp_path, monkeypatch, *, snapshot):
+    """造一个 tmp「仓库根」+ 一份 `groups.toml` +（可选）一份快照。
+
+    返回一个**工厂**：每次调用都造一个全新的 app（等价于「重启服务」），
+    但共用同一个 tmp 根 —— 「落盘 ⇒ 重读仍在」要的正是这个形状。
+
+    ⚠️ 路径写成**绝对 + posix**（`as_posix()`）：相对路径的解析基准是
+    `config.REPO_ROOT`（**那个**全局没被挪走），写成相对就会指回真实仓库；
+    反斜杠则是 TOML 基本字符串里的转义字符，必须避开。
+    """
+    from vigil import api as _api
+
+    root = tmp_path / "fake_root"
+    (root / "config").mkdir(parents=True)
+    data = tmp_path / "data"
+    data.mkdir()
+    qqdb = tmp_path / "qqdb"
+    qqdb.mkdir()
+    cfg_path = root / "config" / "groups.toml"
+    cfg_path.write_text(
+        _GROUPS_TOML.format(qq=qqdb.as_posix(), out=(data / "vigil.db").as_posix()),
+        encoding="utf-8",
+    )
+    if snapshot is not None:
+        groups_snapshot.write(snapshot, data / "groups-snapshot.json", now=1_700_000_999)
+    # ⚠️ 必须在造 app 之前挪：`config_path()` 是**每次现读**这个全局的
+    monkeypatch.setattr(_api, "REPO_ROOT", root)
+    cfg = Config(
+        qq_db_dir=qqdb,
+        output_db=data / "vigil.db",
+        groups=(Group(id=111, name="甲群"),),
+    )
+
+    def make() -> TestClient:
+        return TestClient(create_app(cfg))
+
+    return make
+
+
+@pytest.fixture()
+def client_no_snapshot(tmp_path, monkeypatch):
+    """没有任何快照的 app：`data/` 下只有那份 config（没有 `groups-snapshot.json`）。"""
+    return _groups_root(tmp_path, monkeypatch, snapshot=None)()
+
+
+@pytest.fixture()
+def client_with_snapshot(tmp_path, monkeypatch):
+    """快照里有 111（已纳入）与 222（未纳入）。"""
+    return _groups_root(tmp_path, monkeypatch, snapshot=_QQ_GROUPS)()
+
+
+@pytest.fixture()
+def client_factory(tmp_path, monkeypatch):
+    """可反复造新 app 的工厂（同一个 tmp 根）。
+
+    ⚠️ 快照里多一个 333：它在「QQ 库」里但**不在** config 里 —— 正是
+    「还没纳入、等着被加进来」的形状。「加群 ⇒ 重启后仍在」那条用例要靠它。
+    """
+    return _groups_root(
+        tmp_path,
+        monkeypatch,
+        snapshot=(
+            *_QQ_GROUPS,
+            groups_snapshot.GroupInfo(id=333, name="丙群", messages=1, last_ts=1),
+        ),
+    )
+
+
+def test_api_groups_says_so_when_there_is_no_snapshot(client_no_snapshot):
+    """⭐ 没有快照时**明说**，不许回一个空列表。
+
+    ⚠️ 空列表会被读成「你的 QQ 库里一个群都没有」——一句**假话**，
+    而且是最容易让人不再信任这个页面的那种假话（本项目的
+    「只说自己有资格说的话」判据，M2 起立下的规矩）。
+    """
+    r = client_no_snapshot.get("/api/groups")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["available"] is False
+    assert "export" in body["reason"]
+
+
+def test_api_groups_reads_the_snapshot_and_marks_watched(client_with_snapshot):
+    body = client_with_snapshot.get("/api/groups").json()
+    assert body["available"] is True
+    by_id = {g["id"]: g for g in body["groups"]}
+    assert by_id[111]["watched"] is True
+    assert by_id[222]["watched"] is False
+    assert by_id[111]["messages"] == 10
+    assert body["generated_at"] > 0
+
+
+def test_api_add_group_persists_and_is_visible_after_reload(tmp_path, client_factory):
+    """⭐ **出口判据 1 的机械形式**：网页上加一个群 ⇒ 落盘 ⇒ **重读仍在**。
+
+    ⚠️ 「重读仍在」是判据的全部意义所在：只断言响应体的话，
+    一个"内存里加了、磁盘上没写"的实现照样绿——而它在重启后**静默消失**，
+    用户要到下次开机才发现。
+
+    ⚠️ **对本条的一处实际修正**（brief 原稿读 `body["watched"]`）：`/api/groups`
+    的响应**没有**那个顶层键——契约是 `available` / `reason` / `generated_at` /
+    `groups`（计划 T10 的 `GroupsResponse`，与 Step 5d 的实现一致）。
+    这里改成「快照里那个群（333）在新 app 里**变成 watched**」：同样是
+    「新进程从磁盘读到了刚写的配置」的机械形式，且比读文件文本更接近
+    用户在页面上看到的东西。
+    """
+    c = client_factory()
+    r = c.post("/api/groups", json={"id": 333, "name": "丙群", "tier": "high"})
+    assert r.status_code == 201
+    # 换一个**全新的 app**（等价于重启）后再读
+    c2 = client_factory()
+    body = c2.get("/api/groups").json()
+    assert any(g["id"] == 333 and g["watched"] for g in body["groups"])
+
+
+def test_api_add_group_rejects_a_duplicate(client_factory):
+    c = client_factory()
+    assert c.post("/api/groups", json={"id": 111, "name": "重复"}).status_code == 409
+
+
+def test_api_add_group_rejects_a_bad_tier(client_factory):
+    c = client_factory()
+    assert c.post("/api/groups", json={"id": 444, "name": "群", "tier": "boss"}).status_code == 400
+
+
+def test_api_add_group_rejects_a_bool_id(client_factory):
+    """`true` 是 `int` 的子类 ⇒ `isinstance(True, int)` 为真。
+
+    ⚠️ 不挡的话会建出一个群号为 1 的条目——与 M5 终审 #22 是同一个形状，
+    而这里连 `toml_int` 都拦不住（它在 `save_config` 里，那时 id 已经是
+    `True`、写出去是 `true`）。**闸必须在入口。**
+    """
+    c = client_factory()
+    assert c.post("/api/groups", json={"id": True, "name": "群"}).status_code == 400
+
+
+def test_api_delete_group_refuses_the_last_one(client_factory):
+    """⚠️ 退掉最后一个群 = 把程序改成起不来（`load_config` 判「一个群都没配」）。
+
+    ⚠️ 正确动作是 `enabled = false`，接口要在 detail 里**说清这一点**。
+    """
+    c = client_factory()  # 夹具只配了一个群
+    r = c.delete("/api/groups/111")
+    assert r.status_code == 409
+    assert "enabled" in r.json()["detail"]
+
+
+def test_api_patch_group_disables_without_deleting(client_factory):
+    c = client_factory()
+    assert c.patch("/api/groups/111", json={"enabled": False}).status_code == 200
+    body = c.get("/api/groups").json()
+    assert all(not g["watched"] for g in body["groups"])
+    assert any(g["id"] == 111 for g in body["groups"]), "停用不是删除——条目还在"

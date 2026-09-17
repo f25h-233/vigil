@@ -114,6 +114,55 @@ def _isolate_llm_toml_path(tmp_path_factory, monkeypatch):
     )
 
 
+@pytest.fixture(autouse=True)
+def _isolate_api_repo_root(tmp_path_factory, monkeypatch):
+    """把 `api.config_path()`（Web 侧**现读**的 `groups.toml`）的解析根挪出仓库。
+
+    ⚠️ 与 `_isolate_llm_toml_path` 是**同一族**（M6 T4）；形态更险一点：
+    那边只是读文件，这边除了读，`load_config` 还要 `qq_db_dir.is_dir()`——
+    那是个**外部**目录（QQ 的安装位置），换台机器、换个盘就没有。
+
+    ⚠️ **不隔离的后果是「一批无关用例跟着用户改配置红绿」**：M6 T4 起
+    `/api/items`、`/api/items/{id}`、`/api/digests/{id}` 经 `item_out` 现读
+    `groups.toml` 取群名（`api.current_config()`，也正是 `test_api._config_for`
+    的 docstring 早就点过的那个「假红来源」）。而那份文件**正是 M6 邀请用户
+    在网页上改的东西**：用户在「配置」页改个群名或停用群，就会让一批与群配置
+    毫无关系的用例变红。
+
+    ⚠️ **只挪根、不写文件**也不行：`load_config` 读不到文件抛 `ConfigError`
+    ⇒ 每个走 `/api/*` 的用例都变 500。所以这里在根下写一份**能读通的**最小配置。
+
+    ⚠️ 数据根（`output_db`）同样落在这个 tmp 根下：`groups_snapshot.default_path`
+    由它推出来（`output_db.parent / "groups-snapshot.json"`），
+    于是「快照会被写到哪里」也一并隔离，不会碰到仓库里真实的 `data/`。
+
+    ⚠️ 路径写**绝对 + posix**：相对路径的解析基准是 `config.REPO_ROOT`
+    （**那个**全局没被挪走），而反斜杠是 TOML 基本字符串里的转义字符。
+
+    ⚠️ 用 `mktemp` 而不是 `tmp_path`（理由与上面两道一字不差）：
+    有些用例把 `tmp_path` 当**产品目录**用并按**文件集合**断言
+    （`tests/test_digest.py` 就是 `sorted(p.name for p in tmp_path.iterdir())`）。
+    """
+    from vigil import api as _api
+
+    root = tmp_path_factory.mktemp("api_root")
+    (root / "config").mkdir()
+    (root / "data").mkdir()
+    (root / "qqdb").mkdir()
+    (root / "config" / "groups.toml").write_text(
+        "[settings]\n"
+        f'qq_db_dir = "{(root / "qqdb").as_posix()}"\n'
+        f'output_db = "{(root / "data" / "vigil.db").as_posix()}"\n'
+        "\n"
+        "[[groups]]\n"
+        "id = 111\n"
+        'name = "隔离用群"\n'
+        "enabled = true\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(_api, "REPO_ROOT", root)
+
+
 @pytest.fixture
 def memdb():
     """内存库。用完即弃，不污染任何真实文件。

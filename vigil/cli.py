@@ -12,6 +12,7 @@ import sqlite3
 import sys
 
 from . import export as export_mod
+from . import groups_snapshot
 from . import lock, logs
 from . import qqdb, reader
 from . import refine as refine_mod
@@ -104,6 +105,18 @@ def _cmd_groups_locked(args) -> int:
         names = qqdb.group_names(qqdb.open_group_info(gi_clear, key))
     except Exception as exc:  # noqa: BLE001 — 群名缺失不该让 listing 失败
         print(f"[警告] 群名读取失败（不影响群号）：{str(exc)[:70]}\n", file=sys.stderr)
+
+    # ⚠️ 顺手写快照（M6 T4）：Web 的「配置」页只读这个文件，永远不碰 QQ 库。
+    # ⚠️ 失败**只警告不中断**：快照是增强项，而 `vigil groups` 的主业是
+    # 把那张家底表打到屏幕上（人工排障时最需要的东西）。
+    try:
+        snap_path = groups_snapshot.write(
+            groups_snapshot.collect(counts, names),
+            groups_snapshot.default_path(config),
+        )
+        print(f"[快照] 已写 {snap_path}", file=sys.stderr)
+    except OSError as exc:
+        print(f"[警告] 群清单快照写不出去（不影响上面的列表）：{exc}", file=sys.stderr)
 
     watched = {g.id for g in config.enabled_groups}
     known = {g.id for g in config.groups}
