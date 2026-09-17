@@ -1082,12 +1082,22 @@ def cmd_config_import(args) -> int:
         )
         return 0
 
-    report = configpack.import_pack(
-        pack,
-        keep_settings=args.keep_settings,
-        paths=_config_pack_paths(),
-        on_progress=logs.emit,
-    )
+    # ⚠️ **这是一条写命令**（一次写三份配置），所以要上锁——与 `export` /
+    # `refine` / `digest` / `daily` / `repass --apply` 同一条规矩（M4 审 F4）。
+    # ⚠️ 退出码 2 的语义与其它写命令一字不差：**「上一次还没跑完，等着就行」**
+    # 与「这次跑失败了」是两回事——无人值守时后者才要人来看（计划 §三 3.4）。
+    # ⚠️ 撞车时**一个字节都不许写**：先写再报 2 会留下半新半旧的配置。
+    try:
+        with lock.SingleInstance():
+            report = configpack.import_pack(
+                pack,
+                keep_settings=args.keep_settings,
+                paths=_config_pack_paths(),
+                on_progress=logs.emit,
+            )
+    except lock.AlreadyRunning as exc:
+        logs.emit(f"[跳过] {exc}")
+        return 2
     return 0 if (report.groups or report.categories) else 1
 
 

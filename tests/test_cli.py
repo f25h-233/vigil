@@ -1605,3 +1605,74 @@ def test_config_export_survives_an_overlay_db_that_predates_the_alias_table(
     tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
     conn.close()
     assert "kind_alias" in tables, "补表没生效——下一次导出还会踩同一颗雷"
+
+
+# ── 夹具的判据（M6 T7 Fix loop 1 / I3）──────────────────────────────
+
+
+def test_cli_repo_root_is_isolated_by_conftest():
+    """⭐ **夹具的判据**：`cli.REPO_ROOT` 必须被挪出仓库，而且根下有一份能读通的配置。
+
+    ⚠️ 为什么要有这条：`cli.REPO_ROOT` 是 `cli.py` **自己**的全局名字
+    （`from .config import REPO_ROOT` 在 import 期绑定）⇒
+    `monkeypatch.setattr(config, "REPO_ROOT", …)` / 挪 `api.REPO_ROOT` 都**够不着它**。
+    不隔离时（reviewer 实测 2026-09-18）一条**不用 `pack_env`** 的用例调
+    `cli.main(["config", "import", …])` 就会写**仓库根的 `config/groups.toml`**
+    ——实测把 15 群改成 1 群、`persons.toml` 抹成 0 人，**而用例全绿**。
+    同一个根还挂着 `cmd_repass --audit` 的默认落点（真仓库的 `data/`）。
+
+    ⚠️ 三条断言各挡一种退化：
+      · **路径在仓库外** —— 挡"夹具被删掉"（本条也是 I3 的变异反证落点）；
+      · **`config/groups.toml` 存在** —— 挡"只挪根不写文件"：那样
+        `--keep-settings` 会**静默走回落分支**，一整类用例测的就成了另一支；
+      · **那份配置真能读通** —— 挡"写了个坏文件"（存在不等于合法）。
+
+    ⚠️ 本用例**只读**。
+    ⚠️ 变异反证：把 `conftest.py` 的 `_isolate_cli_repo_root` 改成空转
+    ⇒ 本条**必红**（第一条断言）。只跑本条，**绝不许跑全量**——夹具一撤，
+    别的用例就可能写进真仓库。
+    """
+    from vigil.config import REPO_ROOT, load_config
+
+    root = cli.REPO_ROOT
+    assert not root.resolve().is_relative_to(REPO_ROOT.resolve()), (
+        f"`cli.REPO_ROOT` 还指着仓库：{root}——`config import` 会写真实的 "
+        "config/groups.toml，`repass --audit` 会往真实 data/ 落文件"
+    )
+    local = root / "config" / "groups.toml"
+    assert local.is_file(), (
+        f"夹具要连 `{local}` 一起写出来：只挪根的话，`--keep-settings` 会静默"
+        "走「读不出来 ⇒ 整份用包里的」那一支，用例测的就不是它名字里那件事"
+    )
+    assert [g.id for g in load_config(local).groups] == [111], "自带的那份必须真能读通"
+
+
+def test_config_import_returns_2_when_another_instance_holds_the_lock(pack_env):
+    """⭐ Minor①：`config import` 也是**写命令**（它一次写三份配置）⇒ 要上锁。
+
+    ⚠️ 其余写命令（`export` / `refine` / `digest` / `daily` / `repass --apply`）
+    **全都取** `lock.SingleInstance`；它是本组里唯一漏掉的。与正在跑的 `daily`
+    撞车时，正确行为是**响亮地拒绝**（退出码 2 = 「上一次还没跑完，等着就行」），
+    而不是两边各写一遍配置文件。
+
+    ⚠️ 判据两条一起：**退出码 2** + **一个字都没写**（只判退出码的话，
+    "先写后报 2" 也能全绿）。
+
+    ⚠️ 变异反证：把 `cmd_config_import` 的 `with lock.SingleInstance():` 去掉
+    ⇒ 本条**必红**（第一次调用会真的写，退出码 0）。
+    """
+    from vigil import configpack, lock
+
+    src = pack_env / "pack.toml"
+    src.write_text(
+        _pack_with((configpack.Category(slug="life", label="生活", desc="生活"),)),
+        encoding="utf-8",
+    )
+    before = (pack_env / "config" / "categories.toml").read_text(encoding="utf-8")
+
+    with lock.SingleInstance(lock.LOCK_PATH):        # 「另一个实例」持着同一把锁
+        assert cli.main(["config", "import", str(src)]) == 2
+    assert (pack_env / "config" / "categories.toml").read_text(encoding="utf-8") == before, (
+        "撞车时一个字节都不许写——先写后报 2 会留下半新半旧的配置"
+    )
+    assert cli.main(["config", "import", str(src)]) == 0   # 锁放掉后照常

@@ -303,6 +303,96 @@ def _isolate_api_repo_root(tmp_path_factory, monkeypatch):
     monkeypatch.setattr(_api, "REPO_ROOT", root)
 
 
+_ISOLATED_PERSONS_TOML = """\
+[[persons]]
+uin = 10001
+label = "隔离用人物"
+"""
+
+
+@pytest.fixture(autouse=True)
+def _isolate_persons_toml_path(tmp_path_factory, monkeypatch):
+    """把 `config.DEFAULT_PERSONS` 挪到 tmp，并**自带内容**（M6 T7 Fix loop 1 / FIX 2）。
+
+    ⚠️ **为什么它必须存在**（Global Constraint 9 / 勘误 E6 的字面要求）：
+    M6 T7 给本项目添了**第一条会写 `DEFAULT_PERSONS` 的产品路径** ——
+    `vigil config import`（`cli._config_pack_paths()` 里 `persons=config.DEFAULT_PERSONS`）。
+    而 `save_persons` 是**整体替换**写（那是它刻意的语义：不整体替换就删不掉人）
+    ⇒ 没有这道夹具时，任何一个"忘了 monkeypatch 就直接
+    `cli.main(["config", "import", …])`"的用例，都会把**用户真实的
+    `config/persons.toml`**（真数据，而且 `config/` 要进 git）整体覆盖掉。
+    那与 `_isolate_api_repo_root` 记的那次「测试往真仓库写人」是**同一条链**。
+
+    ⚠️ **内容自带、不指向不存在的路径**（与 `_isolate_llm_toml_path` **刻意相反**）：
+    `load_persons` 对"文件不存在"返回**空元组**，而那是个**合法语义**
+    （"一个人都没监视"）⇒「夹具没生效」与「夹具生效且名单为空」在断言层面
+    **完全同形**。写一份非空的，`test_config.py::test_default_persons_path_
+    is_isolated_by_conftest` 才能反过来把**夹具本身**钉住。
+    内容**自带**、不抄仓库里那份真名单（理由同 `_isolate_categories_toml_path`：
+    抄一份等于把"测试红绿取决于用户的名单"这件事留着）。
+
+    ⚠️ 用 `mktemp` 而不是 `tmp_path`（理由与上面几道一字不差）：
+    有些用例把 `tmp_path` 当**产品目录**用并按**文件集合**断言
+    （`tests/test_digest.py` 就是 `sorted(p.name for p in tmp_path.iterdir())`）。
+
+    ⚠️ 用 autouse：漏掉一个测试文件，那个文件里的用例就退回"写用户的真名单"。
+    """
+    path = tmp_path_factory.mktemp("persons") / "persons.toml"
+    path.write_text(_ISOLATED_PERSONS_TOML, encoding="utf-8")
+    monkeypatch.setattr(config, "DEFAULT_PERSONS", path)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_cli_repo_root(tmp_path_factory, monkeypatch):
+    """把 `cli.REPO_ROOT` 挪出仓库（M6 T7 Fix loop 1 / I3）。
+
+    ⚠️ **它与 `api.REPO_ROOT` / `config.DEFAULT_PERSONS` 是同一个洞的第三个入口**：
+    `cli.py` 里 `REPO_ROOT` 是**它自己**的一个全局名字（`from .config import REPO_ROOT`
+    在 import 期绑定），所以 `monkeypatch.setattr(config, "REPO_ROOT", …)`
+    **够不着它**（`_isolate_api_repo_root` 挪的是 `api` 的那一份，同样够不着）。
+
+    ⚠️ 不隔离的后果（reviewer 实测，2026-09-18）：一条**不用 `pack_env`** 的用例
+    调 `cli.main(["config", "import", …])`，就会写**仓库根的 `config/groups.toml`**
+    ——实测把那份从 **15 群改成 1 群**、`persons.toml` 抹成 **0 人**，
+    **而用例全绿**（它断言的是它自己造的包，看不见仓库被改了）。
+    这正是 Global Constraint 9「测试不碰真实资产」的字面违反。
+
+    ⚠️ 还有一处**今天没人看**的落点：`cmd_repass` 的 `--audit` 默认路径
+    （`REPO_ROOT / "data" / f"repass-audit-{stamp}.jsonl"`，`cli.py:456`）。
+    没隔离时，任何不显式传 `--audit` 的 repass 用例都会往**真仓库的 `data/`** 里
+    落一份审计文件——那是**数据**，`data/` 不入 git、删了就没了。
+
+    ⚠️ **根下写一份能读通的 `config/groups.toml`**（照 `_isolate_api_repo_root` 的
+    同形理由）：`cmd_config_import --keep-settings` 会读它来拿"本机路径"；
+    让它**存在且合法**，`--keep-settings` 走的才是**真实的那一支**（保留本机），
+    而不是"读不出来 ⇒ 回落"的异常分支——否则一整类用例会**静默地测错分支**。
+
+    ⚠️ 路径写**绝对 + posix**：相对路径的解析基准是 `config.REPO_ROOT`
+    （**那个**全局没被挪走），而反斜杠是 TOML 基本字符串里的转义字符。
+
+    ⚠️ 用 `mktemp` 而不是 `tmp_path`（理由与上面几道一字不差）：
+    有些用例把 `tmp_path` 当**产品目录**用并按**文件集合**断言。
+    """
+    from vigil import cli as _cli
+
+    root = tmp_path_factory.mktemp("cli_root")
+    (root / "config").mkdir()
+    (root / "data").mkdir()
+    (root / "qqdb").mkdir()
+    (root / "config" / "groups.toml").write_text(
+        "[settings]\n"
+        f'qq_db_dir = "{(root / "qqdb").as_posix()}"\n'
+        f'output_db = "{(root / "data" / "vigil.db").as_posix()}"\n'
+        "\n"
+        "[[groups]]\n"
+        "id = 111\n"
+        'name = "隔离用群"\n'
+        "enabled = true\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(_cli, "REPO_ROOT", root)
+
+
 @pytest.fixture(autouse=True)
 def _isolate_jobs_registry(monkeypatch):
     """每个用例一份**全新的**后台 job 注册表（M6 T6；勘误 E6 点名要一并考虑的那件）。

@@ -309,3 +309,196 @@ def test_import_prunes_an_alias_that_shadows_a_live_slug(roots):
         f"别名表里有 old_kind ∈ 现存 slug 的行：{sorted(set(aliases) & live)}——"
         "`ka2` 会把用户手工选的合法类目顶掉"
     )
+
+
+@pytest.mark.parametrize("shape", ["missing", "corrupt"])
+def test_keep_settings_says_so_when_the_local_settings_cannot_be_kept(roots, shape):
+    """⭐ FIX 1（controller 裁定）：`--keep-settings` **保不住**本机设置时**必须出声**。
+
+    ⚠️ 被裁定掉的写法是"静默采用包里的 `[settings]`"：用户勾了「保留本机路径」，
+    拿到的却是**别台机器的 `qq_db_dir`**，而**全程零提示**——他会在下一次
+    `vigil export` 才撞上「QQ 数据库目录不存在」，而且**看不出为什么**。
+    （本项目的立场：宁可响亮，不许静默退化；"只说自己有资格说的话"。）
+
+    ⚠️ **但也不许改成"拒绝导入"**（那是另一条更容易走错的路）：包里的
+    群/类目/人物仍然是用户想要的。**要的是把话说出来，不是把事拦住**——
+    所以下面同时断言「它确实写了包里的 settings」（行为不变）。
+
+    ⚠️ 两种形状一起参数化，因为有**两句**不同的原因必须都能说出来：
+      · `missing` —— 第一次导入，本机还没有那份文件；
+      · `corrupt` —— 手改笔误（`[groups]` 单层方括号是极常见的一种）。
+    只测其中一种的话，另一种可以退化成"没有理由的一句话"而不被发现。
+
+    ⚠️ 变异反证：把 `import_pack` 那一支里的 `on_progress(...)` 删掉 ⇒ 本条**必红**。
+    """
+    a, b = roots
+    _seed(a)
+    assert not b.groups.exists(), "B 根上**故意**没有 groups.toml（shape=missing）"
+    if shape == "corrupt":
+        # 单层方括号：一份"语法合法、形状错"的本机配置（真机上极常见的笔误）
+        b.groups.write_text(
+            f'[settings]\nqq_db_dir = "{b.qq.as_posix()}"\n'
+            f'output_db = "{(b.base / "data" / "vigil.db").as_posix()}"\n\n'
+            '[groups]\nid = 999\nname = "本机群"\n',
+            encoding="utf-8",
+        )
+
+    pack_path = a.base / "pack.toml"
+    configpack.write_pack(
+        pack_path, config=config.load_config(a.groups),
+        cats=categories.load_categories(a.cats),
+        persons=config.load_persons(a.persons), aliases=(),
+    )
+    parsed = configpack.parse(pack_path.read_text(encoding="utf-8"), pack_path)
+
+    lines: list[str] = []
+    report = configpack.import_pack(
+        parsed, keep_settings=True,
+        paths=configpack.Paths(groups=b.groups, categories=b.cats, persons=b.persons),
+        on_progress=lines.append,
+    )
+
+    assert report.settings_skipped is False, (
+        "⭐ I4：`settings_skipped` 只有在**真的跳过**了本机 [settings] 时才为 True。"
+        "这一支明明把包里的（外机的）settings 写进去了，报 True 是**一句假话**"
+        "——用户会以为「保留本机路径」生效了。"
+    )
+    assert report.warnings, (
+        "那句话必须**同时**进 `ImportReport`：CLI 靠 on_progress 看见它，"
+        "而 API 一侧没有 stdout，只能靠这个字段回到响应体"
+    )
+    text = "\n".join(lines)
+    assert "保留" in text or "没能" in text, f"一句话都不说：{text!r}"
+    assert a.qq.as_posix() in text or str(a.qq) in text, (
+        f"必须**点名**它到底采用了哪个 qq_db_dir（那是导出那台机器的）——实际：{text!r}"
+    )
+    assert "手工" in text or "修好" in text, (
+        f"措辞要能让人行动（怎么才能用上本机路径）——实际：{text!r}"
+    )
+
+    # 行为不变：本机那份读不出来 ⇒ 只能整份用包里的（**不是**拒绝导入）
+    assert config.load_config(b.groups).qq_db_dir == a.qq
+    assert [g.id for g in config.load_config(b.groups).groups] == [111, 222]
+
+
+# ── Fix loop 1：I1 / I2 —— parse 的对外契约（**任何问题都抛 ConfigError**）──
+#
+# ⚠️ 这几条钉的是同一件事的三个入口：`parse` 接的是**用户拷来拷去的文件**，
+# 所以它的每一种"看不懂"都必须以 `ConfigError` 收场——那是 `api_import_pack`
+# （→400）与 `cmd_config_import`（→一行 `[配置错误]`）唯一认得的东西。
+# 这正是 C6 的形状（groups 已经 400 了，categories / 顶层键 / 别名环没跟上）。
+
+
+def _pack_text(root, *, categories=(), aliases=(), top_extra="", persons_key="persons"):
+    """拼一份**手写**的包文本（不走 `build`——本组要造的是 build 造不出的坏形状）。"""
+    lines = ["schema = 1"]
+    if top_extra:
+        lines.append(top_extra)
+    lines += [
+        "",
+        "[settings]",
+        f'qq_db_dir = "{root.qq.as_posix()}"',
+        f'output_db = "{(root.base / "data" / "vigil.db").as_posix()}"',
+        "",
+        "[[groups]]",
+        "id = 111",
+        'name = "甲群"',
+        "enabled = true",
+        'tier = "normal"',
+        "",
+    ]
+    for slug, label, desc in categories:
+        lines += [
+            "[[categories]]", f'slug = "{slug}"', f'label = "{label}"', f'desc = "{desc}"', ""
+        ]
+    if persons_key is not None:
+        lines += [f"[[{persons_key}]]", "uin = 10001", 'label = "甲"', ""]
+    for old, new in aliases:
+        lines += ["[[kind_aliases]]", f'old_kind = "{old}"', f'new_kind = "{new}"', ""]
+    return "\n".join(lines)
+
+
+def test_parse_wraps_a_category_problem_in_configerror(roots):
+    """⭐ I1：坏 slug 的包 ⇒ `ConfigError`（**不是** `CategoryError`）。
+
+    ⚠️ 不转的后果（reviewer 实测）：`CategoryError` 不是 `ConfigError` 的子类，
+    而两个调用方**只捕 `ConfigError`** ⇒ API **500**、CLI **裸 traceback**。
+    这与 C6 是**同一个缺陷的另一个入口**：`groups` 已经修成 400 了，
+    `categories` 没跟上——而 `parse` 自己的 docstring 写着「任何问题都抛 ConfigError」。
+
+    ⚠️ 变异反证：把 `parse` 里那句 `except CategoryError` 的转换删掉 ⇒ 本条**必红**
+    （抛出来的会是 `CategoryError`）。
+    """
+    a, _ = roots
+    broken = _pack_text(a, categories=(("Notice", "通知", "大写 slug 不合法"),))
+    with pytest.raises(config.ConfigError, match="类目"):
+        configpack.parse(broken, pathlib.Path("cats.toml"))
+
+
+def test_parse_wraps_a_bad_alias_cycle_in_configerror(roots):
+    """⭐ I1 同族：`[[kind_aliases]]` **成环**的包必须在 `parse` 就被挡下。
+
+    ⚠️ 不挡的后果：`import_pack` 走到 `set_kind_alias` 时抛 `OverlayError`
+    ⇒ API 500 / CLI 裸 traceback。**而环是可静态检测的**——不需要真的去写一次表
+    （写一次还更糟：那会先把半张表写进去）。
+
+    ⚠️ 变异反证：把 `parse` 里那段环检测删掉 ⇒ 本条**必红**
+    （parse 会放行，而下面的 `import_pack` 抛 `OverlayError`）。
+    """
+    a, _ = roots
+    cyclic = _pack_text(
+        a,
+        categories=(("life", "生活", "生活"),),
+        aliases=(("a_kind", "b_kind"), ("b_kind", "a_kind")),
+    )
+    with pytest.raises(config.ConfigError, match="环"):
+        configpack.parse(cyclic, pathlib.Path("cyclic.toml"))
+    # 它不是"写的时候才炸"：这一句之后**没有**任何 overlay 写入发生
+    ov = _open_overlay()
+    try:
+        assert overrides.kind_aliases(ov) == {}
+    finally:
+        ov.close()
+
+
+def test_parse_rejects_an_unknown_top_level_key(roots):
+    """⭐ I2：`[[person]]`（少个 s）⇒ **响亮**，不许静默读成 0 人。
+
+    ⚠️ 实测的伤害链（reviewer 2026-09-18）：`parse` 只认 `raw.get("persons", [])`
+    ⇒ 键名拼错时读成**空元组** ⇒ `import_pack` 把本机的 `persons.toml`
+    **整体覆盖成 0 人**（`save_persons` 是整体替换写），而**全程零报错**。
+    这与 M5 那条 `_check_persons_shape`（`config.py`）是**同一个形态**，
+    而那份文件里早就立过这条规矩并写了完整论证——照它的写法与理由做。
+
+    ⚠️ 变异反证：把 `parse` 里那段顶层键校验删掉 ⇒ 本条**必红**
+    （parse 返回 `persons=()` 而不报错）。
+    """
+    a, _ = roots
+    typo = _pack_text(
+        a, categories=(("life", "生活", "生活"),), persons_key="person"
+    )
+    with pytest.raises(config.ConfigError, match="person"):
+        configpack.parse(typo, pathlib.Path("typo.toml"))
+
+
+def test_parse_rejects_a_single_bracket_section(roots):
+    """⭐ I2 的另一半：`[persons]`（**单层**方括号）必须与 `[[persons]]` 分得开。
+
+    ⚠️ 与 `config._check_persons_shape` 同形：只差一层括号，解析结果一个是 dict、
+    一个是 list；不挡的话 `for entry in …` 会去迭代 dict 的**键**（字符串），
+    下一行以一个看不懂的异常收场。
+
+    ⚠️ 但**段不在**仍然合法（"这份包不带人物"是 `build` 对空名单的正常产物，
+    见 `test_export_then_import_into_another_root` 之外的几个用例）——本条的阳性
+    对照就在 `test_import_prunes_an_alias_that_shadows_a_live_slug`（`persons=()`）。
+    """
+    a, _ = roots
+    # ⚠️ 类目**必须合法**：`validate_categories` 在 persons 之前跑，喂空类目的话
+    # 这条包会死在「[[categories]] 段为空」上——**红得对但不是这条断言红**
+    # （勘误 E7 的形态 5：输入到不了被测分支）。
+    single = _pack_text(a, categories=(("life", "生活", "生活"),)).replace(
+        "[[persons]]\n", "[persons]\n", 1
+    )
+    assert "[persons]" in single
+    with pytest.raises(config.ConfigError, match="数组表"):
+        configpack.parse(single, pathlib.Path("single.toml"))

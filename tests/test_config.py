@@ -501,3 +501,42 @@ def test_save_config_tolerates_a_missing_qq_db_dir(tmp_path):
     # 读路径这一半：仍然响亮（默认 require_paths_exist=True）
     with pytest.raises(config.ConfigError, match="不存在"):
         config.load_config(p)
+
+
+# ── 夹具的判据（M6 T7 Fix loop 1 / FIX 2）────────────────────────────
+
+
+def test_default_persons_path_is_isolated_by_conftest():
+    """⭐ **夹具的判据**（不是夹具本身）：`DEFAULT_PERSONS` 必须被挪出仓库、且自带内容。
+
+    ⚠️ 为什么要有这条：`vigil config import` 是本项目**第一条会写
+    `DEFAULT_PERSONS` 的产品路径**（`save_persons` 是整体替换写）。夹具一旦被人
+    删掉 / 改名 / 换写法，**不会有任何东西变红**——直到某次全量跑完，用户的真实
+    `config/persons.toml`（真数据、要进 git）被测试整体覆盖。
+    这正是 Global Constraint 9 与勘误 E6 说的那件事：
+    **新增的可写路径必须被夹具隔离，而"隔离了"这件事本身要有判据。**
+
+    ⚠️ 三条断言各挡一种退化，缺一条就是空守卫：
+      · **路径在仓库外** —— 挡"夹具被删掉"（这条同时是 FIX 2 的变异反证落点）；
+      · **文件存在** —— 挡"改成指向不存在的路径"（见 conftest 里那段：
+        "文件不存在"与"名单为空"在断言层面同形）；
+      · **读出来非空** —— 挡"内容写成空文件"（那也会让上面两条全绿）。
+
+    ⚠️ 本用例**只读**，任何情况下都不会往真实名单里写一个字
+    （即使夹具坏了：只读一条真名单，不改它）。
+
+    ⚠️ 变异反证：把 `conftest.py` 的 `_isolate_persons_toml_path` 改成空转
+    （只留一条 docstring）⇒ 本条**必红**（第一条断言）。
+    只跑本条，**绝不许跑全量**——夹具一撤，别的用例就可能写进真仓库。
+    """
+    target = config.DEFAULT_PERSONS
+    repo = config.REPO_ROOT.resolve()
+    assert not target.resolve().is_relative_to(repo), (
+        f"`DEFAULT_PERSONS` 还在仓库里：{target}——省 path 的 `save_persons` 会"
+        "整体覆盖用户的真实名单（要进 git 的真数据）"
+    )
+    assert target.is_file(), (
+        f"夹具必须**自带内容**（{target} 不存在）：'文件不存在'是 `load_persons` 的"
+        "合法语义（空名单），会让'夹具没生效'与'夹具生效且名单为空'变得不可区分"
+    )
+    assert config.load_persons(), "夹具自带的那份必须是**非空**名单，否则上一句等于没写"

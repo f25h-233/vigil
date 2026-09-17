@@ -1261,6 +1261,12 @@ def create_app(config: Config) -> FastAPI:
                 "aliases": len(pack.aliases),
             }
 
+        # ⚠️ **`on_progress` 不许塞空 lambda**（M6 T7 Fix loop 1 / I4）：导入的
+        # 汇报里有**用户必须看见**的话（最要命的一句是「本机路径没保住，已整份
+        # 采用包里的 [settings]，其中包括 qq_db_dir = <别台机器>」）。
+        # 塞空 lambda 等于把它扔进黑洞——前端只能显示"导入成功"，而用户
+        # 根本不知道自己的路径被换掉了。这里收进 `notes` 随响应回去。
+        notes: list[str] = []
         with write_lock:
             report = configpack.import_pack(
                 pack,
@@ -1270,7 +1276,7 @@ def create_app(config: Config) -> FastAPI:
                     categories=categories_path(),
                     persons=persons_path(),
                 ),
-                on_progress=lambda _: None,
+                on_progress=notes.append,
             )
         return {
             "applied": True,
@@ -1279,6 +1285,8 @@ def create_app(config: Config) -> FastAPI:
             "persons": report.persons,
             "aliases": report.aliases,
             "settings_skipped": report.settings_skipped,
+            "notes": notes,
+            "warnings": report.warnings,
         }
 
     # ── 群：清单走只读快照（M6 T4 / spec §1.6），增删改走 groups.toml ──────

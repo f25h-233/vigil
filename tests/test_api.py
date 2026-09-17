@@ -2911,3 +2911,41 @@ def test_api_reorder_survives_a_worker_that_starts_before_submit_returns(
         "（`on_progress` 引用了还没绑定的 `job`）"
     )
     assert body["total"] == 2, "进度也没接上（on_progress 没跑成）"
+
+
+def test_api_import_pack_reports_what_it_could_not_keep(client_factory, tmp_path):
+    """⭐ I4（Fix loop 1）：回落分支在 **API 侧也要出声**。
+
+    ⚠️ 场景：本机那份 `groups.toml` 读不出来（手改笔误）⇒ `import_pack` 的回落
+    分支会把**包里的** `[settings]` 写进去——其中包括**导出那台机器**的 `qq_db_dir`。
+    CLI 侧靠 `on_progress` 把这句话打出来，而 API 侧从前收的是
+    `on_progress=lambda _: None` ⇒ **一个字都没有**：前端只能显示「导入成功」，
+    用户根本不知道自己的路径被换成了别人的。
+
+    ⚠️ 判据三条一起，缺一条就是一个空守卫：
+      · `settings_skipped is False` —— **没跳过却报 True 是假话**（I4 的另一半）；
+      · `warnings` 非空且**点名那个 qq_db_dir** —— 只说"用了包里的"等于让用户猜；
+      · `notes` 非空 —— 它证明 `on_progress` 不再是一个空 lambda
+        （把它塞回 `lambda _: None` ⇒ 这一条单独就红）。
+
+    ⚠️ 变异反证：把 `api_import_pack` 里的 `on_progress=notes.append` 换回
+    `lambda _: None` 且不返回 `warnings` ⇒ 本条**必红**。
+    """
+    c = client_factory()
+    text = c.get("/api/config/pack").json()["toml"]   # 先导出（此刻本机配置还是好的）
+
+    # 手改笔误：单层方括号 ⇒ 本机那份读不出来
+    (tmp_path / "fake_root" / "config" / "groups.toml").write_text(
+        "[groups]\nid = 1\nname = \"改坏了的\"\n", encoding="utf-8"
+    )
+
+    r = c.post(
+        "/api/config/pack",
+        json={"toml": text, "apply": True, "keep_settings": True},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["settings_skipped"] is False, "没跳过却报 True——用户以为本机路径还在"
+    assert body["warnings"], "回落分支一句话都没说"
+    assert "qq_db_dir" in body["warnings"][0], body["warnings"]
+    assert body["notes"], "on_progress 收的是空 lambda ⇒ notes 永远是空列表"
