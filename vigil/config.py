@@ -516,6 +516,46 @@ class LLMSettings:
     enable_thinking: bool | None = None
 
 
+def _llm_str(section: dict, key: str, default: str, path: pathlib.Path) -> str:
+    """`[llm]` 里的字符串字段：**缺省回落、写错报错、空串报错**。
+
+    ⚠️ 三条判定各有实测理由（M6 T3 re-review，Important-2 / Minor）：
+
+      · **键不存在** ⇒ 用 `default`。这是**逐项回落**（不是整段回落）：
+        用户只写了他关心的那个字段，剩下的照内置默认。
+      · **不是 str** ⇒ `ConfigError`。原实现是 `str(section.get(...)).strip()`，
+        实测 `base_url = 123` 被**静默转成 `"123"` 而且真会拿去发请求**、
+        `model = 1.5` 变 `"1.5"`——**同一个文件里 `enable_thinking` 是响亮报错的**，
+        两者待遇相反；而且这种失败要等到请求真的发出去才现形。
+        契约是「字符串」而不是「能转成字符串的东西」（与 `toml_int` 同一条判据）。
+      · **空串（含全空白）** ⇒ `ConfigError`。原实现把它静默吞成"没写"，
+        于是 `save_llm_settings(LLMSettings(base_url=""))` 写出的 `base_url = ""`
+        **读回来变成内置默认** ⇒ round-trip 不保值（reviewer 实测）。
+        这里选**拒**而不是"保值往返"：`base_url = ""` 是一个**发不出去的 URL**，
+        与 `enable_thinking = "false"` 同类——不猜、不兜底，当场说清楚。
+
+    ⚠️ 返回值一律 `.strip()` 过：于是**写出去的是什么，读回来就是什么**
+    （`save_llm_settings` 也 strip，见那里的 docstring）。
+    """
+    if key not in section:
+        return default
+    raw = section[key]
+    if not isinstance(raw, str):
+        raise ConfigError(
+            f"{path}: {key} 必须是**字符串**（带引号），实际是 {raw!r}"
+            f"（{type(raw).__name__}）——不加引号会被解析成数字/布尔，"
+            "而它会被拿去发请求，静默转一下的代价是排障时看不出问题在哪。"
+        )
+    value = raw.strip()
+    if not value:
+        raise ConfigError(
+            f"{path}: {key} 不能是空串——空串会**静默回落成内置默认**，"
+            "于是写出去再读回来就不是同一个值了（round-trip 不保值）。"
+            f"要回到内置默认，请把整行删掉（`{key}` 的缺省语义就是回落到内置默认）。"
+        )
+    return value
+
+
 def load_llm_settings(
     path: pathlib.Path | None = None,
     *,
@@ -566,8 +606,8 @@ def load_llm_settings(
             "读出来的是一串表。"
         )
 
-    base_url = str(section.get("base_url", "")).strip() or llm.DEFAULT_BASE
-    model = str(section.get("model", "")).strip() or llm.DEFAULT_MODEL
+    base_url = _llm_str(section, "base_url", llm.DEFAULT_BASE, target)
+    model = _llm_str(section, "model", llm.DEFAULT_MODEL, target)
 
     if "enable_thinking" not in section:
         thinking: bool | None = None
@@ -607,11 +647,29 @@ def save_llm_settings(
     唯一表达方式。写成 `enable_thinking = null` 的话，读回来是 Python 的
     `None` 但通过的是 **TOML 里不存在的 null 语法**（TOML 根本没有 null），
     文件直接解析不了。
+
+    ⚠️ **写出去的 `base_url` / `model` 一定是非空且已 `strip` 的**，两条理由
+    （M6 T3 re-review，Minor-3 实测）：
+
+      · **空串会把 round-trip 弄坏**：写出 `base_url = ""`，`load_llm_settings`
+        读回来是**内置默认**——存进去的和读出来的不是一回事，而界面上看不出区别。
+      · **带首尾空白也会**：`load` 会 `strip`，所以 `"  https://x  "` 写出去、
+        读回来是 `"https://x"`。所以写侧先 `strip` 再落盘：**写出去的文本里
+        那个值，就是读回来的那个值**（这条是 `load`/`save` 之间的契约）。
+
+    拒绝用 `ConfigError`（与 `enable_thinking` 非布尔同一条判据：**不猜、不兜底**）。
     """
     target = path or DEFAULT_LLM_TOML
+    for field, value in (("base_url", settings.base_url), ("model", settings.model)):
+        if not isinstance(value, str) or not value.strip():
+            raise ConfigError(
+                f"{field} 必须是非空字符串（空串/全空白会写出一份读回来"
+                f"变成内置默认的配置——round-trip 不保值），实际是 {value!r}"
+            )
+
     lines = [_LLM_HEADER, "", "[llm]", ""]
-    lines.append(f"base_url = {toml_str(settings.base_url)}")
-    lines.append(f"model = {toml_str(settings.model)}")
+    lines.append(f"base_url = {toml_str(settings.base_url.strip())}")
+    lines.append(f"model = {toml_str(settings.model.strip())}")
     if settings.enable_thinking is not None:
         lines.append(
             f"enable_thinking = {'true' if settings.enable_thinking else 'false'}"

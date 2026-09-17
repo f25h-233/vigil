@@ -1133,3 +1133,41 @@ def test_budget_stops_remaining_batches_and_never_deletes(con, monkeypatch):
     assert stats.batches == 1, "预算闸在跑之前就拦下了第二批"
     assert plan.unjudged == [second], "没跑到的那批要明着列出来，一条都不许删"
     assert plan.to_delete == [first], "跑过的那批照常判（它确实产出 0 条）"
+
+
+def test_repass_defaults_to_thinking_off(con, monkeypatch):
+    """⭐⭐ `repass()` 的 `enable_thinking` 默认值必须是 `False`，**不是 `None`**。
+
+    ⚠️ re-review Minor-1：这个默认值原来**一条判据都没有**——把它改成 `None`
+    实测 **645 passed**（一条不红）。而这两个值在报文里是**两件不同的事**：
+
+      · `False` ⇒ 发 `false`（Qwen3/Qwen3.5 这类混合思考模型要的就是它；
+        不发会慢 **40 倍**：111.5s vs 2.8s/批，实测）
+      · `None` ⇒ **不发这个字段**（通用 OpenAI 端点的安全形状，R12）
+
+    `refine` / `digest` 的同一个默认值**各自有用例钉着**
+    （`test_refine_passes_thinking_switch_to_llm` / `test_digest.py:887`），
+    只有 `repass` 漏了——而 `repass` 是**无人值守批量跑**的那条路，
+    真退回 `None` 的代价是整轮重判慢 40 倍，且**不会有任何东西变红**。
+
+    ⚠️ 变异反证：把 `repass()` 签名里的 `enable_thinking: bool | None = False`
+    改成 `= None` ⇒ 本条**必红**。
+    """
+    content = "校园卡办理，需要的联系我"
+    _msg(con, 1, content)
+    _item(con, 1, title=content)
+
+    seen: list = []
+
+    def fake(cfg, *, system, user, **kw):
+        seen.append(cfg)
+        return LLMResult(payload={"items": []}, input_tokens=1, output_tokens=1)
+
+    monkeypatch.setattr(repass, "chat_json", fake)
+    repass.repass(_cfg(), api_key="k", conn=con)
+
+    assert seen, "一批都没跑，这条测试就没在验证任何东西"
+    assert all(c.enable_thinking is False for c in seen), (
+        "`repass()` 的默认 thinking 必须是**发 false**，不是「不发」——"
+        "后者会让混合思考模型退回 111.5s/批（见 llm.LLMConfig 的注释）"
+    )

@@ -294,7 +294,18 @@ def cmd_refine(args) -> int:
 
             # ⚠️ 设置的**解析顺序**固定是：命令行 > config/llm.toml > 内置默认。
             # 命令行优先是为了让排障能"先试一下别的端点"而不用改文件。
-            llm_settings = load_llm_settings(on_warn=logs.emit)
+            #
+            # ⚠️ **必须接住 `ConfigError`**（M6 T3 re-review Important-3）：`main()`
+            # 是裸的 `return args.func(args)`，**没有顶层兜底** ⇒ 用户在
+            # `config/llm.toml` 里写错一个键（`base_url = 123`、
+            # `enable_thinking = "false"`），拿到的是一段**裸 traceback**，
+            # 而不是与 `_load_config_only()` 同形的 `[配置错误] …`。
+            # 同批的 T2 刚为 `load_config` 的 `TOMLDecodeError` 修了同一件事
+            # （Global Constraint 5：配置写错要快速失败成**一句人话**）。
+            try:
+                llm_settings = load_llm_settings(on_warn=logs.emit)
+            except ConfigError as exc:
+                sys.exit(f"[配置错误] {exc}")
 
             try:
                 since_ts = reader._to_epoch(args.since)
@@ -410,7 +421,12 @@ def cmd_repass(args) -> int:
 
     # ⚠️ 设置的**解析顺序**固定是：命令行 > config/llm.toml > 内置默认。
     # 命令行优先是为了让排障能"先试一下别的端点"而不用改文件。
-    llm_settings = load_llm_settings(on_warn=logs.emit)
+    # ⚠️ 接住 `ConfigError`（M6 T3 re-review Important-3）：`main()` 没有顶层
+    # 兜底，不接就是一段裸 traceback——见 `cmd_refine` 里那段的完整论证。
+    try:
+        llm_settings = load_llm_settings(on_warn=logs.emit)
+    except ConfigError as exc:
+        sys.exit(f"[配置错误] {exc}")
 
     # ⚠️ **每次跑都落一份 audit**（诊断结论）：上一轮干跑没留 payload，174 条删除
     # 事后一条都复核不了。不可逆操作的事前可见（清单）与事后可复核（payload）
@@ -562,7 +578,12 @@ def cmd_digest(args) -> int:
 
             # ⚠️ 设置的**解析顺序**固定是：命令行 > config/llm.toml > 内置默认。
             # 命令行优先是为了让排障能"先试一下别的端点"而不用改文件。
-            llm_settings = load_llm_settings(on_warn=logs.emit)
+            # ⚠️ 接住 `ConfigError`（M6 T3 re-review Important-3）：`main()` 没有顶层
+            # 兜底，不接就是一段裸 traceback——见 `cmd_refine` 里那段的完整论证。
+            try:
+                llm_settings = load_llm_settings(on_warn=logs.emit)
+            except ConfigError as exc:
+                sys.exit(f"[配置错误] {exc}")
 
             day = args.date or digest_mod.yesterday()
             try:

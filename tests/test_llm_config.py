@@ -15,32 +15,6 @@ import pytest
 from vigil import config, llm
 
 
-def _capture_bodies(monkeypatch) -> list[dict]:
-    """把 `chat_json` 真正发出去的请求体抓下来。"""
-    sent: list[dict] = []
-
-    class _Response:
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *exc):
-            return False
-
-        def read(self):
-            return json.dumps(
-                {"choices": [{"message": {"content": "{}"}}], "usage": {}}
-            ).encode("utf-8")
-
-    def fake_urlopen(request, timeout=None):
-        sent.append(json.loads(request.data.decode("utf-8")))
-        return _Response()
-
-    # ⚠️ 打的是 `urllib.request.urlopen`（`llm.py` 用的是模块级 `urllib.request`）。
-    # 不要在这里 `monkeypatch.undo()`——那会连带拆掉 conftest 的 autouse 隔离夹具。
-    monkeypatch.setattr(llm.urllib.request, "urlopen", fake_urlopen)
-    return sent
-
-
 def _patch_existing(monkeypatch, tmp_path, text: str) -> pathlib.Path:
     """让 `load_llm_settings()` 的**默认路径**指向一份临时文件。
 
@@ -138,6 +112,84 @@ def test_a_wrong_section_shape_is_rejected(tmp_path, monkeypatch):
         config.load_llm_settings()
 
 
+# ── base_url / model 的类型与空串（re-review Minor-3）────────────────────
+#
+# ⚠️ 原实现是 `str(section.get("base_url", "")).strip() or llm.DEFAULT_BASE`：
+# **任何类型都能进来**。同一份文件里 `enable_thinking` 是响亮报错的，
+# 两者待遇相反——而 `base_url` 写错的代价更靠后（要等到请求发出去才现形）。
+
+
+@pytest.mark.parametrize(
+    ("toml_value", "field"),
+    [("123", "base_url"), ("1.5", "model"), ("true", "model"), ('["a"]', "base_url")],
+    ids=["base_url=123", "model=1.5", "model=true", "base_url=数组"],
+)
+def test_a_non_string_endpoint_field_is_rejected(tmp_path, monkeypatch, toml_value, field):
+    """非字符串 ⇒ `ConfigError`，**不许静默 `str()` 一下**。
+
+    ⚠️ re-review Minor-3 实测：`base_url = 123` 会被转成 `'123'`，而它**真的会被
+    拿去发请求**（`urllib` 会抛一个与被测逻辑无关的错）；`model = 1.5` 变 `'1.5'`，
+    一路作为模型名发出去。契约是「字符串」，不是「能转成字符串的东西」
+    ——与 `toml_int` 拒绝 `"100000001"` 是同一条判据。
+    """
+    _patch_existing(monkeypatch, tmp_path, f"[llm]\n{field} = {toml_value}\n")
+    with pytest.raises(config.ConfigError, match=field):
+        config.load_llm_settings()
+
+
+def test_an_empty_endpoint_field_is_rejected_on_both_sides(tmp_path, monkeypatch):
+    """⭐ 空串**两侧都拒**——它原来会静默回落成内置默认（round-trip 不保值）。
+
+    ⚠️ re-review Minor-3 实测：`save_llm_settings(LLMSettings(base_url=""))`
+    写出 `base_url = ""`，而 `load_llm_settings` 读回来是**内置默认**。
+    存进去的和读出来的不是一回事，而界面上看不出区别——正是本项目反复
+    禁止的「静默回落」。
+
+    选「拒」而不是「保值往返」的理由：`base_url = ""` 是一个**发不出去的 URL**，
+    与 `enable_thinking = "false"` 同一类——**不猜、不兜底，当场说清楚**。
+    """
+    _patch_existing(monkeypatch, tmp_path, '[llm]\nbase_url = ""\n')
+    with pytest.raises(config.ConfigError, match="base_url"):
+        config.load_llm_settings()
+
+    _patch_existing(monkeypatch, tmp_path, '[llm]\nmodel = "   "\n')
+    with pytest.raises(config.ConfigError, match="model"):
+        config.load_llm_settings()
+
+    with pytest.raises(config.ConfigError, match="base_url"):
+        config.save_llm_settings(config.LLMSettings(base_url=""), tmp_path / "out.toml")
+    with pytest.raises(config.ConfigError, match="model"):
+        config.save_llm_settings(config.LLMSettings(model="  "), tmp_path / "out.toml")
+
+
+@pytest.mark.parametrize(
+    "settings",
+    [
+        config.LLMSettings(base_url="https://x/v1", model="m"),
+        config.LLMSettings(base_url="  https://x/v1  ", model="m"),
+        config.LLMSettings(base_url="https://x/v1", model='名字带"引号"'),
+        config.LLMSettings(base_url="https://x/v1", model="m", enable_thinking=False),
+        config.LLMSettings(base_url="https://x/v1", model="m", enable_thinking=True),
+        config.LLMSettings(base_url="https://x/v1", model="m", enable_thinking=None),
+    ],
+)
+def test_save_then_load_roundtrips_any_accepted_value(tmp_path, settings):
+    """⭐ **写出去的那个值，就是读回来的那个值**（load/save 之间的契约）。
+
+    ⚠️ 判据是 `load(save(x)) == x` 的**归一化形态**：`base_url` / `model` 两侧
+    都 `strip`（写侧先 strip，读侧再 strip），所以带首尾空白的输入落盘后是
+    strip 过的值——**这是刻意的归一化，不是丢失**：它保证"你看到的文件内容
+    = 读回来的值"。`enable_thinking` 的三态则必须**逐字**往返（`None` 那一态
+    在文件里表现为**整行不写**，见 `save_llm_settings` 的 docstring）。
+    """
+    p = tmp_path / "llm.toml"
+    config.save_llm_settings(settings, p)
+    back = config.load_llm_settings(p)
+    assert back.base_url == settings.base_url.strip()
+    assert back.model == settings.model.strip()
+    assert back.enable_thinking is settings.enable_thinking
+
+
 # ── 写侧 ────────────────────────────────────────────────────────────
 
 
@@ -169,38 +221,6 @@ def test_saved_llm_toml_contains_no_key():
 
 
 # ── ⭐ 端到端：从配置文件到真实报文（R12 的全部意义）────────────────
-
-
-def test_the_end_to_end_wire_format_omits_the_field(tmp_path, monkeypatch):
-    """⭐ R12：`enable_thinking` 在通用 OpenAI 端点上**必须真的不发出去**。
-
-    ⚠️ 这条测的是**三层拼起来的结果**：`config/llm.toml` → `LLMSettings`
-    → `refine` 内部的 `LLMConfig` → `chat_json` 的请求体。
-    只测其中任何一层都不够——`LLMConfig` 今天已经能正确省略这个字段了
-    （`llm.py:150-151`），**卡住的是它上面那两层根本没把 `None` 传下来**
-    （三个消费函数的默认值是 `False`）。
-
-    ⚠️ **实测修正（M6 T3，见 task-3-report §偏差 D3）**：原稿在这里写的变异反证
-    ——「把 `refine.py` 里构造 `LLMConfig` 那行的 `enable_thinking=enable_thinking`
-    改成 `enable_thinking=False` ⇒ 本条**必红**」——**不成立**：本条自己用
-    `llm.LLMConfig(...)` 手工构造配置，**一次都没调 `refine()`**，所以
-    `refine.py` 怎么改都影响不到它（实测：变异后本文件 **10 passed**）。
-    「上一层有没有把值传下来」那一半由
-    `test_refine_forwards_the_configured_endpoint_to_the_wire` 钉住。
-    """
-    sent = _capture_bodies(monkeypatch)
-    cfg = config.LLMSettings(enable_thinking=None)
-    llm_cfg = llm.LLMConfig(api_key="k", base_url=cfg.base_url, model=cfg.model,
-                            enable_thinking=cfg.enable_thinking)
-    llm.chat_json(llm_cfg, system="s", user="u", sleep=lambda _: None)
-    assert "enable_thinking" not in sent[0]
-
-    sent.clear()
-    llm_cfg2 = llm.LLMConfig(api_key="k", enable_thinking=False)
-    llm.chat_json(llm_cfg2, system="s", user="u", sleep=lambda _: None)
-    assert sent[0]["enable_thinking"] is False, (
-        "明确关掉时必须**发出去**——否则 Qwen 混合思考模型会退回 111.5s/批"
-    )
 
 
 def test_base_url_reaches_the_request(tmp_path, monkeypatch):
@@ -392,15 +412,47 @@ def test_cli_falls_back_to_the_builtin_when_the_file_is_missing(monkeypatch, tmp
         assert seen[stage]["model"] == llm.DEFAULT_MODEL
 
 
-def test_cli_think_flag_never_swallows_the_files_value(monkeypatch, tmp_path, capsys):
-    """⭐ 「没给 `--think` 时**文件说了算**」——把 brief 说的"碰巧"钉成判据。
+@pytest.mark.parametrize("sub", ["refine", "digest", "repass"])
+def test_cli_reports_a_broken_llm_toml_as_a_config_error(monkeypatch, tmp_path, capsys, sub):
+    """⭐ 配置文件写错 ⇒ 一句 `[配置错误] …`，**不是裸 traceback**。
 
-    ⚠️ brief 自己论证过：`args.think or llm_settings.enable_thinking` 在这里
-    **碰巧正确**，而它依赖 `args.think` 的默认值是 `False` 而不是 `None`
-    （`False or X` 得到 `X`；但若哪天有人把 `store_true` 改成
-    `default=None`，同一条式子的**含义就变了**）。实现用的是显式写法
-    （`True if args.think else …`），语义与那份论证**不同**——
-    所以这里钉的是**要保住的语义**，三种情形一个都不许错：
+    ⚠️ re-review Important-3：`main()` 是裸的 `return args.func(args)`，**没有
+    顶层兜底**。三个 `cmd_*` 只把 `ValueError` 转成 `[参数错误]`，于是
+    `ConfigError` 会**一路穿透到用户面前**——与本仓 `_load_config_only()`
+    的 `[配置错误]` 约定不一致（T2 刚为 `load_config` 的 `TOMLDecodeError`
+    修过同一件事，见 `config.load_config` 里那段注释）。
+
+    判据是 `SystemExit`：配置都读不对时，**一个阶段都不该跑起来**
+    （`seen == {}` 那一条同时挡住"先跑再报错"）。
+    """
+    from vigil import cli
+
+    _patch_existing(monkeypatch, tmp_path, "[llm]\nbase_url = 123\n")
+    seen: dict = {}
+    _wire_cli(monkeypatch, tmp_path, seen)
+
+    with pytest.raises(SystemExit) as exc:
+        cli.main([sub])
+    message = str(exc.value)
+    assert "[配置错误]" in message, f"`{sub}` 没把它转成一句人话：{message!r}"
+    assert "base_url" in message, "错误里必须点名是哪个键写错了"
+    assert seen == {}, f"配置都没读对，`{sub}` 却已经把阶段跑起来了"
+
+
+def test_cli_think_flag_never_swallows_the_files_value(monkeypatch, tmp_path, capsys):
+    """⭐ 「没给 `--think` 时**文件说了算**」——三个消费口径钉死。
+
+    ⚠️ **实测修正（M6 T3 re-review，Minor-1）**：这条 docstring 原来抄了 brief
+    的一句论证——「`args.think or llm_settings.enable_thinking` **碰巧**正确，
+    它依赖 `args.think` 的默认值是 `False` 而不是 `None`」。**那句是错的**：
+    `None or X` ≡ `False or X`（两者都是 falsy），所以两种写法对 `args.think`
+    的**一切取值语义相同**——**根本不依赖默认值**。已删掉，不留错论证
+    （本项目最贵的那条陈规：**错的理由会让后来者以为自己理解了，于是不去验证**）。
+
+    ⚠️ 实现用显式写法（`True if args.think else …`）**不是为了更正确**——
+    两者等价；它只是**更好读**，并且将来若加 `--no-think`（第三态）时不必
+    再想一遍 `or` 链。**那是审美与前瞻，不是正确性。** 这里钉的是**要保住的
+    语义**，三种情形一个都不许错：
 
       ① 文件 `= true`、没给 `--think` ⇒ `True`（**文件说了算**，不是"默认关"）
       ② 文件 `= false`、给了 `--think` ⇒ `True`（命令行赢）
@@ -428,54 +480,89 @@ def test_cli_think_flag_never_swallows_the_files_value(monkeypatch, tmp_path, ca
     capsys.readouterr()
 
 
-def test_refine_forwards_the_configured_endpoint_to_the_wire(monkeypatch):
-    """⭐ `refine(..., base_url=..., enable_thinking=...)` 必须真的到请求层。
+# ── ⭐ 三个消费点各自把配置传到请求层（R12 / 出口判据 3）────────────────────
+#
+# ⚠️ **re-review Important-1**：首轮这里只有 `refine` 一条判据，`digest` 与
+# `repass` 里同样那两行（`base_url=base_url` / `enable_thinking=enable_thinking`）
+# **删掉或改掉都 645 passed、一条不红**——正是 E5 那个形状（接线在、没人守）。
+# 所以判据必须是「**真调那个消费函数**」+「读它**真正交给 `chat_json` 的那个 cfg**」，
+# 既不是源码文本，也不是手工构造 `LLMConfig`（那正是首轮那条假反证的病根）。
+#
+# 三个 driver 各自造一份**最小可跑**的库，形状照抄各自的测试文件：
+#   refine → `tests/test_refine.py::seeded` / `StubConfig`
+#   digest → `tests/test_digest.py::seeded`
+#   repass → `tests/test_repass.py::con` / `_MESSAGE_TABLES_DDL`
+#
+# ⚠️ 同批**删掉**了原来那条 `test_the_end_to_end_wire_format_omits_the_field`
+# （re-review Minor-2 点它"名字叫端到端、其实不是"）：它手工构造 `LLMConfig`
+# 之后断言报文，而报文那一层**已经由 `tests/test_llm.py` 的
+# `test_sends_thinking_false_when_configured`（发 false）与
+# `test_omits_thinking_field_by_default`（不发）各钉一条**，它只是重复；
+# 它真正唯一想守的是「上一层有没有把值传下来」，而那正是下面这条参数化用例
+# 在做的事（而且是真的调消费函数）。**去重而不是改名**，是因为留着一条
+# 与别处重复的用例，只会让人误以为那一层有两条判据。
 
-    ⚠️ **补的（偏离 brief，见报告 §偏差 D3）**：brief 给
-    `test_the_end_to_end_wire_format_omits_the_field` 写的变异反证是
-    「把 `refine.py` 里构造 `LLMConfig` 那行的 `enable_thinking=enable_thinking`
-    改成 `enable_thinking=False` ⇒ 本条**必红**」——**实测是假的**：那条测试
-    自己 `llm.LLMConfig(...)` 手工构造配置，**一次都没调 `refine()`**
-    （实测：变异后 `tests/test_llm_config.py` **10 passed**、全量只红
-    `tests/test_refine.py::test_refine_passes_thinking_switch_to_llm`）。
-    而它想守的那条线（「上一层有没有把值传下来」）`base_url` 那一半
-    **今天没有任何判据**——删掉 `base_url=base_url` 不会让任何用例变红，
-    因为 `LLMConfig` 的默认值恰好就是 `DEFAULT_BASE`（空守卫的典型形状）。
+_MARK_BASE = "https://wired.example/v1/chat/completions"
+_MARK_MODEL = "wired-model"
 
-    判据是**真正交给 `chat_json` 的那个 cfg**，不是源码文本——
-    语料构造照抄 `tests/test_refine.py::seeded` / `StubConfig`。
-    """
+_MESSAGES_DDL = """
+CREATE TABLE messages (
+    msg_id INTEGER PRIMARY KEY, group_id INTEGER NOT NULL,
+    ts INTEGER NOT NULL, sender_uid TEXT, content TEXT NOT NULL
+);
+CREATE TABLE sender_names (
+    group_id   INTEGER NOT NULL,
+    uid        TEXT    NOT NULL,
+    group_nick TEXT,
+    qq_nick    TEXT,
+    uin        INTEGER,
+    in_group   INTEGER,
+    PRIMARY KEY (group_id, uid)
+);
+"""
+
+
+def _new_conn():
+    """内存库 + `messages` / `sender_names`（这两张表不由 `ensure_schema` 建）。"""
     import sqlite3
 
+    conn = sqlite3.connect(":memory:", uri=True)
+    conn.executescript(_MESSAGES_DDL)
+    return conn
+
+
+class _Cfg:
+    """最小 `Config` 替身：`tier_of`（三个消费函数都要）+ `groups`（digest 要）。
+
+    `tier_of` 一律 `"high"`，与 `tests/test_refine.py::StubConfig` 同款——
+    本文件要验的是**参数有没有传下去**，不是预筛口径；档位调高保证候选非空。
+    """
+
+    def __init__(self, groups=()):
+        from vigil.config import Config, Group
+
+        self.groups = tuple(Group(id=g, name=n) for g, n in groups)
+        # 刻意保留一个真 Config 只为 `tier_of` 的语义不漂移（本替身不用它，
+        # 但写在这里提醒：真身一改，这条替身要跟着看一眼）。
+        self._real = Config(
+            qq_db_dir=pathlib.Path(), output_db=pathlib.Path(), groups=self.groups
+        )
+
+    def tier_of(self, gid: int) -> str:
+        return "high"
+
+
+def _cfg_seen_by_refine(monkeypatch, *, enable_thinking):
     from vigil import refine, store
     from vigil.llm import LLMResult
 
-    conn = sqlite3.connect(":memory:", uri=True)
-    conn.executescript(
-        """
-        CREATE TABLE messages (
-            msg_id INTEGER PRIMARY KEY, group_id INTEGER NOT NULL,
-            ts INTEGER NOT NULL, sender_uid TEXT, content TEXT NOT NULL
-        );
-        CREATE TABLE sender_names (
-            group_id INTEGER NOT NULL, uid TEXT NOT NULL, group_nick TEXT,
-            qq_nick TEXT, uin INTEGER, in_group INTEGER,
-            PRIMARY KEY (group_id, uid)
-        );
-        """
-    )
+    conn = _new_conn()
     conn.execute(
         "INSERT INTO messages VALUES (?,?,?,?,?)",
         (1, 100, 1000, "u_a", "明天下午有讲座，地点西太湖报告厅"),
     )
     conn.commit()
     store.ensure_schema(conn)
-
-    class _Cfg:
-        """refine 只用到 `tier_of`（`refine.py:464` 是全模块唯一的 `config.`）。"""
-
-        def tier_of(self, gid: int) -> str:
-            return "high"
 
     seen: list[llm.LLMConfig] = []
 
@@ -484,21 +571,119 @@ def test_refine_forwards_the_configured_endpoint_to_the_wire(monkeypatch):
         return LLMResult(payload={"items": []}, input_tokens=1, output_tokens=1)
 
     monkeypatch.setattr(refine, "chat_json", fake_chat_json)
-    quiet = lambda *a, **k: None  # noqa: E731
-
     refine.refine(
-        _Cfg(), api_key="k", conn=conn, batch_size=1, on_progress=quiet,
-        base_url="https://my-host/v1/chat/completions", enable_thinking=None,
+        _Cfg(), api_key="k", conn=conn, batch_size=1,
+        base_url=_MARK_BASE, model=_MARK_MODEL, enable_thinking=enable_thinking,
+        on_progress=lambda *a, **k: None,
     )
-    assert seen, "一批都没跑，这条测试就没在验证任何东西"
-    assert seen[0].base_url == "https://my-host/v1/chat/completions"
-    assert seen[0].enable_thinking is None, "「不发」这一态被上一层吞掉了"
+    return seen
 
-    seen.clear()
-    refine.refine(
-        _Cfg(), api_key="k", conn=conn, batch_size=1, redo=True,
-        on_progress=quiet, enable_thinking=False,
+
+def _cfg_seen_by_digest(monkeypatch, *, enable_thinking):
+    from vigil import digest, store
+    from vigil.llm import LLMResult
+
+    conn = _new_conn()
+    since, until = digest.day_window("2026-09-13")
+    conn.execute(
+        "INSERT INTO messages VALUES (?,?,?,?,?)",
+        (1, 100, since + 60, "u_a", "通知：明天交体检表"),
     )
-    assert seen, "redo 那轮一批都没跑"
-    assert seen[0].base_url == llm.DEFAULT_BASE, "不传时应当退回内置端点"
-    assert seen[0].enable_thinking is False
+    store.ensure_schema(conn)
+    # 窗口内至少要有一条 item，否则 digest 走「空窗日不调模型」那一支，
+    # `chat_json` 一次都不会被调用——那时本条测试是**空守卫**。
+    conn.execute(
+        "INSERT INTO items (item_id, kind, title, detail, event_ts, deadline_ts,"
+        " group_id, actor_uid, place, links, amount, confidence, model,"
+        " prompt_ver, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (1, "notice", "体检表", "10月8日前交", since + 60, None, 100, None,
+         None, "[]", None, 0.9, "m", "v2", 1),
+    )
+    conn.commit()
+
+    seen: list[llm.LLMConfig] = []
+
+    def fake_chat_json(cfg, *, system, user, sleep=None):
+        seen.append(cfg)
+        return LLMResult(payload={"lines": []}, input_tokens=1, output_tokens=1)
+
+    monkeypatch.setattr(digest, "chat_json", fake_chat_json)
+    digest.digest(
+        _Cfg([(100, "班级群")]), api_key="k", conn=conn, since=since, until=until,
+        day_label="2026-09-13", base_url=_MARK_BASE, model=_MARK_MODEL,
+        enable_thinking=enable_thinking, write_file=False, output_dir=None,
+        on_progress=lambda *a, **k: None,
+    )
+    return seen
+
+
+def _cfg_seen_by_repass(monkeypatch, *, enable_thinking):
+    from vigil import repass, store
+    from vigil.llm import LLMResult
+
+    conn = _new_conn()
+    store.ensure_schema(conn)
+    content = "校园卡办理，需要的联系我"
+    conn.execute(
+        "INSERT INTO messages VALUES (?,?,?,?,?)",
+        (1, 100, 1_700_000_000, "u_1", content),
+    )
+    cur = conn.execute(
+        "INSERT INTO items (kind, title, detail, event_ts, deadline_ts, group_id,"
+        " actor_uid, place, links, amount, confidence, model, prompt_ver,"
+        " created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        ("notice", content, None, 1_700_000_000, None, 100, "u_1", None,
+         "[]", None, 0.9, "m", "v2", 1_700_000_000),
+    )
+    conn.execute(
+        "INSERT INTO item_sources (item_id, msg_id) VALUES (?,?)",
+        (cur.lastrowid, 1),
+    )
+    conn.commit()
+
+    seen: list[llm.LLMConfig] = []
+
+    def fake_chat_json(cfg, *, system, user, sleep=None):
+        seen.append(cfg)
+        return LLMResult(payload={"items": []}, input_tokens=1, output_tokens=1)
+
+    monkeypatch.setattr(repass, "chat_json", fake_chat_json)
+    repass.repass(
+        _Cfg(), api_key="k", conn=conn,
+        base_url=_MARK_BASE, model=_MARK_MODEL, enable_thinking=enable_thinking,
+        on_progress=lambda *a, **k: None,
+    )
+    return seen
+
+
+@pytest.mark.parametrize(
+    "driver",
+    [_cfg_seen_by_refine, _cfg_seen_by_digest, _cfg_seen_by_repass],
+    ids=["refine", "digest", "repass"],
+)
+@pytest.mark.parametrize(
+    "thinking", [None, False, True], ids=["不发(None)", "发 false", "发 true"]
+)
+def test_every_consumer_forwards_the_configured_endpoint(
+    driver, thinking, monkeypatch
+):
+    """⭐⭐ `base_url` / `model` / `enable_thinking` 必须**真的**到达请求层。
+
+    判据读的是**消费函数真正交给 `chat_json` 的那个 `LLMConfig`**——
+    三档 `enable_thinking` 各来一遍，因为三态是本任务的全部意义（R12）：
+    `None`（不发，给通用 OpenAI 端点）、`False`（发 false，给 Qwen 混合思考
+    模型，不发就慢 40 倍）、`True`（显式要思考）。少测任何一档，
+    「上一层把它统一成 `False`」这类退化就有一半是看不见的。
+
+    ⚠️ 变异反证：分别删掉 `digest.py` / `repass.py` 构造点里的
+    `base_url=base_url` 或 `enable_thinking=enable_thinking` ⇒ 对应那一档**必红**。
+    """
+    seen = driver(monkeypatch, enable_thinking=thinking)
+    assert seen, "一次都没跑到 `chat_json`——本条测试是空守卫，先查 driver"
+    for cfg in seen:
+        assert cfg.base_url == _MARK_BASE, "端点没传到请求层"
+        assert cfg.model == _MARK_MODEL, "模型名没传到请求层"
+        assert cfg.enable_thinking is thinking, (
+            f"`enable_thinking` 被上一层改写了：传进去的是 {thinking!r}，"
+            f"到请求层的却是 {cfg.enable_thinking!r}"
+        )

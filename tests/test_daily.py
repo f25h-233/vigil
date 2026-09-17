@@ -553,15 +553,35 @@ def test_unattended_refine_gets_a_token_budget(monkeypatch):
     )
 
 
-def test_daily_passes_the_configured_llm_endpoint(monkeypatch, tmp_path):
-    """⭐ `daily` 必须把 `config/llm.toml` 里的端点**真的传下去**。
+@pytest.mark.parametrize(
+    ("toml_thinking", "expected"),
+    [
+        ("enable_thinking = true\n", True),
+        ("", None),
+    ],
+    ids=["文件写了 true", "文件没写该键（= 不发）"],
+)
+def test_daily_passes_the_configured_llm_endpoint(
+    monkeypatch, tmp_path, toml_thinking, expected
+):
+    """⭐⭐ `daily` 必须把 `config/llm.toml` 里那三样**真的传下去**。
 
     ⚠️ 这条挡的是一个具体的形状：`daily` 是**无人值守**路径，没有命令行
     可接，很容易在改造时被漏掉——而它漏掉的后果是"网页上改了端点、
     日报却还在打老地址"，且**只有等到有人看日志才发现**。
 
-    ⚠️ 变异反证：把 `daily.run` 里 refine 调用那三行换回
-    `model=refine_mod.DEFAULT_MODEL` ⇒ 本条**必红**。
+    ⚠️ **`enable_thinking` 这两档是 re-review 补的（Important-2）**，原来的
+    参数是 `false`——而 `false` **与「硬写回 `False`」不可区分**：
+    把 `daily.py` 里那行换成 `enable_thinking=False`，全量照样 645 passed。
+    一个值域只有 {硬编码值} 的夹具，测的是它自己。所以：
+
+      · 写 `true` ⇒ 必须传 `True`（**任何形式的"我们替你关掉"都会在这里红**）
+      · 不写该键 ⇒ 必须传 `None`（**"不发"这一态，R12**；写成 `False` 也红）
+      · 反过来**不测** `false` ⇒ 那一档由"出厂文件 + 三处默认值 `False`"覆盖，
+        而它对变异是瞎的（上面那句实测）。**测有判别力的那一档。**
+
+    ⚠️ 变异反证：把 `daily.py` 里 `enable_thinking=llm_settings.enable_thinking`
+    写成 `enable_thinking=False` ⇒ **两档都红**。
     """
     from vigil import config
 
@@ -571,7 +591,7 @@ def test_daily_passes_the_configured_llm_endpoint(monkeypatch, tmp_path):
     )
     (tmp_path / "llm.toml").write_text(
         '[llm]\nbase_url = "https://my-host/v1/chat/completions"\n'
-        'model = "my-model"\nenable_thinking = false\n',
+        f'model = "my-model"\n{toml_thinking}',
         encoding="utf-8",
     )
 
@@ -600,5 +620,9 @@ def test_daily_passes_the_configured_llm_endpoint(monkeypatch, tmp_path):
 
     assert seen["refine"]["base_url"] == "https://my-host/v1/chat/completions"
     assert seen["refine"]["model"] == "my-model"
-    assert seen["refine"]["enable_thinking"] is False
+    assert seen["refine"]["enable_thinking"] is expected
     assert seen["digest"]["base_url"] == "https://my-host/v1/chat/completions"
+    assert seen["digest"]["enable_thinking"] is expected, (
+        "digest 那一处也要跟文件走——brief 点名「daily 是唯一行为真的变了的地方」，"
+        "而它改的是**两处**调用"
+    )
