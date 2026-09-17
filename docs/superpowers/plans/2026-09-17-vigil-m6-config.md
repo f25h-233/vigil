@@ -159,6 +159,75 @@ D 盘 97% 时再叠 6.6 GB 峰值是有风险的。**清理由用户决定，不
 
 ---
 
+### E4（T2 implementer 实测，**controller 已独立复跑确认**）⚠️ **计划对 TOML 段序的论证是事实错误**
+
+**计划正文至少 5 处**（`600` / `622` / `852` / `910` / `1019-1020` / `1062` / `4880`）写着同一句话：
+
+> 「TOML 里，一个 `[table]` 出现在 `[[array_of_tables]]` 之后，会被解析成**最后一个数组元素下的子表**（`groups[-1].settings`）」
+
+**这是错的。** controller 用 `uv run python` + `tomllib` 独立复跑（2026-09-17）：
+
+```python
+tomllib.loads("[[groups]]
+id = 111
+
+[settings]
+qq_db_dir = 'x'
+")
+# ⇒ 顶层键 = ['groups', 'settings']；raw.get("settings") == {'qq_db_dir': 'x'}
+# ⇒ **没有嵌套**
+
+tomllib.loads("[[groups]]
+id = 111
+
+[groups.settings]
+x = 1
+")
+# ⇒ 顶层键 = ['groups']；raw['groups'][-1] == {'id': 111, 'settings': {'x': 1}}
+# ⇒ **只有显式写全路径才嵌套**
+```
+
+**正确的事实**：TOML 的 `[header]` 是**从根算的绝对路径**。`[settings]` 无论写在哪里，
+定义的都是**顶层** `settings`。会嵌套的只有 `[groups.settings]` 这种**显式带前缀**的写法。
+（数组表之后的**裸键值对**——比如 `[[groups]]` 后直接写 `name = "x"`——确实落入 `groups[-1]`；
+但那是裸键，不是 `[header]`。本计划把两者混为一谈了。）
+
+**影响面（逐条判定）**：
+
+| 处 | 原论证的作用 | 判定 |
+|---|---|---|
+| `_GROUPS_HEADER` / `configpack._HEADER` 的段序**要求** | 决定 `[settings]` 写在哪 | ✅ **要求保留**（与现有手写文件的形状一致、人读着自然），**依据作废** |
+| `save_config` 落盘前的 `validate_config_raw` 自校 | 曾被说成"段序陷阱的**唯一**兜底" | ⚠️ **它仍然有价值**（挡零群、挡缺 `[settings]`、挡类型错），但**不挡段序**——段序根本不需要挡 |
+| `test_save_config_writes_settings_before_groups` 的**变异反证** | 声称「挪到后面 ⇒ `load_config` 抛 `ConfigError`」 | ❌ **该变异根本不会红**——它是一段**错的变异反证**，比没有反证更危险 |
+| `configpack.build`（`plan:4880`） | 同上 | 同上 |
+
+**⭐ 这条修正的要点不是"改个说法"，而是它示范了本项目最贵的那条陈规**：
+
+> **错的论证比没有论证更危险。** 一个写错的理由会让后来者**以为自己理解了**，于是不去验证——
+> 而他会照着那个错理由去"修"一个不存在的问题（这正是 E1 说的「假红比假绿更贵」的同族）。
+
+**⇒ 对已完成的 T2 的处理**：implementer 已把 4 处依据改成实测事实并标记「实测修正」，**判定采信**。
+但 `test_save_config_writes_settings_before_groups` **那条测试本身要重新评估**（见下）。
+
+**⇒ 对未执行的 T4/T7/T8 的要求**：`configpack.build`（T7）与任何新写的 `[settings]` 序列化，
+**照旧把 `[settings]` 写在前面**（保持形状一致），但**注释里不许再写那个嵌套的理由**。
+写一句实话即可：「与现有 `groups.toml` 的段序一致，便于人读与 diff」。
+
+**⇒ 那条测试该怎么办（留给 T2 的 reviewer 裁决，这里是 controller 的倾向）**：
+把断言从"段序"换成**真正该钉的不变量**——**产物的顶层键恰好是 `{settings, groups}`**：
+
+```python
+    import tomllib
+    assert set(tomllib.loads(text)) == {"settings", "groups"}, (
+        "生成的配置有预期外的顶层键——最常见的成因是 `[settings]` 被写成了 "
+        "`[groups.settings]`（那才会嵌套），或者 [[groups]] 少了一层方括号"
+    )
+```
+
+这条**有牙**（写错任何一个段头都会红），而"先后顺序"那一条**没有**。
+
+---
+
 ## Task 1: U-4 —— `strip_fake_header` 原子写 + `groups` 上锁
 
 **为什么要做（spec §1.6）**：`vigil groups` 列群列表靠 `strip_fake_header(...)`，它**就地截断重写** `data/cache/nt_msg_clear.db`，而 `export` 用的是**同一个文件**（`export._clear_db_path`）。并发时正在跑的 export 会读到半个文件，SQLite 报坏页 —— 于是「消息静默消失」被报告成「QQ 库物理坏页」，一个**指向错误方向**的诊断。
