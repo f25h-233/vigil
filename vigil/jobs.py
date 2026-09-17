@@ -91,10 +91,22 @@ class JobRegistry:
                     job.state = STATE_CANCELLED
                 elif job.state == STATE_RUNNING:
                     job.state = STATE_DONE
-            except Exception as exc:  # noqa: BLE001 — **必须落进 job**，见下
+            except BaseException as exc:  # noqa: BLE001 — **必须落进 job**，见下
                 # ⚠️ 后台线程里没接住的异常会被 Python 打到 stderr 然后**消失**，
                 # 而 stderr 属于 uvicorn 的日志。用户点完按钮看到的只有
                 # 「一直转圈」——轮询端点必须能说出「失败了，原因是 X」。
+                #
+                # ⚠️ 捕 `BaseException` 而不是 `Exception`（T6 复审 Minor-3）：
+                # 只捕 `Exception` 时，`KeyboardInterrupt` / `SystemExit` 会**穿透**
+                # 这里 ⇒ `state` 永远停在 `running`（而 `finished_at` 已经写了）
+                # ⇒ `is_busy()` 此后恒为真，**每一次**「起 job」都被 `JobBusy`
+                # 挡掉，直到重启服务——一条**没有出口**的状态。
+                # （⚠️ 别拿 `MemoryError` 当例子：它是 `Exception` 的子类，
+                #  实测 `issubclass(MemoryError, Exception) is True`，拿它做测例
+                #  是一条**修不修都绿**的空守卫。）
+                #
+                # ⚠️ 不 re-raise：worker 是 daemon 线程，主线程该收到的 Ctrl-C
+                # 照样收到（它不经过这里）；这里只负责把状态**落下来**。
                 job.state = STATE_FAILED
                 job.error = f"{type(exc).__name__}: {exc}"
             finally:

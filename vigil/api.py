@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import datetime as dt
 import pathlib
+import re
 import sqlite3
 import threading
 import time
@@ -46,6 +47,21 @@ from .config import (
 WEB_DIST = REPO_ROOT / "web" / "dist"
 
 MAX_LIMIT = 200
+
+# ⚠️ `/api/bulk-undo` 只接受**本程序自己造的** actor 前缀（T6 复审 Minor-2）。
+# 它挡的是**误用**，不是**权限**——单机自用、没有用户模型，能点这个按钮的人
+# 本来就有权改；前缀闸拦住的是一件具体的事：`{"actor": "web"}` 会把尾部那一整段
+# **人工操作**（改类目、`delete` 行、墓碑行）一次性撤掉，而调用方很可能只是想撤
+# 「刚才那批重排」。定义在**模块级**（不是 `create_app` 里）好让测试直接断言它。
+_ACTOR_PREFIXES = ("reorder:", "bulk:")
+
+# ⚠️ 进度的**字符串协议**（T6 复审 ⚠️W-2）。`reorder.plan_reorder` 的进度通道
+# 就是一条 `on_progress(str)`，而复审明确要求**不改它的签名**（它已经有回调了）。
+# 所以这里读它那两行既有的、给人看的输出——**格式变了会红**：
+# `tests/test_api.py::test_api_reorder_reports_progress_while_running` 钉着
+# 「源消息 … → N 批」必须把 `total` 填上、「批次 i/M」必须把 `done` 填上。
+_PROGRESS_BATCHES = re.compile(r"批次 (\d+)/(\d+)")
+_PROGRESS_TOTAL = re.compile(r"→ (\d+) 批")
 
 # ⚠️ 这张表同时承担**两个**职责，动它之前先看清两种后果不一样：
 #
@@ -242,7 +258,27 @@ def create_app(config: Config) -> FastAPI:
                 status_code=400,
                 detail="没有 LLM 密钥（.env 里的 SILICONFLOW_API_KEY），重排跑不了",
             )
-        actor = f"reorder:{int(time.time())}"
+        # ⚠️ actor 里**必须有随机性**（复审 Minor-2）：只写 `reorder:{秒}`
+        # 的话，同一个秒里起的两个 job 会撞成同一个 actor，于是第二次的
+        # `undo_batch` 会把**两次重排的事件一起撤掉**（尾部连续 + actor 相同），
+        # 而用户以为自己只撤了后一次。时间戳**留着**是给人看的（日志里能对时刻）。
+        actor = f"reorder:{int(time.time())}:{uuid.uuid4().hex[:8]}"
+
+        def on_progress(msg: str) -> None:
+            """把 `plan_reorder` 的进度接到 job 上（复审 ⚠️W-2）。
+
+            ⚠️ 不接线的话 `total`/`done`/`message` 在整轮重排里**恒为 0/空**，
+            而 `_job_out` 把它们暴露给了前端——spec §4.2 ④ 要的「进度」在接口层缺席，
+            用户看到的只有一个转圈。
+            """
+            job.message = msg
+            m = _PROGRESS_BATCHES.search(msg)
+            if m:
+                job.done, job.total = int(m.group(1)), int(m.group(2))
+                return
+            m = _PROGRESS_TOTAL.search(msg)
+            if m:
+                job.total = int(m.group(1))
 
         def work(job: jobs.Job) -> str:
             conn = sqlite3.connect(db_uri, uri=True)
@@ -251,7 +287,7 @@ def create_app(config: Config) -> FastAPI:
                     conn, config=config, api_key=api_key,
                     model=settings.model, base_url=settings.base_url,
                     enable_thinking=settings.enable_thinking,
-                    on_progress=lambda m: None,
+                    on_progress=on_progress,
                     should_stop=job.cancel.is_set,
                 )
             finally:
@@ -280,6 +316,28 @@ def create_app(config: Config) -> FastAPI:
         if job is None:
             raise HTTPException(status_code=404, detail=f"没有这个任务：{job_id}")
         return _job_out(job)
+
+    @app.post("/api/jobs/{job_id}/cancel")
+    def api_job_cancel(job_id: str) -> dict:
+        """请求中断这个 job（**协作式**：worker 在批次之间看到它才会停）。
+
+        ⚠️ 为什么必须有这个端点（T6 复审 Important-1）：`JobRegistry.cancel`
+        此前**全仓零生产调用方**，而下面 `/api/jobs/{id}/undo` 的 409 却写着
+        「先取消它再撤销」——要用户去做一件**做不到**的事；且那个 job 全程占着
+        唯一的 `JobBusy` 名额（一轮重排是分钟级的，只能干等）。
+
+        ⚠️ 「取消」不是「立刻停」：**正在飞的那一批会跑完**（Python 没法从外面
+        杀线程），停的是**下一批**。所以响应里的 `cancelled: true` 只说
+        「请求已受理」，真正结束看轮询到的 `state == "cancelled"`。
+
+        ⚠️ 对**已经结束**的 job 返回 200 + `cancelled: false`，不是 409：
+        那是"手慢了一步"，而 `state` 就在同一个响应里，前端不需要为它写分支。
+        真正的 404 是**没有这个 job**。
+        """
+        job = jobs.registry.get(job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail=f"没有这个任务：{job_id}")
+        return {"cancelled": jobs.registry.cancel(job_id), "state": job.state}
 
     @app.post("/api/jobs/{job_id}/undo")
     def api_job_undo(job_id: str) -> dict:
@@ -327,7 +385,13 @@ def create_app(config: Config) -> FastAPI:
             raise HTTPException(status_code=400, detail="kind 不能为空")
         _reject_controls(kind, "kind")
 
-        known = {c.slug for c in load_categories(categories_path())}
+        # ⚠️ 用 `current_categories()` 而不是 `load_categories(categories_path())`
+        # （复审 Minor-1）：两者都**响亮**（`CategoryError` ⇒ 500），差的只是
+        # 排障那一档——裸 `load_categories` 让 FastAPI 兜成一句
+        # `Internal Server Error`，而前者会说出「config/categories.toml 读不出来：…」。
+        # ⚠️ 这里**不降级**（不像 `group_names_map`）：类目表是这条端点的**前提**
+        # ——不知道有哪些类目就根本判不了 `kind` 合不合法。
+        known = {c.slug for c in current_categories()}
         if kind not in known:
             raise HTTPException(
                 status_code=400,
@@ -353,9 +417,27 @@ def create_app(config: Config) -> FastAPI:
 
     @app.post("/api/bulk-undo")
     def api_bulk_undo(body: dict = Body(...)) -> dict:
+        """撤掉**一次批量操作**写的全部事件（`reorder.apply_reorder` 或
+        `api_bulk_set_kind` 共用同一个 actor）。
+
+        ⚠️ 只接受 `/api/reorder` 与 `/api/bulk-set-kind` 造出来的 actor
+        （`_ACTOR_PREFIXES`，复审 Minor-2）。**必须说清这条边界的性质：
+        它挡的是「误用」，不是「权限」**——单机自用、没有用户模型，能点这个
+        按钮的人本来就有权改。它拦住的是具体的一件事：`{"actor": "web"}` 会把
+        尾部那一整段**人工操作**（改类目、`delete` 行、墓碑行）一次性撤掉，
+        而调用方很可能只是想撤「刚才那批重排」——那是一次**不可逆的静默扩大**。
+        """
         actor = str(body.get("actor", ""))
         if not actor:
             raise HTTPException(status_code=400, detail="actor 不能为空")
+        if not actor.startswith(_ACTOR_PREFIXES):
+            raise HTTPException(
+                status_code=400,
+                detail=f"这个 actor 不是本程序造出来的（批量撤销只认 "
+                f"{list(_ACTOR_PREFIXES)} 开头）：{actor!r}。"
+                "⚠️ 这条闸挡的是误用、不是权限——但它确实会拒绝「撤掉尾部任意"
+                "一段人工操作」这种用法：那属于逐条撤销（`/api/undo`）。",
+            )
         ov = overrides.connect()
         try:
             n = overrides.undo_batch(ov, actor=actor)

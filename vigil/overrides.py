@@ -747,6 +747,19 @@ def _reject_non_tail_undo(
         )
 
 
+def is_deleted(conn: sqlite3.Connection, item_id: int) -> bool:
+    """这条 item 的**最终态**是不是「被软删」——`_state_of` 的公开门面。
+
+    ⚠️ 存在理由是**跨模块调用方**（`reorder.apply_reorder` 在写之前要复查，
+    见 T6 复审 Important-2 的 TOCTOU）。与 `store.dedupe_batch` 是
+    `_dedupe_batch` 的公开别名**同一个形状**：跨模块读私有名会让
+    「哪天改名/改语义」变成一件没人拦得住的事，而让调用方自己抄一句
+    `SELECT deleted FROM item_state` 是**第二份实现**——它一定会漂移
+    （本项目反复吃亏的那个形状）。
+    """
+    return _state_of(conn, item_id)[1] == 1
+
+
 def undo(conn: sqlite3.Connection, *, edit_id: int) -> bool:
     """撤掉一条事件，然后重建状态。事件不存在返回 False。
 

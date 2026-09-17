@@ -51,6 +51,39 @@ def test_a_failing_job_records_the_error_instead_of_dying_silently():
     assert "看不懂" in job.error
 
 
+def test_a_base_exception_also_lands_on_the_job():
+    """⚠️ **`BaseException` 也必须落进 job**（T6 复审 Minor-3）。
+
+    ⚠️ 只捕 `Exception` 的后果不是"少记一条错误"，而是**卡死**：
+    穿透 `except Exception` 的那几类不会落状态，于是 `state` **永远停在 running**
+    （而 `finished_at` 已经写了），而 `is_busy()` 看的就是 `state` ⇒ 此后
+    **每一次**「起 job」都被 `JobBusy` 挡掉，直到重启服务为止——一条**没有出口**的状态。
+
+    ⚠️ **用 `KeyboardInterrupt` 而不是复审原文举的 `MemoryError`**——
+    后者是个**错的例子**，实测：`issubclass(MemoryError, Exception) is True`
+    ⇒ 拿它写这条用例，**修之前就是绿的**（一条空的守卫，E7 形态 4）。
+    `BaseException` 的直接子类只有五个：`BaseExceptionGroup` / `Exception` /
+    `GeneratorExit` / `KeyboardInterrupt` / `SystemExit`，真正会从 worker 里
+    冒出来的是 `KeyboardInterrupt`（**本机就是 uvicorn 所在的那个终端**，
+    用户 Ctrl-C 一下就会打到正在跑重排的线程上）与 `SystemExit`。
+
+    ⚠️ 变异反证：把 `runner` 里的 `except BaseException` 改回 `except Exception`
+    ⇒ 本条**必红**（`job.state` 停在 "running"）。
+    """
+    reg = jobs.JobRegistry()
+
+    def boom(job):
+        raise KeyboardInterrupt("模拟：uvicorn 那个终端被按了 Ctrl-C")
+
+    job = reg.submit("reorder", boom)
+    _wait(job)
+    assert job.state == "failed"
+    assert "KeyboardInterrupt" in job.error
+    assert reg.is_busy() is False, (
+        "state 卡在 running ⇒ 这个 registry 从此再也起不了 job（只能重启服务）"
+    )
+
+
 def test_a_second_job_is_refused_while_one_is_running():
     """⭐ 同一时刻只许一个 job。
 

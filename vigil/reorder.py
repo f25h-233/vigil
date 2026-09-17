@@ -229,9 +229,23 @@ def apply_reorder(
     ⚠️ **全部事件共用同一个 `actor`**——这是「撤销这一整批」的键
     （`overrides.undo_batch`）。逐条 `set_kind` 而各带各的 actor 的话，
     撤销 N 次才能退回重排前，而中途任何一次别的操作都会把它切成两段。
+
+    ⚠️⭐ **每条 change 在写之前复查 `deleted`**（T6 复审 Important-2 的 TOCTOU）：
+    `plan_reorder` 与 `apply_reorder` 之间隔着**整轮 LLM**（1–2 分钟），
+    而用户完全可能在这段时间里把某一条删掉。不复查的话那条 `set_kind` 会落在
+    `delete` **之后** ⇒ `item_state.deleted` 被翻回 0 ⇒ 条目**重新进入 Web 与
+    日报**，而用户以为自己已经删掉它了：一次"成功"的重排就这样静默推翻了 D15。
+
+    ⚠️ 复查用的是**写这一侧同一个连接**（`ov`）上的 `item_state`——那正是
+    `plan_reorder` 当初跳过软删时读的同一张表，所以两边不可能对"什么算删了"
+    有不同看法（R13 的形状：两个视图对同一份日志给出相反答案）。
     """
+    written = 0
     for change in plan.changes:
+        if overrides.is_deleted(ov, change.item_id):
+            continue
         overrides.set_kind(
             ov, item_id=change.item_id, kind=change.new_kind, actor=actor
         )
-    return len(plan.changes)
+        written += 1
+    return written

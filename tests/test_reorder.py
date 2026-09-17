@@ -387,6 +387,43 @@ def test_a_hallucinated_slug_never_reaches_the_plan(db_with_items, llm_returning
     )
 
 
+def test_apply_reorder_does_not_revive_an_item_deleted_after_planning(db_with_items, fake_llm):
+    """⭐⭐ 出口判据 7 的 TOCTOU 边界：**plan 之后**用户删掉的那一条，apply 不许把它复活。
+
+    ⚠️ 窗口是**整轮 LLM 的时间**（1–2 分钟，见 `jobs.py` 的模块 docstring）——
+    用户在界面上删掉一条、而那条的 `set_kind` 正躺在待写的计划里，这不是
+    假想场景，是**每次重排都会开的窗口**。
+
+    ⚠️ 不复查的后果不是一个"多改了一条类目"的小毛病：`set_kind` 落在 `delete`
+    **之后** ⇒ `item_state.deleted` 被翻回 0 ⇒ 条目**重新进入 Web 与日报**，
+    而用户以为自己已经删掉它了。D15（软删是持久的）就这样被一次"成功"的重排
+    静默推翻。
+
+    ⚠️ 变异反证：`apply_reorder` 里不复查 `deleted` ⇒ 本条**必红**
+    （`store.get_item` 又会返回那条）。
+    """
+    plan, _ = reorder.plan_reorder(
+        db_with_items.conn, config=db_with_items.config, api_key="k",
+        on_progress=lambda _: None,
+    )
+    assert plan.changes, "夹具必须能造出至少一条要改的条目，否则本条是空守卫"
+    target = plan.changes[0].item_id
+
+    ov = overrides.connect(db_with_items.overlay_path)
+    try:
+        # ── 用户在这 1–2 分钟里把这条删了 ──
+        overrides.delete_item(ov, item_id=target, msg_id=None)
+        n = reorder.apply_reorder(ov, plan, actor="reorder:test")
+    finally:
+        ov.close()
+
+    assert n == len(plan.changes) - 1, "被删掉的那条不该写 set_kind"
+    assert store.get_item(db_with_items.conn, target) is None, (
+        "重排把用户刚删掉的条目复活了——`set_kind` 落在 `delete` 之后会把 "
+        "`item_state.deleted` 翻回 0，它重新出现在 Web 与日报里（D15 被打破）"
+    )
+
+
 def test_should_stop_halts_between_batches(db_with_items, fake_llm):
     """取消是协作式的：`should_stop` 在**每一批之间**被检查。"""
     calls = {"n": 0}

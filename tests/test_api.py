@@ -1451,33 +1451,41 @@ def _seed_items_db(db: pathlib.Path) -> None:
     条目跟着走」的断言，拿一条本来就是目标类目的条目来测是**空的**
     （改不改都绿）——而 T4 的夹具从不起库，`/api/items` 在它下面本来会炸。
 
-    ⚠️ **M6 T6 起还落 `messages` + `item_sources`**（两条源消息各挂一条条目）：
+    ⚠️ **M6 T6 起还落 `messages` + `item_sources`**（每条源消息各挂一条条目）：
     `/api/reorder` 的输入是 `collect_source_messages`（它 JOIN `item_sources`
     与 `messages`），没有这两张表那就是**空的重排**——`plan.changes` 恒为空，
     于是 `test_api_reorder_undo_returns_to_the_previous_kinds` 里那句
     「`after != before`」会红，而红的原因与它要守的东西无关（夹具缺料）。
     正文里带「通知」二字也是承重的：预筛的保留规则靠关键词（`DEFAULT_KEYWORDS`）。
+
+    ⚠️ **两条条目在 111 群、第三条在 222 群是刻意的**（T6 fix loop 1）：
+    `prefilter.make_batches` **不跨群混批** ⇒ 111 群那两条一批、222 群那条一批
+    ⇒ **两批**。取消（`POST /api/jobs/{id}/cancel`）与进度这两条用例都需要
+    「第一批在飞、第二批还没发」这个中途状态；只有一批时，
+    `plan_reorder` 的 `should_stop` **永远只被调一次且那时还没人喊停**
+    ⇒ 那条接线是**死代码**（复审 Important-1 的实测形状）。
     """
     conn = sqlite3.connect(str(db))
     try:
         store.ensure_schema(conn)
         conn.executescript(_MESSAGE_TABLES_DDL)
         ts = int(dt.datetime(2026, 9, 13, 12, 0).timestamp())
-        for item_id, kind, title, msg_id, content in (
-            (1, "academic", "选课通知", 11, "选课通知：9月16日截止"),
-            (2, "life", "宿舍通知", 12, "宿舍通知：本周五停水检修"),
+        for item_id, kind, title, msg_id, content, gid in (
+            (1, "academic", "选课通知", 11, "选课通知：9月16日截止", 111),
+            (2, "life", "宿舍通知", 12, "宿舍通知：本周五停水检修", 111),
+            (3, "notice", "兼职通知", 13, "兼职招聘：图书馆整理资料", 222),
         ):
             conn.execute(
                 "INSERT INTO messages (msg_id, group_id, ts, sender_uid, content)"
                 " VALUES (?,?,?,?,?)",
-                (msg_id, 111, ts + msg_id, "u1", content),
+                (msg_id, gid, ts + msg_id, "u1", content),
             )
             conn.execute(
                 "INSERT INTO items (item_id, kind, title, detail, event_ts,"
                 " deadline_ts, group_id, actor_uid, place, amount, links, confidence,"
                 " model, prompt_ver, created_at)"
-                " VALUES (?,?,?,NULL,?,NULL,111,'u1',NULL,NULL,'[]',0.9,'m','v1',1)",
-                (item_id, kind, title, ts),
+                " VALUES (?,?,?,NULL,?,NULL,?,'u1',NULL,NULL,'[]',0.9,'m','v1',1)",
+                (item_id, kind, title, ts, gid),
             )
             conn.execute(
                 "INSERT INTO item_sources (item_id, msg_id) VALUES (?,?)",
@@ -1535,10 +1543,20 @@ def _groups_root(tmp_path, monkeypatch, *, snapshot):
         groups=(Group(id=111, name="甲群"),),
     )
 
-    def make() -> TestClient:
-        return TestClient(create_app(cfg))
+    def make(*, raise_server_exceptions: bool = True) -> TestClient:
+        # ⚠️ `raise_server_exceptions=False` 是给**「未捕获异常 ⇒ 500 响应」**
+        # 那类判据留的（T6 fix loop 1 的第一条用户：`/api/items/kinds` 的类目表
+        # 读不出来时**必须说出原因**）。默认 `True` 时那个异常会在测试里
+        # **重新抛出**，于是「响应里有没有原因」这件事**根本断言不到**
+        # ——那是一条"看起来在守、实际只能证明它抛了"的空守卫。
+        return TestClient(
+            create_app(cfg), raise_server_exceptions=raise_server_exceptions
+        )
 
-    make.item_ids = [1, 2]  # type: ignore[attr-defined]
+    make.item_ids = [1, 2, 3]  # type: ignore[attr-defined]
+    # ⚠️ 主库**文件路径**也挂上（T6 fix loop 1）：`test_api_reorder_never_writes_
+    # the_main_db` 要按 D11 的机械判据（逐字节指纹）验**整条 API 路径**。
+    make.db_path = data / "vigil.db"  # type: ignore[attr-defined]
     return make
 
 
@@ -2077,8 +2095,22 @@ def test_api_undo_refuses_a_corrupt_snapshot_without_consuming_it(client_factory
 # `chat_json`，不换掉的话点一下按钮就是一次**联网**调用（Global Constraint 9）。
 # 它们顺带把 `api.load_llm_key` 也换掉，理由见下面那个夹具的 docstring。
 
-# 假模型判出的类目：与夹具库里那两条（`academic` / `life`）都不同 ⇒ 一定产生变更。
+# 假模型判出的类目：与夹具库里前两条（`academic` / `life`）都不同 ⇒ 一定产生变更。
 _NEW_KIND = "notice"
+
+# 假模型的响应：**三条消息各一条**（第三批——222 群那条——也要有产出，
+# 否则"两批"里有一批永远什么都不产出，进度与取消两条用例的"中途"就没意义了）。
+# ⚠️ `quote` 必须**逐字**出现在正文里（`refine._match_source` 按摘录定位）。
+_REORDER_PAYLOAD = {
+    "items": [
+        {"quote": "选课通知：9月16日截止", "kind": _NEW_KIND,
+         "title": "选课通知", "confidence": 0.9},
+        {"quote": "宿舍通知：本周五停水检修", "kind": _NEW_KIND,
+         "title": "宿舍通知", "confidence": 0.9},
+        {"quote": "兼职招聘：图书馆整理资料", "kind": _NEW_KIND,
+         "title": "兼职通知", "confidence": 0.9},
+    ]
+}
 
 
 @pytest.fixture
@@ -2094,19 +2126,11 @@ def fake_llm(monkeypatch):
     from vigil import reorder as _reorder
     from vigil.llm import LLMResult
 
-    payload = {
-        "items": [
-            {"quote": "选课通知：9月16日截止", "kind": _NEW_KIND,
-             "title": "选课通知", "confidence": 0.9},
-            {"quote": "宿舍通知：本周五停水检修", "kind": _NEW_KIND,
-             "title": "宿舍通知", "confidence": 0.9},
-        ]
-    }
     seen: list[str] = []
 
     def fake(cfg, *, system, user, **kw):  # noqa: ANN001, ANN003
         seen.append(user)
-        return LLMResult(payload=payload, input_tokens=10, output_tokens=5)
+        return LLMResult(payload=_REORDER_PAYLOAD, input_tokens=10, output_tokens=5)
 
     monkeypatch.setattr(_reorder, "chat_json", fake)
     monkeypatch.setattr(_api, "load_llm_key", lambda *a, **k: "k-llm")
@@ -2191,6 +2215,251 @@ def test_api_bulk_set_kind_is_one_actor_so_it_can_be_undone_together(client_fact
     job_actor = r.json()["actor"]
     assert c.post("/api/bulk-undo", json={"actor": job_actor}).status_code == 200
     assert [c.get(f"/api/items/{i}").json()["kind"] for i in ids] == before
+
+
+# ── M6 T6 fix loop 1：取消 / 进度 / 主库指纹 ────────────────────────
+
+
+def _wait_for_job(client, job_id: str, *, timeout: float = 10.0) -> dict:
+    """轮询到 job 结束（`state != "running"`）。超时**响亮地抛**。
+
+    ⚠️ 超时不许静默返回一个半成品 dict：那样 `body["state"] == "done"` 会以
+    「看起来像产品缺陷」的方式红，而真相是 job 卡住了（或夹具的假模型忘了放行）
+    ——一条把排障指向错方向的假红。这里直接说清是哪一种。
+
+    ⚠️ 轮询按**次数**而不是钟表（`test_two_reorders_never_share_an_actor` 会把
+    `time.time` 冻住）——用 `time.time()` 计时的循环在那种用例里会**立刻超时**。
+    """
+    body: dict = {}
+    for _ in range(int(timeout / 0.02)):
+        body = client.get(f"/api/jobs/{job_id}").json()
+        if body["state"] != "running":
+            return body
+        time.sleep(0.02)
+    raise AssertionError(f"job {job_id} 一直没结束（{timeout}s）：{body}")
+
+
+def _main_db_fingerprint(db: pathlib.Path) -> dict[str, str]:
+    """主库 + 侧车文件的 sha256（与 `test_repass` / `test_reorder` 里那两条同形）。"""
+    out: dict[str, str] = {}
+    for suffix in ("", "-wal", "-shm", "-journal"):
+        p = db if not suffix else db.with_name(db.name + suffix)
+        out[suffix or "main"] = (
+            hashlib.sha256(p.read_bytes()).hexdigest() if p.is_file() else "<missing>"
+        )
+    return out
+
+
+class _GatedLLM:
+    """假模型：**第 1 次**调用卡住等测试放行，之后各次立刻返回。
+
+    ⚠️ 为什么要"卡住"：job 跑在后台线程里。没有它的话用例只能"等它跑完再断言"，
+    而「取消」与「进度」这两个卖点**全在中途**——跑完就什么都看不到，
+    两条用例都会退化成"看结果对不对"的空守卫。
+
+    ⚠️ 只卡第一次：第二次立刻返回，这样「取消之后第二批还发不发」是可数的
+    （`calls`）——那正是 `should_stop` 那条接线的机械判据。
+    """
+
+    def __init__(self, payload: dict) -> None:
+        self.payload = payload
+        self.entered = threading.Event()   # 第 1 次调用已进入（确认"真的在飞"）
+        self.gate = threading.Event()      # 测试放行
+        self.calls = 0
+
+    def __call__(self, cfg, *, system, user, **kw):  # noqa: ANN001, ANN003
+        from vigil.llm import LLMResult
+
+        self.calls += 1
+        if self.calls == 1:
+            self.entered.set()
+            self.gate.wait(30)
+        return LLMResult(payload=self.payload, input_tokens=1, output_tokens=1)
+
+
+@pytest.fixture
+def gated_llm(monkeypatch):
+    """见 `_GatedLLM`。⚠️ 同时换掉 `api.load_llm_key`（理由同 `fake_llm`）。"""
+    from vigil import api as _api
+    from vigil import reorder as _reorder
+
+    llm = _GatedLLM(_REORDER_PAYLOAD)
+    monkeypatch.setattr(_reorder, "chat_json", llm)
+    monkeypatch.setattr(_api, "load_llm_key", lambda *a, **k: "k-llm")
+    yield llm
+    llm.gate.set()   # 收尾放行：别让工作线程一直挂在 chat_json 里
+
+
+def test_api_cancel_stops_the_job_and_writes_nothing(client_factory, gated_llm):
+    """⭐ 复审 Important-1：跑着的重排**必须能被中断**。
+
+    ⚠️ 此前 `JobRegistry.cancel` **全仓零生产调用方**（只有测试碰它），
+    而 `/api/jobs/{id}/undo` 的 409 却写着「先取消它再撤销」——
+    要用户去做一件**做不到**的事，且那个 job 全程占着唯一的 JobBusy 名额。
+
+    ⚠️ 这一条同时钉住**两条**接线，缺任何一条它就红：
+      · 端点里真的调 `registry.cancel`（否则 `cancel.is_set()` 永远是 False）；
+      · `plan_reorder` 的 `should_stop=job.cancel.is_set`（否则**第二批照发**）。
+    """
+    c = client_factory()
+    item_id = client_factory.item_ids[0]
+    before = c.get(f"/api/items/{item_id}").json()["kind"]
+
+    job_id = c.post("/api/reorder").json()["job_id"]
+    assert gated_llm.entered.wait(5), "假模型没被调到——后面全是空断言"
+    assert c.get(f"/api/jobs/{job_id}").json()["state"] == "running"
+
+    r = c.post(f"/api/jobs/{job_id}/cancel")
+    assert r.status_code == 200 and r.json()["cancelled"] is True
+
+    # 取消是**协作式**的：它只可能在批次边界生效 ⇒ 必须先把在飞的那一批放行
+    gated_llm.gate.set()
+    body = _wait_for_job(c, job_id)
+
+    assert body["state"] == "cancelled"
+    assert gated_llm.calls == 1, (
+        f"取消之后仍然发了第 {gated_llm.calls} 批——`should_stop` 没接到 `job.cancel`"
+    )
+    assert c.get(f"/api/items/{item_id}").json()["kind"] == before, (
+        "取消之后还是把计划写进了 overlay —— `work()` 的取消早退没接线"
+    )
+
+
+def test_api_cancel_says_so_when_there_is_nothing_to_cancel(client_factory, fake_llm):
+    """⚠️ 对**已经结束**的 job 点取消不是错误：200 + `cancelled: false`。
+
+    ⚠️ 409 会把"手慢了一步"报成"你的请求有问题"，而前端此时需要的只是
+    「它已经不在跑了」——`state` 就在同一个响应里。真正的 404 是**没有这个 job**。
+    """
+    c = client_factory()
+    job_id = c.post("/api/reorder").json()["job_id"]
+    _wait_for_job(c, job_id)
+
+    r = c.post(f"/api/jobs/{job_id}/cancel")
+    assert r.status_code == 200
+    assert r.json()["cancelled"] is False
+    assert r.json()["state"] == "done"
+    assert c.post("/api/jobs/nope/cancel").status_code == 404
+
+
+def test_api_reorder_reports_progress_while_running(client_factory, gated_llm):
+    """⭐ 复审 ⚠️W-2：`total` / `done` / `message` 必须**在跑的时候**就有值。
+
+    ⚠️ 「等它跑完再断言」抓不到这条缺陷：那时 `total`/`done` 会被收尾逻辑填上，
+    而 spec §4.2 ④ 要的"进度"全在中途。所以这里卡住第一批、在**中途**读一次。
+    """
+    c = client_factory()
+    job_id = c.post("/api/reorder").json()["job_id"]
+    assert gated_llm.entered.wait(5)
+
+    mid = c.get(f"/api/jobs/{job_id}").json()
+    assert mid["state"] == "running"
+    assert mid["total"] == 2, (
+        f"跑到中途 total={mid['total']}（夹具是两批）——进度没接线"
+    )
+    assert mid["done"] == 0
+    assert "源消息" in mid["message"], f"跑到中途 message 是空的：{mid['message']!r}"
+
+    gated_llm.gate.set()
+    done = _wait_for_job(c, job_id)
+    assert done["state"] == "done"
+    assert (done["total"], done["done"]) == (2, 2)
+
+
+def test_api_reorder_never_writes_the_main_db(client_factory, fake_llm):
+    """⭐ D11 的机械判据，罩住**整条 API 路径**（含工作线程）。
+
+    ⚠️ 与 `test_reorder.py::test_reorder_writes_only_overlay_and_never_touches_items`
+    的分工：那条只罩 `plan_reorder` / `apply_reorder` 的调用路径。而 job 跑在
+    **工作线程**里——复审实测过：线程里加一句 `UPDATE items SET deadline_ts=NULL`，
+    上面那条**看不见**（它的指纹只在函数边界上取）。
+
+    ⚠️ 生产 `db_uri` 是 `mode=ro`，所以那是**覆盖缺口**、不是现网漏洞；
+    这条把缺口补上：谁的写落进主库，指纹就变。
+    """
+    c = client_factory()
+    db = client_factory.db_path
+    item_id = client_factory.item_ids[0]
+    before_fp = _main_db_fingerprint(db)
+
+    body = _wait_for_job(c, c.post("/api/reorder").json()["job_id"])
+    assert body["state"] == "done"
+    # ⚠️ 非空守卫：重排**真的改了东西**，否则"指纹没变"可能只是"什么都没干"
+    assert c.get(f"/api/items/{item_id}").json()["kind"] == _NEW_KIND
+
+    after_fp = _main_db_fingerprint(db)
+    changed = [k for k in before_fp if before_fp[k] != after_fp[k]]
+    assert not changed, f"`/api/reorder` 动了 data/vigil.db 的字节（D11）：{changed}"
+
+
+def test_api_bulk_undo_refuses_an_actor_it_did_not_mint(client_factory):
+    """⚠️ 复审 Minor-2：`{"actor": "web"}` 能把**尾部那一整段人工操作**撤掉。
+
+    ⚠️ 撤掉的是什么值得说清：`delete` 行（条目重新可见）与墓碑行（D15 的
+    「永不被重抽复活」保护）都在 `item_edits` 里、actor 都是 `web` ⇒
+    一个"撤刚才那批重排"的误操作可以把**用户的删除**一起翻回来。
+
+    ⚠️ **这条边界的性质**：它挡的是**误用**，不是**权限**——单机自用、没有
+    用户模型，能点这个按钮的人本来就有权改。别把它读成一道安全边界。
+    """
+    c = client_factory()
+    item_id = client_factory.item_ids[0]
+    assert c.post(f"/api/items/{item_id}/kind", json={"kind": "life"}).status_code == 200
+
+    r = c.post("/api/bulk-undo", json={"actor": "web"})
+    assert r.status_code == 400
+    assert c.get(f"/api/items/{item_id}").json()["kind"] == "life", (
+        "被拒了却还是撤了——前缀闸必须在**写之前**"
+    )
+
+
+def test_api_bulk_set_kind_says_why_when_the_category_file_is_broken(client_factory):
+    """⚠️ 复审 Minor-1：类目表读不出来时，`/api/items/kinds` 的 500 要**说出原因**。
+
+    ⚠️ 两类响应都"响亮"（都是 500），差的只是**排障那一档**：裸
+    `load_categories(...)` 让 `CategoryError` 逃出去，FastAPI 兜成一句
+    `Internal Server Error`——用户与日志里**一个字的原因都没有**；
+    `current_categories()` 会写清是 `config/categories.toml` 读不出来（还带上原始错误）。
+
+    ⚠️ 这里**不降级**（与 `group_names_map()` 的显示路径刻意相反）：类目表是这条
+    端点的**前提**——不知道有哪些类目就判不了 `kind` 合不合法。
+    """
+    from vigil import api as _api
+
+    c = client_factory(raise_server_exceptions=False)   # 见工厂的 docstring
+    cfg = _api.REPO_ROOT / "config" / "categories.toml"
+    cfg.write_text("[[categories]\nslug = \"broken\"\n", encoding="utf-8")   # 坏 TOML
+
+    r = c.post("/api/items/kinds", json={"item_ids": [1], "kind": "life"})
+    assert r.status_code == 500
+    # ⚠️ 断言 `r.text` 而不是 `r.json()["detail"]`：变异体（裸 `load_categories`）
+    # 的响应体是 Starlette 那句**纯文本** `Internal Server Error`，`r.json()`
+    # 会先抛 JSONDecodeError ⇒ 又变成"红的原因不是这条断言"。
+    assert "categories.toml" in r.text and "读不出来" in r.text, (
+        f"500 没有说出原因（用户只能看到一句 Internal Server Error）：{r.text[:200]!r}"
+    )
+
+
+def test_two_reorders_never_share_an_actor(client_factory, fake_llm, monkeypatch):
+    """⭐ 复审 Minor-2 的另一半：`actor` 里必须有随机性，不只是秒级时间戳。
+
+    ⚠️ 后果是具体的：两个 job 撞成同一个 actor ⇒ 第二次的 `undo_batch`
+    会把**两次重排的事件一起撤掉**（它们尾部连续、actor 相同），
+    而用户以为自己只撤了后一次。
+
+    ⚠️ 时钟**冻结**是刻意的：正常跑的话两次 POST 之间时钟总会走一点，
+    这条就成了"看运气"的守卫——夹具给的输入必须真的区分得开（E7 的默认值陷阱）。
+    """
+    from vigil import api as _api
+
+    monkeypatch.setattr(_api.time, "time", lambda: 1_700_000_000)
+    c = client_factory()
+    first = c.post("/api/reorder").json()
+    _wait_for_job(c, first["job_id"])
+    second = c.post("/api/reorder").json()
+    assert first["actor"] != second["actor"], (
+        "同一个秒里两个 job 撞成同一个 actor ⇒ 撤销会把两次重排一起撤掉"
+    )
 
 
 # ── M6 T5 Fix loop 2：撤销要整表还原别名（FIX 1）+ 写失败要保守（FIX 3）──
