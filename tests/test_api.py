@@ -10,6 +10,7 @@ from __future__ import annotations
 import datetime as dt
 import hashlib
 import pathlib
+import re
 import sqlite3
 
 import pytest
@@ -998,3 +999,273 @@ def test_delete_item_without_sources_still_works(client, db_path):
         )
     finally:
         ov.close()
+
+
+# ── M5 终审修复轮：非尾部 undo / kind 控制字符 / edit_id 严格转整 ──────────
+
+
+def _add_item(db_path, item_id: int, msg_id: int) -> None:
+    """往临时库补一条 item（带一条源消息）。
+
+    与 `test_delete_item_without_sources_still_works` 的造法同源：**造真库里
+    本来就有的形状**，不是放宽断言。
+    """
+    con = sqlite3.connect(str(db_path))
+    ts = con.execute("SELECT event_ts FROM items WHERE item_id = 1").fetchone()[0]
+    ts = ts + 60 * item_id
+    con.execute(
+        "INSERT INTO items (item_id, kind, title, detail, event_ts, deadline_ts,"
+        " group_id, actor_uid, place, amount, links, confidence, model, prompt_ver,"
+        " created_at) VALUES (?, 'academic', ?, NULL, ?, NULL, 12345, 'u1',"
+        " NULL, NULL, '[]', 0.9, 'm', 'v1', 1)",
+        (item_id, f"第 {item_id} 条", ts),
+    )
+    con.execute(
+        "INSERT INTO messages (msg_id, group_id, ts, sender_uid, content)"
+        " VALUES (?, 12345, ?, 'u1', ?)",
+        (msg_id, ts, f"第 {item_id} 条的原文"),
+    )
+    con.execute(
+        "INSERT INTO item_sources (item_id, msg_id) VALUES (?, ?)", (item_id, msg_id)
+    )
+    con.commit()
+    con.close()
+
+
+def _reading_state(client) -> tuple[dict, frozenset]:
+    """**读取路径**能看到的全部状态：`GET /api/items` 的整个响应 + 墓碑集。
+
+    ⚠️ 判据必须取读取侧（Web 的 ItemCard 与日报读的就是这两样），
+    不能去比 `item_state` 的原始行：`item_state.kind` 对**已软删**的条目是
+    读不到的（所有读取路径都 `_NOT_DELETED` 过滤 + `COALESCE(ost.kind, i.kind)`），
+    拿它当判据会把「可证明惰性」的撤法也判成红。
+    """
+    from vigil import overrides
+
+    ov = overrides.connect()
+    try:
+        return client.get("/api/items").json(), overrides.deleted_msg_ids(ov)
+    finally:
+        ov.close()
+
+
+def test_undo_of_a_non_tail_event_never_silently_flips_state(client, db_path):
+    """⭐ M5 终审 Important-1：非尾部 `undo` **绝不许静默把状态弄坏**。
+
+    终审的复现原文：`POST /api/undo {"edit_id":1}`（一条 `set_kind`，其前其后
+    夹着 `delete`）⇒ 200 `{"undone":true}`，而 `item_state` 从
+    `{life, deleted:0}` 变成 `{kind:NULL, deleted:1}`——「撤销改分类」导致
+    「条目被删」，Web 与日报同时消失。
+
+    ⚠️ 先记一处**对不上**（本轮实测）：终审正文给的事件列表（set_kind → delete）
+    与那个「改前」状态互相矛盾——同一个条目上**最后一条**事件是 delete 时，
+    它必然是 `deleted=1`；`{life, deleted:0}` 只可能出现在
+    「**delete 在前、set_kind 在后**」的日志上。两种形状都钉在下面：
+
+    * **① 终审给的那个具体序列**（set_kind(item1) → delete(item1) → set_kind(item2)，
+      再撤那条**非尾部**的 set_kind）：它被后面那条 delete **覆盖**（该条目之后
+      还有事件）⇒ 撤掉它对所有读取路径**可证明惰性** ⇒ 照旧允许（`True`；
+      `test_undo_accepts_an_explicit_edit_id` 钉着这条既有语义），且**幂等**。
+    * **② 同形、把两条事件对调**（delete(item1) → set_kind(item1) → set_kind(item2)，
+      再撤那条 set_kind）：它**没有**被覆盖 ⇒ 撤掉它会让那条软删重新生效、
+      条目从 Web 与日报同时消失（`{life,0}`→`{NULL,1}`、total 2→1 就是这个形状）
+      ⇒ 必须**响亮拒绝**（409），且状态一个字不动。
+
+    ⚠️ **承重的是 ②**：没有它，这条测试在修复之前也是绿的
+    （① 的前后读取态本来就一样）。变异「去掉 `undo` 里对
+    `_reject_non_tail_undo` 的调用」⇒ ② 变红（409 变 200、条目消失）。
+    """
+    _add_item(db_path, 2, 12)
+    _add_item(db_path, 3, 13)
+    assert client.get("/api/items").json()["total"] == 3, "造场景失败：三条都该可见"
+
+    # ── ① 终审给的那个具体序列 ────────────────────────────────
+    e1 = client.post("/api/items/1/kind", json={"kind": "life"}).json()["edit_id"]
+    e2 = client.delete("/api/items/1").json()["edit_id"]
+    e3 = client.post("/api/items/2/kind", json={"kind": "life"}).json()["edit_id"]
+    assert e1 < e2 < e3, "造场景失败：edit_id 必须递增"
+
+    before = _reading_state(client)
+    assert client.post("/api/undo", json={"edit_id": e1}).json()["undone"] is True, (
+        "被后面事件覆盖的 set_kind 是**可证明惰性**的——既有语义要求它返回 True"
+    )
+    assert _reading_state(client) == before, (
+        "撤一条被覆盖的事件改变了读取路径看到的状态——「撤销」不该让任何条目出现/消失"
+    )
+
+    # ── ② 同形，两条事件对调（终审报的那一格）：item 3 ────────────
+    # ⚠️ 这个形状**造不出**在 HTTP 上：`api_set_kind` 会 `store.get_item`，而
+    # 被软删的条目查不到 ⇒ 404。所以「delete 之后又 set_kind」只可能从
+    # **overlay 层**来（`overrides.*` 是公开的数据层 API；M7 的干预 UI、
+    # 以及将来任何直接调它的脚本都会走到）。而 `POST /api/undo` 是**已发布的
+    # HTTP 契约**：它必须对 overlay 里真实存在的任何日志都不静默弄坏状态。
+    from vigil import overrides
+
+    ov = overrides.connect()
+    try:
+        e_del = overrides.delete_item(ov, item_id=3, msg_id=13)
+        e_kind = overrides.set_kind(ov, item_id=3, kind="life")
+    finally:
+        ov.close()
+    e_other = client.post("/api/items/2/kind", json={"kind": "life"}).json()["edit_id"]
+    assert e_del < e_kind < e_other, "造场景失败：edit_id 必须递增"
+    before2 = _reading_state(client)
+    assert before2[0]["total"] == 2, (
+        f"造场景失败：撤销之前 item 2/3 该可见（item 1 的软删还生效着）："
+        f"{[i['item_id'] for i in before2[0]['items']]}"
+    )
+    assert {i["item_id"]: i["kind"] for i in before2[0]["items"]}[3] == "life", (
+        "造场景失败：那条 delete 之后被 set_kind 覆盖，item 3 该以新类目可见"
+    )
+
+    r = client.post("/api/undo", json={"edit_id": e_kind})
+    assert r.status_code == 409, (
+        f"撤一条**非尾部、且是该条目最后一条**的事件返回了 {r.status_code}："
+        "这一撤会让条目倒退回上一条事件决定的状态（终审：撤销改分类 ⇒ 条目被删）"
+    )
+    assert "detail" in r.json()
+    assert _reading_state(client) == before2, (
+        "被拒绝的撤销仍然改坏了状态——拒绝必须在写之前发生"
+    )
+    # 拒绝不是「卡死」：撤完它后面那条无关的编辑之后，它就回到尾部、照旧撤得掉
+    assert client.post("/api/undo", json={"edit_id": e_other}).json()["undone"] is True
+    assert client.post("/api/undo", json={"edit_id": e_kind}).json()["undone"] is True
+    # 回到尾部再撤 ⇒ 那条软删重新生效、item 3 消失——这是**尾部**的既有语义
+    # （回退最近一次操作），与 ② 拒绝的「从中间抽走」是两件事，不许混为一谈。
+    assert client.get("/api/items").json()["total"] == 1   # 只剩 item 2
+
+
+def test_undo_refuses_a_tombstone_row(client, db_path):
+    """⭐ 非尾部的**墓碑行**也必须拒（终审 Important-1 的第二形态）。
+
+    墓碑行对 `item_state` 完全惰性 ⇒ 撤掉它「状态一点没变、照样返回 True」
+    （用户点「撤销」、毫无反应、系统说成功）；而它唯一的作用是 D15 那道
+    「永不被重抽复活」的保护——撤掉之后 `refine --redo` 会把条目以新 item_id
+    抽出来。所以它不是一次可独立撤销的操作。
+
+    形状：给 item 1 补一条源消息 12（批内去重的**来源取并集**，
+    真库今天 0 例、T3 之后才出现）⇒ delete 会先落墓碑行、再落 delete 行。
+    """
+    from vigil import overrides
+
+    con = sqlite3.connect(str(db_path))
+    con.execute(
+        "INSERT INTO messages (msg_id, group_id, ts, sender_uid, content)"
+        " VALUES (12, 12345, (SELECT event_ts FROM items WHERE item_id = 1),"
+        " 'u1', '兄弟消息')"
+    )
+    con.execute("INSERT INTO item_sources (item_id, msg_id) VALUES (1, 12)")
+    con.commit()
+    con.close()
+
+    e_del = client.delete("/api/items/1").json()["edit_id"]
+    ov = overrides.connect()
+    try:
+        tombs = [
+            int(r[0])
+            for r in ov.execute(
+                "SELECT edit_id FROM item_edits WHERE action = 'tombstone'"
+                " ORDER BY edit_id"
+            )
+        ]
+        assert tombs, "造场景失败：双源条目的 delete 应当先落一条墓碑行"
+        assert tombs[0] < e_del, "墓碑行必须垫在 delete 行之前（undo 只删一条事件）"
+        assert overrides.deleted_msg_ids(ov) == frozenset({11, 12})
+    finally:
+        ov.close()
+
+    r = client.post("/api/undo", json={"edit_id": tombs[0]})
+    assert r.status_code == 409, (
+        f"墓碑行被撤掉了（{r.status_code}）：状态看不出变化，但那条源消息失去了"
+        "「永不被重抽复活」的保护（D15）"
+    )
+    ov = overrides.connect()
+    try:
+        assert overrides.deleted_msg_ids(ov) == frozenset({11, 12}), "墓碑集被改动了"
+    finally:
+        ov.close()
+    # 正面：撤那条**尾部**的 delete，条目真的回来、墓碑全消（既有语义不许被这次修复动到）
+    assert client.post("/api/undo", json={"edit_id": e_del}).json()["undone"] is True
+    assert client.get("/api/items").json()["total"] == 1
+    ov = overrides.connect()
+    try:
+        assert overrides.deleted_msg_ids(ov) == frozenset()
+    finally:
+        ov.close()
+
+
+def test_set_kind_rejects_control_characters(client, db_path):
+    """⭐ M5 终审 Important-2：`kind` 是**日报的章节标题**，注入会落进归档。
+
+    终审复现：`{"kind":"x\\n\\n## ⏰ 别忘\\n- **伪造的紧急条目**"}` ⇒ 200 ⇒
+    `render_markdown` 真的把它渲染成日报的一节，落进 `docs/digests/*.md`
+    （**入 git 的归档**）与 `digests.body_md`。同文件的 `api_add_person` 对
+    label/note 都拒了，`kind` 是漏的那一个。
+
+    ⚠️ 判据取**三条一起**：400 / overlay 里一个字节没写 / `store.window_items`
+    （日报的读取入口）拿不到那个 kind。只看状态码的话，一个「先写再拒」的实现
+    也能全绿。
+
+    变异「删掉 `api_set_kind` 里的 `_reject_controls(kind, "kind")`」⇒ 本条红。
+    """
+    from vigil import overrides, store
+
+    injection = "x\n\n## ⏰ 别忘\n- **伪造的紧急条目**"
+    for kind in [injection, "a\nb", "a\rb", "a\x00b", "a\x1bb", "a\x7fb"]:
+        r = client.post("/api/items/1/kind", json={"kind": kind})
+        assert r.status_code == 400, (kind[:20], r.status_code, r.text)
+
+    ov = overrides.connect()
+    try:
+        assert ov.execute("SELECT COUNT(*) FROM item_edits").fetchone()[0] == 0, (
+            "被拒绝的 kind 仍然写进了 overlay（先写再拒）"
+        )
+    finally:
+        ov.close()
+    assert client.get("/api/items").json()["items"][0]["kind"] == "academic"
+
+    # 日报的读取入口：`window_items` 是 digest 唯一取数据的地方
+    con = sqlite3.connect(f"file:{db_path.as_posix()}?mode=ro", uri=True)
+    try:
+        ts = con.execute("SELECT event_ts FROM items WHERE item_id = 1").fetchone()[0]
+        kinds = [r.kind for r in store.window_items(con, since=ts - 1, until=ts + 1)]
+    finally:
+        con.close()
+    assert kinds == ["academic"], f"注入的 kind 进了日报的读取路径：{kinds}"
+    assert "## ⏰ 别忘" not in client.get("/api/items").text
+
+
+@pytest.mark.parametrize("bad", ["abc", "1", 1.9, 1.0, True, [], {}])
+def test_undo_rejects_a_non_integer_edit_id(client, bad):
+    """⭐ M5 终审 Important-4：`int(target)` 无保护 ⇒ 500（应 400），`1.9` 静默截断。
+
+    实测：`{"edit_id":"abc"}` ⇒ `ValueError`（uvicorn 下 500）；
+    `{"edit_id":1.9}` ⇒ `int(1.9) == 1` ⇒ **撤掉的是另一条事件**，
+    而响应里看不出任何区别。同一文件里 `_day_start` 早就把「转不成就 400」
+    做成了规矩。`True` 也要挡（`bool` 是 `int` 的子类，`True == 1`）。
+
+    ⚠️ 除状态码外还必须断言 **`1.9` 没有把 edit 1 撤掉**——否则「截断」这个
+    真正的伤害（撤错东西）依然可以发生在一个只改状态码的实现里。
+    """
+    from vigil import overrides
+
+    e1 = client.post("/api/items/1/kind", json={"kind": "life"}).json()["edit_id"]
+    r = client.post("/api/undo", json={"edit_id": bad})
+    assert r.status_code == 400, (bad, r.status_code, r.text)
+    assert "detail" in r.json()
+
+    ov = overrides.connect()
+    try:
+        assert (
+            ov.execute(
+                "SELECT COUNT(*) FROM item_edits WHERE edit_id = ?", (e1,)
+            ).fetchone()[0]
+            == 1
+        ), f"{bad!r} 把 edit {e1} 撤掉了——非法输入不许有副作用"
+        assert overrides.last_edit(ov)[0] == e1
+    finally:
+        ov.close()
+    # 反面：真正的整数照旧能撤（不许把这条路一起挡死）
+    assert client.post("/api/undo", json={"edit_id": e1}).json()["undone"] is True
+
+
