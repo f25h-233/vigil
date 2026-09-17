@@ -1540,3 +1540,32 @@ def test_actor_uin_is_none_for_anonymous(memdb):
     items, _ = store.search_items(memdb, limit=50, offset=0)
     assert items[0].actor_uin is None
     assert store.search_items(memdb, actor_uins=[111], limit=50, offset=0)[1] == 0
+
+
+def test_dedupe_batch_key_is_exact_not_normalized():
+    """⭐ M5 终审 Minor-1：去重**键的严格度**零守护（变异实测 578 passed / 0 red）。
+
+    上面那一组守的是「合不合并」（同标题同秒同群要合成一条、换群换秒不许合），
+    **没有一条**守「键有多严」。终审的变异把键改成
+    `(it.title.strip().lower(), it.event_ts, it.group_id)` ⇒ **全绿**，
+    而那个变异的后果是：同群同秒的两条**不同**条目被合并、其中一条从 Web
+    与日报同时消失（`src_msg_ids` 取并集还能掩盖掉一半痕迹），
+    且没有任何测试变红。
+
+    ⚠️ 键是**逐字**的（`(title, event_ts, group_id)`），「顺手规范化一下标题」
+    是**产品决策**而不是重构——这条测试就是要把那个决策钉在明处。
+
+    变异「键改成 `.strip()` / `.lower()` / 两者都上」⇒ 本条红。
+    """
+    out = store.dedupe_batch(
+        [
+            _item("选课通知", src=(11,)),
+            _item("选课通知 ", src=(12,)),      # 只差一个尾空格 ⇒ 仍然是**另一条**
+            _item("CET-4 报名", src=(13,)),
+            _item("cet-4 报名", src=(14,)),      # 只差大小写 ⇒ 仍然是**另一条**
+        ]
+    )
+    assert [i.title for i in out] == [
+        "选课通知", "选课通知 ", "CET-4 报名", "cet-4 报名",
+    ], "键被规范化了：两条不同的条目被合并，其中一条会从 Web 与日报消失"
+    assert [i.src_msg_ids for i in out] == [(11,), (12,), (13,), (14,)]
