@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import os
 import pathlib
 import shutil
 
@@ -41,6 +42,28 @@ def strip_fake_header(src: pathlib.Path, dst: pathlib.Path) -> pathlib.Path:
     """把 QQ 的加密库（带假头）复制成可被 SQLCipher 直接打开的形式。
 
     若源文件已是明文 SQLite 结构则原样复制。已存在且大小正确则跳过。
+
+    ⚠️ **写 dst 必须原子**（U-4，M6 T1）。原实现是
+    ``open(dst, "wb")`` —— 那是「**先截断、再拷**」，而 dst 与 `export`
+    **共用同一个文件**（`export.py:329` 与 `cli.py:66` 指向同一个路径，
+    由 `export._clear_db_path` 定义）。并发时
+    （用户手跑 ``vigil groups`` 而任务计划正在跑 ``vigil export``）：
+
+      1. 后者把这个文件**从 0 字节重新写**；
+      2. 正在读它的 export 于是读到**半个文件 / 空洞**；
+      3. SQLite 报的是**坏页** —— 于是「消息静默消失」被报告成
+         「QQ 库物理坏页」，一个**指向错误方向**的诊断（spec §1.6）。
+
+    ⇒ 改成「同目录临时文件 → fsync → ``os.replace``」：读者要么看到
+    完整的旧版、要么看到完整的新版，**没有第三种状态**。
+    ``os.replace`` 在同一文件系统上是原子的，Windows 上也成立。
+
+    ⚠️ 临时文件名带 **pid**。固定名 ``dst.tmp`` 只对「单写者」成立，
+    而这里恰恰是并发场景；用同一个临时名会让两个进程互相写坏对方正在拷的
+    临时文件 —— 而那只会在 replace 之后才现形，**长得像数据损坏**。
+    ⚠️ 临时文件必须与目标**同目录**（``os.replace`` 不跨卷）。
+    ⚠️ 失败路径要清掉临时文件：`data/cache/` 会被本函数反复扫到，
+    残留的 `.tmp<pid>` 只会越积越多。
     """
     if not src.is_file():
         raise QQDBError(f"库文件不存在: {src}")
@@ -61,10 +84,21 @@ def strip_fake_header(src: pathlib.Path, dst: pathlib.Path) -> pathlib.Path:
             return dst
 
     dst.parent.mkdir(parents=True, exist_ok=True)
-    with open(src, "rb") as f:
-        f.seek(offset)
-        with open(dst, "wb") as out:
-            shutil.copyfileobj(f, out, 64 << 20)
+    tmp = dst.with_name(f"{dst.name}.tmp{os.getpid()}")
+    try:
+        with open(src, "rb") as f:
+            f.seek(offset)
+            with open(tmp, "wb") as out:
+                shutil.copyfileobj(f, out, 64 << 20)
+                # ⚠️ fsync 必须在 replace **之前**：否则断电时可能留下一个
+                # 「名字已就位、内容还在页缓存里」的空文件——那比旧版本更糟，
+                # 因为它**看起来是有效的**（大小对得上时连缓存判据都会放行）。
+                out.flush()
+                os.fsync(out.fileno())
+        os.replace(tmp, dst)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
     return dst
 
 

@@ -1305,3 +1305,25 @@ def test_downgrade_apply_without_fields_never_clears_place(cli_env, monkeypatch,
     assert _item_row(db, 1) == (None, None), (
         "阳性对照失败：place 都没有被降级 ⇒ ① 是空守卫（判据可能整个失效了）"
     )
+
+
+# ── groups：与 export 抢同一个缓存文件 ⇒ 上锁（U-4，M6 T1）────────
+
+
+def test_groups_refuses_to_run_while_another_instance_holds_the_lock(cli_env, monkeypatch):
+    """⭐ U-4 的另一半：`groups` 撞上正在跑的 export 时**响亮失败**，不静默并发。
+
+    ⚠️ 变异反证：把 `cmd_groups` 里的 `with lock.SingleInstance():` 去掉
+    ⇒ 本条**必红**（会真的去读 QQ 库并返回 0）。
+
+    ⚠️ 判据必须是「退出码 2」而不是「抛了 AlreadyRunning」：退出码是
+    任务计划与用户唯一能看的东西（`cmd_daily` / `cmd_export` 都是这个契约）。
+    """
+    from vigil import lock
+
+    def boom(self):
+        raise lock.AlreadyRunning("已有实例在跑（锁：x；上次写入：pid=123）")
+
+    monkeypatch.setattr(lock.SingleInstance, "__enter__", boom)
+    rc = cli.main(["groups"])
+    assert rc == 2

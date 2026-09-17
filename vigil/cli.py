@@ -59,6 +59,30 @@ def _fmt_ts(ts: int) -> str:
 
 
 def cmd_groups(args) -> int:
+    """列出 QQ 本地库里的群。
+
+    ⚠️ **必须上锁**（M6 T1，U-4 的另一半）。本命令会经 `strip_fake_header`
+    **写** `data/cache/nt_msg_clear.db`，而那个文件与 `vigil export` **共用**
+    （`export._clear_db_path`）。不加锁时，用户手跑本命令会与任务计划正在跑的
+    `vigil export` 并发访问同一个缓存文件。
+
+    ⚠️ 原子写（Step 3）解决的是「读者不会看到半个文件」，**不解决并发本身**：
+    两个进程各自剥一次头、各自覆盖一次是白费的重复劳动，而缓存判据
+    （size + mtime）在两者之间抖动，谁赢是随机的。上锁之后本命令的语义与
+    `export` / `refine` / `digest` **完全一致**：撞车时报「已有实例在跑」
+    并给退出码 2，**响亮地失败**，而不是静默地互相踩。
+    """
+    try:
+        with lock.SingleInstance():
+            return _cmd_groups_locked(args)
+    except lock.AlreadyRunning as exc:
+        # 与 `cmd_daily` / `cmd_export` 同一语义：2 不是 1——「上一次还没跑完」
+        # 等着就行，「这次跑失败了」才要人来看。
+        logs.emit(f"[跳过] {exc}")
+        return 2
+
+
+def _cmd_groups_locked(args) -> int:
     config, key = _load_or_die()
 
     counts = qqdb.list_group_message_counts(
