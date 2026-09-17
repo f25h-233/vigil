@@ -1035,3 +1035,207 @@ def test_repass_plan_reports_the_three_safety_buckets_separately(
     for iid in (7, 8, 9):
         assert f"item {iid}" in out, f"item {iid} 没被单独报出来——三只桶被并了"
     assert "没判成" in out and "软删" in out and "日报引用" in out
+
+
+# ── M5 终审 Important-3：字段降级路径（`vigil downgrade`）──────────────
+#
+# `store.downgrade_item_fields` 此前**零调用方**，于是 M5 出口判据 3
+# （「不再存在 `deadline_ts < event_ts` 的条目」）没有所有者：真库 item 83
+# 一直是「event 2026-08-05 / deadline 2026-05-06」，`ItemCard` 在 8 月的
+# 条目上渲染「⏰ 05-06 截止」。
+
+
+def _seed_downgradable(db) -> dict:
+    """造一个导出库，里面四种条目各一条（判据要能分开看）。
+
+    * `1` 倒挂的截止日 + 源文里找不到依据的 place ⇒ **两条都该降级**
+    * `2` 正常的截止日（源文里有 `9月26日`）+ 有依据的 place ⇒ **一个字都不许动**
+    * `3` 被软删、且同样倒挂 ⇒ **跳过**（用户自己隐藏的行，不替他改）
+    * `4` 没有源消息、deadline 正常 ⇒ **不许动**（无来源只影响 place 判据）
+    """
+    import datetime as dt
+    import sqlite3
+
+    from vigil import store
+    from vigil.store import ExtractedItem
+
+    db.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(db))
+    store.ensure_schema(conn)
+    conn.executescript(
+        "CREATE TABLE IF NOT EXISTS messages (msg_id INTEGER PRIMARY KEY,"
+        " group_id INTEGER NOT NULL, ts INTEGER NOT NULL, sender_uid TEXT,"
+        " content TEXT NOT NULL);"
+    )
+    event = int(dt.datetime(2026, 9, 20).timestamp())
+    past = int(dt.datetime(2026, 5, 6).timestamp())
+    with store.transaction(conn):
+        store.save_items(
+            conn,
+            [
+                ExtractedItem(
+                    kind="notice", title="档案袋封口时间：5 月 6 日", detail=None,
+                    event_ts=event, deadline_ts=past, group_id=100, actor_uid=None,
+                    place="立德楼", links=(), amount=None, confidence=0.9,
+                    src_msg_ids=(1,),
+                ),
+                ExtractedItem(
+                    kind="notice", title="报名截止", detail=None,
+                    event_ts=event, deadline_ts=event, group_id=100, actor_uid=None,
+                    place="宿舍", links=(), amount=None, confidence=0.9,
+                    src_msg_ids=(2,),
+                ),
+                ExtractedItem(
+                    kind="notice", title="软删掉的倒挂条目", detail=None,
+                    event_ts=event, deadline_ts=past, group_id=100, actor_uid=None,
+                    place=None, links=(), amount=None, confidence=0.9,
+                    src_msg_ids=(3,),
+                ),
+                ExtractedItem(
+                    kind="notice", title="没有来源的条目", detail=None,
+                    event_ts=event, deadline_ts=event, group_id=100, actor_uid=None,
+                    place=None, links=(), amount=None, confidence=0.9,
+                    src_msg_ids=(),
+                ),
+            ],
+            model="m", prompt_ver="v3", commit=False,
+        )
+        conn.executemany(
+            "INSERT INTO messages (msg_id, group_id, ts, sender_uid, content)"
+            " VALUES (?, 100, ?, 'u1', ?)",
+            [
+                (1, event, "档案袋封口时间：5 月 6 日"),
+                # 这一条的源文里既有 `9月26日`（给 deadline 背书）也有 `宿舍`
+                (2, event, "宿舍报名 9月26日 截止"),
+                (3, event, "软删条的正文"),
+            ],
+        )
+    conn.close()
+
+    from vigil import overrides
+
+    ov = overrides.connect()
+    try:
+        overrides.delete_item(ov, item_id=3, msg_id=3)
+    finally:
+        ov.close()
+    return {"event": event, "past": past}
+
+
+def _item_row(db, item_id: int):
+    import sqlite3
+
+    conn = sqlite3.connect(str(db))
+    try:
+        return conn.execute(
+            "SELECT place, deadline_ts FROM items WHERE item_id = ?", (item_id,)
+        ).fetchone()
+    finally:
+        conn.close()
+
+
+def test_downgrade_dry_run_lists_changes_and_does_not_write(cli_env, monkeypatch, capsys):
+    """默认**只出清单**（不可逆操作事前可见——`repass` / `deadline-audit` 的同一惯例）。
+
+    ⚠️ 只读的清单**不上锁**：给只读检查上锁会凭空造出一个假拒绝（rc=2），
+    而 2 的约定含义是「已经有实例在写」（与 `deadline-audit` 同一条判断）。
+    """
+    from vigil import lock
+
+    db = cli_env / "export.db"
+    seen = _seed_downgradable(db)
+    monkeypatch.setattr(cli, "_load_config_only", lambda: _config(cli_env))
+    monkeypatch.setattr(cli, "_require_export_db", lambda config: db)
+
+    with lock.SingleInstance(lock.LOCK_PATH):
+        assert cli.main(["downgrade"]) == 0, "只读的清单被锁挡住了——那是假拒绝"
+
+    out = capsys.readouterr().out
+    assert "item 1" in out and "倒挂" in out
+    assert "item 3" in out and "软删" in out, "被跳过的软删条目必须报出来，不许静默略过"
+    assert _item_row(db, 1) == ("立德楼", seen["past"]), "dry-run 一个字都不许改库"
+
+
+def test_downgrade_apply_clears_the_inverted_deadline_and_reports_it(
+    cli_env, monkeypatch, capsys
+):
+    """⭐ `--apply` 真写：倒挂的 deadline 置 NULL，**没问题的条目不碰**。
+
+    变异「把 `store.downgrade_item_fields` 换成 `store.clear_deadlines`」⇒
+    本条红（place 那一列不会跟着降级）；变异「把 `scope` 里的软删过滤去掉」⇒
+    软删那条会被改，而下面那句断言它**没被改**。
+    """
+    db = cli_env / "export.db"
+    seen = _seed_downgradable(db)
+    monkeypatch.setattr(cli, "_load_config_only", lambda: _config(cli_env))
+    monkeypatch.setattr(cli, "_require_export_db", lambda config: db)
+
+    # **效果对照**：软删在视图层确实生效（否则「item 3 没被改」证明不了因果）
+    import sqlite3 as _sq
+
+    from vigil import store as _store
+
+    ro = _sq.connect(f"file:{db.as_posix()}?mode=ro", uri=True)
+    try:
+        visible = [w.item_id for w in _store.window_items(ro, since=0, until=2**31)]
+    finally:
+        ro.close()
+    assert 3 not in visible and 1 in visible, "造场景失败：软删没生效，这条守卫是空的"
+
+    assert cli.main(["downgrade", "--apply"]) == 0
+    out = capsys.readouterr().out
+
+    assert _item_row(db, 1) == (None, None), "倒挂的 deadline 该被降级（place 也在内）"
+    assert _item_row(db, 2) == ("宿舍", seen["event"]), "过了闸门的条目被误改"
+    assert _item_row(db, 3) == (None, seen["past"]), "被软删的条目被改了（D15：不替用户改）"
+    assert _item_row(db, 4) == (None, seen["event"]), "没有来源的条目被误改（deadline 是好的）"
+    # 判据自负：命令自己要报出复核结果，而不是等人去查
+    assert "剩 1 条" in out, out
+    # 复核：判据 SQL 数的是**全部** items（含软删）⇒ 还剩 item 3 那一条
+    import sqlite3
+
+    conn = sqlite3.connect(str(db))
+    try:
+        left = conn.execute(
+            "SELECT COUNT(*) FROM items"
+            " WHERE deadline_ts IS NOT NULL AND deadline_ts < event_ts"
+        ).fetchone()[0]
+    finally:
+        conn.close()
+    assert left == 1, "非软删的倒挂条目应当清零（剩的那条是被软删、刻意不动的）"
+
+
+def test_downgrade_apply_returns_2_and_leaves_the_db_alone_when_locked(
+    cli_env, monkeypatch, capsys
+):
+    """撞车 ⇒ **2** + 库一个字没动（与 `deadline-audit --apply` 同一套契约）。
+
+    变异「去掉 `cmd_downgrade` 里的 `with lock.SingleInstance():`」⇒ 本条红，
+    且两个数一起现形（rc 0 而不是 2，**且库已经被改**）。
+    """
+    from vigil import lock
+
+    db = cli_env / "export.db"
+    seen = _seed_downgradable(db)
+    monkeypatch.setattr(cli, "_load_config_only", lambda: _config(cli_env))
+    monkeypatch.setattr(cli, "_require_export_db", lambda config: db)
+
+    with lock.SingleInstance(lock.LOCK_PATH):
+        rc = cli.main(["downgrade", "--apply"])
+    after = _item_row(db, 1)
+
+    assert (rc, after) == (2, ("立德楼", seen["past"])), (
+        f"锁被持有时 rc={rc}（应当是 2）、item 1={after}——退 0 + 库被改说明锁没保护到它"
+    )
+    assert "[跳过]" in capsys.readouterr().out
+
+
+def test_downgrade_fields_deadline_leaves_place_alone(cli_env, monkeypatch):
+    """`--fields deadline` 只动那一列（真库执行时用的就是这个范围）。"""
+    db = cli_env / "export.db"
+    _seed_downgradable(db)
+    monkeypatch.setattr(cli, "_load_config_only", lambda: _config(cli_env))
+    monkeypatch.setattr(cli, "_require_export_db", lambda config: db)
+
+    assert cli.main(["downgrade", "--fields", "deadline", "--apply"]) == 0
+    assert _item_row(db, 1) == ("立德楼", None), "只该降 deadline，place 不许动"
