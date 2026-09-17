@@ -7,6 +7,10 @@
 > ⚠️ **第一版 spec（`2026-09-13-…-design.md`）只覆盖 M1–M4，已冻结，不要照它做 M5。**
 >
 > 最后更新：2026-09-16 深夜　｜　M5 模式：**SDD pipeline**　｜　仓库：`https://github.com/f25h-233/vigil`（private）
+>
+> 🛑 **2026-09-17 追加**：**M5 里的「噪声过滤」线已由用户裁定收束**（不再用 LLM 判据批量清洗商业推广）。
+> 归档：**`docs/superpowers/specs/2026-09-17-vigil-filtering-archive.md`**。
+> **Task 9 的 Step 7/8/9（真库干跑 / apply / 复算判据）作废。**
 
 ---
 
