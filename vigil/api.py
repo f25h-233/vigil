@@ -15,14 +15,16 @@ import datetime as dt
 import pathlib
 import sqlite3
 import threading
+import time
 import tomllib
+import uuid
 from collections.abc import Sequence
 
 from fastapi import Body, FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse, HTMLResponse
 
 from . import categories as categories_mod
-from . import groups_snapshot, logs, overrides, store
+from . import groups_snapshot, jobs, logs, overrides, reorder, store
 from .categories import Category, load_categories
 from .config import (
     REPO_ROOT,
@@ -34,6 +36,8 @@ from .config import (
     Person,
     atomic_write_text,
     load_config,
+    load_llm_key,
+    load_llm_settings,
     load_persons,
     save_config,
     save_persons,
@@ -196,6 +200,168 @@ def create_app(config: Config) -> FastAPI:
     # 它保护的是 QQ 库与主库，**语义不同、别混用**：CLI 拿不到锁时会拒绝运行，
     # 而 Web 不该因为「任务计划在跑」就整个不能保存配置。
     write_lock = threading.Lock()
+
+    # ── 后台 job + 重排（M6 T6）─────────────────────────────────────
+    #
+    # ⚠️ **每个 app 一个 registry 还是全局一个？**——本函数用**模块级**
+    # `jobs.registry`。理由：job 是**进程**级的资源（线程池、token 花费），
+    # 而 `create_app` 在一个进程里可能被调用多次（测试里就是这么用的）。
+    # 用模块级才能在"同一个进程起了两个 app"时仍然只允许一个 job 在跑。
+    # ⚠️ 代价：测试之间会**串**（job 的残留跨用例可见 ⇒ 下一个用例可能撞 409）。
+    # `tests/conftest.py` 的 autouse 夹具 `_isolate_jobs_registry` 为每个用例
+    # 换一份新的（`jobs.registry = jobs.JobRegistry()`）。
+    # ⚠️ **实测（T6）：把它改成空转，连跑 5 次全绿** —— 所以那是一道**防御**
+    # 而不是被测试逼出来的守卫（理由与数字见那个夹具的 docstring）。
+    # 这里刻意不写「不隔离就会红」：编出来的理由比没有理由更危险（勘误 E7）。
+
+    def _job_out(job: jobs.Job) -> dict:
+        return {
+            "job_id": job.job_id,
+            "kind": job.kind,
+            "state": job.state,
+            "total": job.total,
+            "done": job.done,
+            "message": job.message,
+            "error": job.error,
+            "actor": job.actor,
+            "started_at": job.started_at,
+            "finished_at": job.finished_at,
+        }
+
+    @app.post("/api/reorder", status_code=202)
+    def api_reorder() -> dict:
+        """按**当前类目定义**重判已有条目。返回 `job_id`，用 `GET /api/jobs/{id}` 轮询。
+
+        ⚠️ **它只写 overlay，不碰 `data/vigil.db`**（D11/D16 同时成立）。
+        ⚠️ 202 而不是 200：活儿还没干完，这是"已受理"。
+        """
+        settings = load_llm_settings(on_warn=lambda m: None)
+        api_key = load_llm_key()
+        if not api_key:
+            raise HTTPException(
+                status_code=400,
+                detail="没有 LLM 密钥（.env 里的 SILICONFLOW_API_KEY），重排跑不了",
+            )
+        actor = f"reorder:{int(time.time())}"
+
+        def work(job: jobs.Job) -> str:
+            conn = sqlite3.connect(db_uri, uri=True)
+            try:
+                plan, stats = reorder.plan_reorder(
+                    conn, config=config, api_key=api_key,
+                    model=settings.model, base_url=settings.base_url,
+                    enable_thinking=settings.enable_thinking,
+                    on_progress=lambda m: None,
+                    should_stop=job.cancel.is_set,
+                )
+            finally:
+                conn.close()
+            if job.cancel.is_set():
+                return "已取消（一条都没改）"
+            ov = overrides.connect()
+            try:
+                n = reorder.apply_reorder(ov, plan, actor=actor)
+            finally:
+                ov.close()
+            return (
+                f"{n} 条改了类目，{len(plan.unjudged)} 条没判成（它们没被动）"
+            )
+
+        try:
+            job = jobs.registry.submit("reorder", work, actor=actor)
+        except jobs.JobBusy as exc:
+            # 409 而不是 400：请求本身合法，与**当前状态**冲突（与 `/api/undo` 同形）
+            raise HTTPException(status_code=409, detail=str(exc))
+        return _job_out(job)
+
+    @app.get("/api/jobs/{job_id}")
+    def api_job(job_id: str) -> dict:
+        job = jobs.registry.get(job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail=f"没有这个任务：{job_id}")
+        return _job_out(job)
+
+    @app.post("/api/jobs/{job_id}/undo")
+    def api_job_undo(job_id: str) -> dict:
+        """撤销**这一批**重排（一次退回重排前）。
+
+        ⚠️ 与 `/api/undo` 是**两个不同的东西**：那条撤的是「最近一条事件」，
+        这条撤的是「这个 job 写的**全部**事件」。协议上刻意分开。
+        """
+        job = jobs.registry.get(job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail=f"没有这个任务：{job_id}")
+        if job.state == jobs.STATE_RUNNING:
+            raise HTTPException(status_code=409, detail="这个任务还在跑，先取消它再撤销")
+        if not job.actor:
+            raise HTTPException(status_code=400, detail="这个任务没有可撤销的改动")
+        ov = overrides.connect()
+        try:
+            n = overrides.undo_batch(ov, actor=job.actor)
+        finally:
+            ov.close()
+        return {"undone": n > 0, "count": n}
+
+    @app.post("/api/items/kinds")
+    def api_bulk_set_kind(body: dict = Body(...)) -> dict:
+        """人工多选批量改类目（D16 的「界面上多选批量改」那一半）。
+
+        ⚠️ **同一次提交共用一个 `actor`**——那样它就能被
+        `POST /api/bulk-undo` 一次撤销。逐条各给自己的 actor 的话，
+        「改了 5 条、发现改错了」要撤 5 次，而中途任何别的操作都会把它切成两段。
+        """
+        raw_ids = body.get("item_ids")
+        if not isinstance(raw_ids, list) or not raw_ids:
+            raise HTTPException(status_code=400, detail="item_ids 必须是非空数组")
+        ids: list[int] = []
+        for x in raw_ids:
+            if isinstance(x, bool) or not isinstance(x, int) or x <= 0:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"item_ids 里必须都是正整数（拒绝 true：bool 是 int 的子类），收到：{x!r}",
+                )
+            ids.append(x)
+
+        kind = str(body.get("kind", "")).strip()
+        if not kind:
+            raise HTTPException(status_code=400, detail="kind 不能为空")
+        _reject_controls(kind, "kind")
+
+        known = {c.slug for c in load_categories(categories_path())}
+        if kind not in known:
+            raise HTTPException(
+                status_code=400,
+                detail=f"没有这个类目：{kind!r}。现存类目：{sorted(known)}",
+            )
+
+        con = connect()
+        try:
+            missing = [i for i in ids if store.get_item(con, i) is None]
+        finally:
+            con.close()
+        if missing:
+            raise HTTPException(status_code=404, detail=f"没有这些条目：{missing}")
+
+        actor = f"bulk:{uuid.uuid4().hex[:12]}"
+        ov = overrides.connect()
+        try:
+            for iid in ids:
+                overrides.set_kind(ov, item_id=iid, kind=kind, actor=actor)
+        finally:
+            ov.close()
+        return {"actor": actor, "count": len(ids)}
+
+    @app.post("/api/bulk-undo")
+    def api_bulk_undo(body: dict = Body(...)) -> dict:
+        actor = str(body.get("actor", ""))
+        if not actor:
+            raise HTTPException(status_code=400, detail="actor 不能为空")
+        ov = overrides.connect()
+        try:
+            n = overrides.undo_batch(ov, actor=actor)
+        finally:
+            ov.close()
+        return {"undone": n > 0, "count": n}
 
     # ── 类目编辑（M6 T5）────────────────────────────────────────────
     #

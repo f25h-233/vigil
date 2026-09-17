@@ -246,6 +246,35 @@ def _isolate_api_repo_root(tmp_path_factory, monkeypatch):
     monkeypatch.setattr(_api, "REPO_ROOT", root)
 
 
+@pytest.fixture(autouse=True)
+def _isolate_jobs_registry(monkeypatch):
+    """每个用例一份**全新的**后台 job 注册表（M6 T6；勘误 E6 点名要一并考虑的那件）。
+
+    ⚠️ `jobs.registry` 是**模块级单例**（`api.py` 用它），而「同一时刻只许一个
+    job」这条守卫（`JobBusy` → 409）看的是**那个进程**里有没有 running 的 job
+    ⇒ job 的**残留**天然跨用例可见：`slow_llm` 那类夹具就是**故意**留一个
+    running job 的（`test_api_reorder_refuses_a_second_job_while_one_runs`），
+    而它的线程要等夹具 teardown 置了那个 Event 之后才把 state 改成 `failed`
+    ——**那一步是异步的**，下一个用例若跑在它前面，POST 就会撞 409。
+
+    ⚠️ **实测（T6，2026-09-17）：把这个夹具改成空转，连跑 5 次
+    （`tests/test_api.py tests/test_jobs.py tests/test_reorder.py`），
+    每次都是 `108 passed`。** 也就是说它今天**不是**一条被逼出来的守卫，
+    而是一道**防御**——上面那个竞态窗口确实存在（异步），但 teardown 的
+    `gate.set()` 几乎总是先落地。这里**刻意不写「不换就会红」**：那是编的，
+    而本项目最贵的一课是**错的论证比没有论证更危险**（勘误 E4/E7）。
+    留着它的理由只有一条：这类竞态的失败形态是**环境相关的假红**
+    ——只在"恰好来不及"时出现，最难查；而它的代价只是一个 `JobRegistry()`。
+
+    ⚠️ 用 autouse（与上面四道同形）：漏掉一个测试文件就退回"看残留脸色"。
+    ⚠️ 造新实例、**不清空旧实例**：旧实例可能正被一个 daemon 线程改着，
+    清空它等于让那个线程往一个没人看的对象上写（无害，而且是真实发生的事）。
+    """
+    from vigil import jobs as _jobs
+
+    monkeypatch.setattr(_jobs, "registry", _jobs.JobRegistry())
+
+
 @pytest.fixture
 def memdb():
     """内存库。用完即弃，不污染任何真实文件。

@@ -646,6 +646,48 @@ def undo(conn: sqlite3.Connection, *, edit_id: int) -> bool:
     return True
 
 
+def undo_batch(conn: sqlite3.Connection, *, actor: str) -> int:
+    """撤掉**尾部连续的**、属于 `actor` 的全部事件。返回撤了几条。
+
+    ⚠️ **为什么不能靠调用 `undo` N 次**：`undo` 一次只删尾部**一条**，
+    而它带着 `_reject_non_tail_undo` 那道闸门。那道闸门是为「撤一条历史
+    **中间**的事件」设的——那会让状态静默翻转（终审 Important-1：
+    撤一条非尾部 `set_kind` 能让条目从 Web 与日报同时消失，而调用方拿到
+    「成功」）。而**重排的 N 条是一个原子意图**，它们天然是尾部连续的一段，
+    所以批量删它们**不会**碰到那个形状。
+
+    ⚠️ **一旦遇到不属于 `actor` 的事件就停**——继续往下删就变成"从日志中间
+    抽走事件"了，闸门要挡的正是那个。
+
+    ⚠️ 与 `undo` 的另一处不同：本函数**只删、不判**。
+    `_reject_non_tail_undo` 里那条「撤掉之后条目会从可见变成被软删 ⇒ 拒绝」
+    在这里**不适用**——因为重排（`reorder.plan_reorder`）**已经跳过了软删的条目**，
+    所以尾部这段 `set_kind` 背后不可能接着一条会重新生效的 `delete`。
+    这条推理是**承重的**：调用方若绕过 `reorder` 自己造一批 `set_kind`，
+    这条保证就不成立了。
+
+    ⚠️ 删完走 `rebuild_state()`（**完整重算**，不是增量）：增量折叠只对
+    「追加一条」成立，而删除是逆向操作。全表重算在这里是廉价的
+    （单机自用、日志规模是几百到几千行），而"再写一套逆向折叠"是典型的
+    「两份实现会漂移」——本项目反复吃亏的那个形状。
+    """
+    rows = conn.execute(
+        "SELECT edit_id, actor FROM item_edits ORDER BY edit_id DESC"
+    ).fetchall()
+    ids: list[int] = []
+    for edit_id, who in rows:
+        if who != actor:
+            break
+        ids.append(int(edit_id))
+    if not ids:
+        return 0
+    marks = ",".join("?" * len(ids))
+    conn.execute(f"DELETE FROM item_edits WHERE edit_id IN ({marks})", ids)
+    rebuild_state(conn)
+    conn.commit()
+    return len(ids)
+
+
 def last_edit(conn: sqlite3.Connection) -> tuple[int, int, str] | None:
     row = conn.execute(
         "SELECT edit_id, item_id, action FROM item_edits ORDER BY edit_id DESC LIMIT 1"

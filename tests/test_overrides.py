@@ -773,3 +773,52 @@ def test_peek_does_not_consume_the_snapshot(ov):
 
 def test_peek_on_an_empty_stack_is_none(ov):
     assert overrides.peek_config_snapshot(ov) is None
+
+
+# ── M6 T6：批量撤销（重排 / 人工多选批量改共用）────────────────────
+
+
+@pytest.fixture
+def con(ov):
+    """brief 的这两条用例用的是 `con` 这个名字（`reorder` / `api` 侧也是 `con`）。
+
+    ⚠️ 直接复用 `ov` 夹具而不是再抄一份 `sqlite3.connect(":memory:")`：
+    两份夹具会漂移，而它们唯一的契约是「形状与 `overrides.connect()` 一致」
+    （`row_factory = sqlite3.Row`）——`_state_of` 的 `row[0]` 两种写法都吃，
+    但 `dict(row)` 那类用法只吃 Row。
+    """
+    return ov
+
+
+def test_undo_batch_reverts_a_whole_reorder(con):
+    """⭐ 批量撤销：重排写 N 条 `set_kind`，撤销要能**一次退回重排前**。
+
+    ⚠️ 为什么不能靠调用 `undo` N 次：`undo` 一次只删**尾部一条**，
+    而它有一条 `_reject_non_tail_undo` 闸门——那条闸门是为「撤一条历史中间
+    的事件」设的（那会让状态静默翻转）。重排的 N 条是一个**原子意图**，
+    它们天然是尾部连续的一段，所以批量删它们是**安全的**，
+    但语义与 `undo` 不同，必须是单独一个函数（并单独论证）。
+    """
+    overrides.set_kind(con, item_id=1, kind="life", actor="reorder:abc")
+    overrides.set_kind(con, item_id=2, kind="life", actor="reorder:abc")
+    assert overrides.undo_batch(con, actor="reorder:abc") == 2
+    assert overrides.undo_batch(con, actor="reorder:abc") == 0
+    assert overrides._state_of(con, 1) == (None, 0)
+    assert overrides._state_of(con, 2) == (None, 0)
+
+
+def test_undo_batch_stops_at_a_different_actor(con):
+    """⭐ 只撤**尾部连续**的那一段：一旦遇到别的 actor 就停。
+
+    ⚠️ 继续往下删就是把历史事件从日志**中间**抽走——那正是
+    `_reject_non_tail_undo` 挡的形状（撤掉中间一条 `set_kind` 能让条目
+    从 Web 与日报同时消失，而调用方拿到的是"成功"）。
+    """
+    overrides.set_kind(con, item_id=1, kind="life", actor="reorder:abc")
+    overrides.set_kind(con, item_id=2, kind="academic", actor="web")   # 夹在中间
+    overrides.set_kind(con, item_id=3, kind="life", actor="reorder:abc")
+
+    assert overrides.undo_batch(con, actor="reorder:abc") == 1   # 只撤 item 3 那条
+    assert overrides._state_of(con, 3) == (None, 0)
+    assert overrides._state_of(con, 2) == ("academic", 0), "别人的事件不许被碰"
+    assert overrides._state_of(con, 1) == ("life", 0), "更早的那条也不许被碰"

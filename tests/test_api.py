@@ -12,6 +12,8 @@ import hashlib
 import pathlib
 import re
 import sqlite3
+import threading
+import time
 
 import pytest
 from fastapi.testclient import TestClient
@@ -1443,26 +1445,43 @@ desc = "隔离用类目：生活"
 
 
 def _seed_items_db(db: pathlib.Path) -> None:
-    """造一个最小主库：两条条目（`academic` / `life`）。
+    """造一个最小主库：两条条目（`academic` / `life`）+ 各自的源消息。
 
     ⚠️ **两条、且 `item_ids[0]` 那条不是 `life`**：类目用例里「改名/迁移之后
     条目跟着走」的断言，拿一条本来就是目标类目的条目来测是**空的**
     （改不改都绿）——而 T4 的夹具从不起库，`/api/items` 在它下面本来会炸。
+
+    ⚠️ **M6 T6 起还落 `messages` + `item_sources`**（两条源消息各挂一条条目）：
+    `/api/reorder` 的输入是 `collect_source_messages`（它 JOIN `item_sources`
+    与 `messages`），没有这两张表那就是**空的重排**——`plan.changes` 恒为空，
+    于是 `test_api_reorder_undo_returns_to_the_previous_kinds` 里那句
+    「`after != before`」会红，而红的原因与它要守的东西无关（夹具缺料）。
+    正文里带「通知」二字也是承重的：预筛的保留规则靠关键词（`DEFAULT_KEYWORDS`）。
     """
     conn = sqlite3.connect(str(db))
     try:
         store.ensure_schema(conn)
         conn.executescript(_MESSAGE_TABLES_DDL)
         ts = int(dt.datetime(2026, 9, 13, 12, 0).timestamp())
-        for item_id, kind, title in (
-            (1, "academic", "选课通知"), (2, "life", "宿舍通知"),
+        for item_id, kind, title, msg_id, content in (
+            (1, "academic", "选课通知", 11, "选课通知：9月16日截止"),
+            (2, "life", "宿舍通知", 12, "宿舍通知：本周五停水检修"),
         ):
+            conn.execute(
+                "INSERT INTO messages (msg_id, group_id, ts, sender_uid, content)"
+                " VALUES (?,?,?,?,?)",
+                (msg_id, 111, ts + msg_id, "u1", content),
+            )
             conn.execute(
                 "INSERT INTO items (item_id, kind, title, detail, event_ts,"
                 " deadline_ts, group_id, actor_uid, place, amount, links, confidence,"
                 " model, prompt_ver, created_at)"
                 " VALUES (?,?,?,NULL,?,NULL,111,'u1',NULL,NULL,'[]',0.9,'m','v1',1)",
                 (item_id, kind, title, ts),
+            )
+            conn.execute(
+                "INSERT INTO item_sources (item_id, msg_id) VALUES (?,?)",
+                (item_id, msg_id),
             )
         conn.commit()
     finally:
@@ -2050,3 +2069,125 @@ def test_api_undo_refuses_a_corrupt_snapshot_without_consuming_it(client_factory
         assert _ov.peek_config_snapshot(w) is not None, "peek 说栈空了——它被消费掉了"
     finally:
         w.close()
+
+
+# ── M6 T6：重排 job + 人工批量改 ────────────────────────────────────
+#
+# ⚠️ 本节全部用例**必须**用 `fake_llm` / `slow_llm`：`/api/reorder` 背后是真
+# `chat_json`，不换掉的话点一下按钮就是一次**联网**调用（Global Constraint 9）。
+# 它们顺带把 `api.load_llm_key` 也换掉，理由见下面那个夹具的 docstring。
+
+# 假模型判出的类目：与夹具库里那两条（`academic` / `life`）都不同 ⇒ 一定产生变更。
+_NEW_KIND = "notice"
+
+
+@pytest.fixture
+def fake_llm(monkeypatch):
+    """假模型：把两条源消息都判成 `notice`（与库里那两条的类目都不同 ⇒ 一定变更）。
+
+    ⚠️ **为什么连 `api.load_llm_key` 一起换掉**：它读的是**仓库根真实的 `.env`**
+    （`load_llm_key()` 的默认路径 `config.DEFAULT_ENV` 是 import 期算好的常量，
+    夹具的 `monkeypatch` 够不着 `config.REPO_ROOT`）。不换的话，这些用例的成败
+    取决于「本机恰好配了密钥」——一条与环境相关的绿，而 CI/别人机器上是红。
+    """
+    from vigil import api as _api
+    from vigil import reorder as _reorder
+    from vigil.llm import LLMResult
+
+    payload = {
+        "items": [
+            {"quote": "选课通知：9月16日截止", "kind": _NEW_KIND,
+             "title": "选课通知", "confidence": 0.9},
+            {"quote": "宿舍通知：本周五停水检修", "kind": _NEW_KIND,
+             "title": "宿舍通知", "confidence": 0.9},
+        ]
+    }
+    seen: list[str] = []
+
+    def fake(cfg, *, system, user, **kw):  # noqa: ANN001, ANN003
+        seen.append(user)
+        return LLMResult(payload=payload, input_tokens=10, output_tokens=5)
+
+    monkeypatch.setattr(_reorder, "chat_json", fake)
+    monkeypatch.setattr(_api, "load_llm_key", lambda *a, **k: "k-llm")
+    return seen
+
+
+@pytest.fixture
+def slow_llm(monkeypatch):
+    """假模型：**卡住不返回**，让 job 停在 `running`（用例结束后解封）。"""
+    from vigil import api as _api
+    from vigil import reorder as _reorder
+
+    gate = threading.Event()
+
+    def fake(cfg, *, system, user, **kw):  # noqa: ANN001, ANN003
+        gate.wait(30)
+        raise AssertionError("slow_llm 不该被解封")
+
+    monkeypatch.setattr(_reorder, "chat_json", fake)
+    monkeypatch.setattr(_api, "load_llm_key", lambda *a, **k: "k-llm")
+    yield gate
+    gate.set()
+
+
+def test_api_reorder_starts_a_job_and_the_poll_says_it_finished(client_factory, fake_llm):
+    """⭐ 出口判据 7 的接口形式：起一个 job、轮询到结束、结果落 overlay。"""
+    c = client_factory()
+    r = c.post("/api/reorder")
+    assert r.status_code == 202
+    job_id = r.json()["job_id"]
+
+    for _ in range(100):
+        body = c.get(f"/api/jobs/{job_id}").json()
+        if body["state"] != "running":
+            break
+        time.sleep(0.02)
+    assert body["state"] == "done"
+    assert body["kind"] == "reorder"
+
+
+def test_api_reorder_refuses_a_second_job_while_one_runs(client_factory, slow_llm):
+    c = client_factory()
+    assert c.post("/api/reorder").status_code == 202
+    assert c.post("/api/reorder").status_code == 409
+
+
+def test_api_jobs_unknown_id_is_404(client_factory):
+    assert client_factory().get("/api/jobs/nope").status_code == 404
+
+
+def test_api_reorder_undo_returns_to_the_previous_kinds(client_factory, fake_llm):
+    """⭐ 判据 7 的后半条：**撤销能回到重排前**。"""
+    c = client_factory()
+    item_id = client_factory.item_ids[0]
+    before = c.get(f"/api/items/{item_id}").json()["kind"]
+
+    job_id = c.post("/api/reorder").json()["job_id"]
+    for _ in range(100):
+        body = c.get(f"/api/jobs/{job_id}").json()
+        if body["state"] != "running":
+            break
+        time.sleep(0.02)
+
+    after = c.get(f"/api/items/{item_id}").json()["kind"]
+    assert after != before, "夹具必须造出至少一条真的会变，否则本条是空守卫"
+
+    r = c.post(f"/api/jobs/{job_id}/undo")
+    assert r.status_code == 200
+    assert c.get(f"/api/items/{item_id}").json()["kind"] == before
+
+
+def test_api_bulk_set_kind_is_one_actor_so_it_can_be_undone_together(client_factory):
+    """人工多选批量改：**同一次提交共用一个 actor**，于是能一次撤销。"""
+    c = client_factory()
+    ids = client_factory.item_ids[:2]
+    before = [c.get(f"/api/items/{i}").json()["kind"] for i in ids]
+
+    r = c.post("/api/items/kinds", json={"item_ids": ids, "kind": "life"})
+    assert r.status_code == 200
+    assert all(c.get(f"/api/items/{i}").json()["kind"] == "life" for i in ids)
+
+    job_actor = r.json()["actor"]
+    assert c.post("/api/bulk-undo", json={"actor": job_actor}).status_code == 200
+    assert [c.get(f"/api/items/{i}").json()["kind"] for i in ids] == before
