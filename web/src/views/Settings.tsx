@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import type { CategoryDetail, GroupRow, LlmSettings } from '../types.ts'
+import type { CategoryDetail, GroupRow, JobRow, LlmSettings } from '../types.ts'
 import * as api from '../api.ts'
 
 // 「配置」tab —— M6 的全部意义：`config/*.toml` 从「手工编辑的文件」变成
@@ -10,13 +10,14 @@ import * as api from '../api.ts'
 // 根本没变。但**「提交 ⇒ 重取」这个模式四节必须一致**——不一致就是 M5 那两个
 // 「改完界面不更新」的缺陷换个页面重演（出口判据 1 的界面形态）。
 
-type Section = 'groups' | 'persons' | 'llm' | 'categories' | 'pack'
+type Section = 'groups' | 'persons' | 'llm' | 'categories' | 'reorder' | 'pack'
 
 const SECTIONS: { key: Section; label: string }[] = [
   { key: 'groups', label: '群' },
   { key: 'persons', label: '人物' },
   { key: 'llm', label: 'LLM' },
   { key: 'categories', label: '类目' },
+  { key: 'reorder', label: '重排' },
   { key: 'pack', label: '导入导出' },
 ]
 
@@ -43,6 +44,7 @@ export default function Settings() {
         {section === 'persons' && <PersonsSection />}
         {section === 'llm' && <LlmSection />}
         {section === 'categories' && <CategoriesSection />}
+        {section === 'reorder' && <ReorderSection />}
         {section === 'pack' && <PackSection />}
       </div>
     </div>
@@ -583,6 +585,192 @@ function CategoriesSection() {
         ↶ 撤销上一次类目改动
       </button>
       {msg !== null && <p className="mt-2 text-xs text-white/60">{msg}</p>}
+    </div>
+  )
+}
+
+// ── 重排（job）────────────────────────────────────────────────────────
+//
+// ⚠️ 这一节是 **M6 的计划补遗**：原计划的 T9 只写了「四节 + 导入导出」，
+// 漏了 spec §4.2 ④ 的「重排 = LLM 重判 + **界面上多选批量改**」。
+// 后果是具体的：出口判据 7（撤销能回到重排前）在 **API 层成立**（5 条用例全绿），
+// 而 `/api/jobs/{id}/cancel`、`/api/items/kinds`、`/api/bulk-undo` 在 `web/` 里
+// **零引用** ⇒ 用户够不到 ⇒ **那个特性事实上不存在**。
+//
+// 三条刻意的形状，每一件都有一个具体的坏法：
+//   ① `job_id` 落 `localStorage`：重排要跑 1–2 分钟，用户很可能刷新页面。
+//      不存的话刷新一次就再也看不到那个 job 的结果了，而它**还在服务端跑着**、
+//      还占着唯一的 `JobBusy` 名额（再点「开始重排」拿到 409，却不知道为什么）。
+//   ② 轮询的依赖列表里 `job?.job_id` 与 `job?.state` **两个都要**：放整个 `job`
+//      对象会每 1 秒重建一次 interval（对象每次渲染都是新的引用），
+//      只放 `job_id` 又会漏掉"状态变了要停"（interval 到终态还活着，白问一辈子）。
+//   ③ 「取消重排」只在 `running` 时出现；「撤销这次重排」只在**非 running 且
+//      `actor` 非空**时出现——`actor` 是那一批改动的键，空的话撤无可撤。
+
+// ⚠️ 模块级常量取名带前缀（而不是 brief 里的裸 `KEY`）：它和别的 section 在
+// 同一个模块作用域里，一个叫 `KEY` 的常量在这里是一颗随时会被撞上的雷。
+const REORDER_JOB_KEY = 'vigil.reorder.job'
+
+const JOB_STATE_LABEL: Record<JobRow['state'], string> = {
+  running: '运行中',
+  done: '已完成',
+  failed: '失败',
+  cancelled: '已取消',
+}
+
+function ReorderSection() {
+  const [job, setJob] = useState<JobRow | null>(null)
+  const [err, setErr] = useState<string | null>(null)
+  const [msg, setMsg] = useState<string | null>(null)
+  // ⚠️ 提交中必须禁掉按钮（与 `GroupsSection` 的 `busy` 同形）：一次请求在飞的
+  // 时候再点一下，第二次多半撞 409「已经有一个后台任务在跑了」，而那句红字会
+  // 盖掉第一句成功提示——用户看到的是"我刚点的重排报错了"。
+  const [busy, setBusy] = useState(false)
+  // 撤过一次（无论撤没撤动）之后按钮就消失：留着一个只会说「没有可撤销的改动」
+  // 的按钮，等于在诱导用户再点一次——而它第二次**必然**是同样那句话。
+  const [undoable, setUndoable] = useState(true)
+
+  // ① 挂载时把上次那个 job 读回来继续看（刷新恢复）。
+  // ⚠️ 读不到（服务重启过、job 早被 LRU 挤掉）就把钥匙清掉：留着一个问不到的
+  // job_id 会让每次刷新都白问一次，而界面上永远是"没有任务"。
+  useEffect(() => {
+    const saved = window.localStorage.getItem(REORDER_JOB_KEY)
+    if (!saved) return
+    api
+      .fetchJob(saved)
+      .then(setJob)
+      .catch(() => window.localStorage.removeItem(REORDER_JOB_KEY))
+  }, [])
+
+  // ② 轮询：只在 running 时开。
+  useEffect(() => {
+    if (job === null || job.state !== 'running') return
+    const t = setInterval(() => {
+      api
+        .fetchJob(job.job_id)
+        .then((j) => {
+          setJob(j)
+          if (j.state !== 'running') window.localStorage.removeItem(REORDER_JOB_KEY)
+        })
+        .catch((e: unknown) => setErr(e instanceof Error ? e.message : String(e)))
+    }, 1000)
+    return () => clearInterval(t)
+  }, [job?.job_id, job?.state])
+
+  async function start() {
+    setErr(null)
+    setMsg(null)
+    setBusy(true)
+    try {
+      const j = await api.startReorder()
+      setJob(j)
+      setUndoable(true)
+      window.localStorage.setItem(REORDER_JOB_KEY, j.job_id)
+      setMsg('已开始。重排要跑 1–2 分钟，可以离开这个页面（刷新也不会丢）。')
+    } catch (e: unknown) {
+      // ⚠️ 409 = **已有 job 在跑**（唯一的 `JobBusy` 名额）。这不是"出错了"，
+      // 而是"等一下"——后端那句 detail 已经把话说清楚了，原样显示即可
+      // （与 `/api/undo` 的 409 同形）。吞掉它的话，用户看到的是一次
+      // 没有任何解释的失败。400 则是"没有 LLM 密钥"，同样照原样说。
+      setErr(e instanceof Error ? e.message : String(e))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  async function cancel() {
+    if (job === null) return
+    setErr(null)
+    setMsg(null)
+    try {
+      const r = await api.cancelJob(job.job_id)
+      // ⚠️ 取消是**协作式**的：`cancelled: true` 只说"请求已受理"，正在飞的那一批
+      // 会跑完。不这么说的话，用户点完看到还在跑会以为按钮坏了（然后去点第二次）。
+      setMsg(
+        r.cancelled
+          ? '已请求取消——正在飞的那一批会跑完，它停在下一批（轮询到「已取消」才算真停）。'
+          : '它已经结束了，这一步没赶上（取消只对正在跑的任务有意义）。',
+      )
+    } catch (e: unknown) {
+      setErr(e instanceof Error ? e.message : String(e))
+    }
+  }
+
+  async function undo() {
+    if (job === null) return
+    setErr(null)
+    setMsg(null)
+    try {
+      const r = await api.undoJob(job.job_id)
+      setMsg(
+        r.undone
+          ? `已撤销这一批：${r.count} 条回到重排前的类目。`
+          : '这一批没有可撤销的改动（可能已经撤过了，或它一条都没改）。',
+      )
+      setUndoable(false)
+    } catch (e: unknown) {
+      // 409 = 它还在跑（先取消再撤销）；404 = job 早没了；500 = overlay 锁住。
+      // 三句都是不同的话，`sendJSON` 已经把后端的 detail 抛上来了，原样显示。
+      setErr(e instanceof Error ? e.message : String(e))
+    }
+  }
+
+  return (
+    <div className="space-y-3">
+      <p className="text-xs text-white/40">
+        重排 = 让 LLM 按**当前类目定义**重判已有条目。它只写 overlay，条目的{' '}
+        <code>item_id</code> 前后不变（D16），所以一整批改错了可以一次退回。
+      </p>
+
+      <div className="flex flex-wrap items-center gap-2">
+        <button
+          onClick={start}
+          disabled={busy}
+          className="rounded-lg bg-sky-500/20 px-3 py-1.5 text-sm text-sky-200 disabled:opacity-40"
+        >
+          开始重排
+        </button>
+        {job !== null && job.state === 'running' && (
+          <button
+            onClick={cancel}
+            className="rounded-lg bg-white/5 px-3 py-1.5 text-sm text-white/60"
+          >
+            取消重排
+          </button>
+        )}
+        {job !== null && job.state !== 'running' && job.actor !== '' && undoable && (
+          <button
+            onClick={undo}
+            className="rounded-lg bg-white/5 px-3 py-1.5 text-sm text-white/60"
+          >
+            ↶ 撤销这次重排
+          </button>
+        )}
+      </div>
+
+      {job !== null && (
+        <div className="rounded-lg bg-white/5 p-3">
+          <p className="text-xs text-white/55">
+            任务 {job.job_id} · {JOB_STATE_LABEL[job.state]}
+            {/* ⚠️ `done` 是「**最后一条成功批次**的序号」，不是"已完成批次数"
+                （后端 docstring 原话）。照实显示，**别自己加一**——那会变成
+                另一句假话：第 1 批就抛异常时用户会看到 2/N，像"全成了"。 */}
+            {job.state === 'running' &&
+              (job.total > 0
+                ? ` · ${job.done}/${job.total}`
+                : ' · 等待第一批进度…')}
+          </p>
+          {job.message !== '' && (
+            <p className="mt-1 text-xs text-white/70">{job.message}</p>
+          )}
+          {job.error !== '' && (
+            <p className="mt-1 text-xs text-red-400">{job.error}</p>
+          )}
+        </div>
+      )}
+
+      {err !== null && <p className="text-xs text-red-400">{err}</p>}
+      {msg !== null && <p className="text-xs text-white/60">{msg}</p>}
     </div>
   )
 }

@@ -184,6 +184,40 @@ export const fetchJob = (jobId: string) => getJSON<JobRow>(`/api/jobs/${jobId}`)
 export const undoJob = (jobId: string) =>
   sendJSON<{ undone: boolean; count: number }>(`/api/jobs/${jobId}/undo`, 'POST')
 
+// ── M6 T11：重排界面用到的三个端点 ───────────────────────────────────
+//
+// ⚠️ 它们此前在 `web/` 里**零引用**（`/api/jobs/{id}/cancel`、`/api/items/kinds`、
+// `/api/bulk-undo`）：后端做了、测了、绿了，而**用户够不到**——那个特性事实上不存在。
+
+/**
+ * 请求中断一个重排。
+ *
+ * ⚠️ 返回体**不是 `JobRow`**——它是 `{"cancelled": bool, "state": str}`，
+ * 与 `fetchJob` 那个端点**不同形**。（计划里这一行写的是 `sendJSON<JobRow>`，
+ * 那会让调用方以为拿到的是完整 job：`job.state` 会是 `undefined`，
+ * 而在 TS 上**一个字都不报**——类型说了一句假话。）
+ *
+ * ⚠️ `cancelled: true` 只说「请求已受理」：取消是**协作式**的（Python 没法从
+ * 外面杀线程），正在飞的那一批会跑完，真正结束看轮询到的 `state == "cancelled"`。
+ * 对**已经结束**的 job 它回 200 + `cancelled: false`，不是 409——那是"手慢了一步"。
+ */
+export const cancelJob = (jobId: string) =>
+  sendJSON<{ cancelled: boolean; state: JobRow['state'] }>(
+    `/api/jobs/${jobId}/cancel`,
+    'POST',
+  )
+
+/** 人工多选批量改类目（D16 的「界面上多选批量改」那一半）。
+ *  ⚠️ 返回的 `actor` 是**撤销的键**——丢了它就再也撤不回这一批。 */
+export const bulkSetKind = (itemIds: number[], kind: string) =>
+  sendJSON<{ actor: string; count: number }>('/api/items/kinds', 'POST', {
+    item_ids: itemIds,
+    kind,
+  })
+
+export const bulkUndo = (actor: string) =>
+  sendJSON<{ undone: boolean; count: number }>('/api/bulk-undo', 'POST', { actor })
+
 export const exportPack = () => getJSON<{ toml: string }>('/api/config/pack')
 
 export const importPack = (toml: string, apply: boolean, keepSettings: boolean) =>

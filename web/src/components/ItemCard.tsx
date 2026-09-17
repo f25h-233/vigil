@@ -7,10 +7,19 @@ import SourceList from './SourceList.tsx'
 export default function ItemCard({
   item,
   onMutated,
+  onSelect,
+  selected,
 }: {
   item: Item
   /** 改动成功后通知父级重取列表。不传则只读（日报页就是这样用的）。 */
   onMutated?: () => void
+  /**
+   * 传了才渲染多选框（信息流的批量改类目用它）。**不传 = 行为一个字不变**
+   * （日报页就是这样用的：那一天的消息是归档，批量改它没有意义）。
+   */
+  onSelect?: (itemId: number) => void
+  /** 只对 `onSelect` 有意义：这张卡片此刻是否被选中。 */
+  selected?: boolean
 }) {
   const [open, setOpen] = useState(false)
   const [sources, setSources] = useState<Source[] | null>(null)
@@ -89,48 +98,63 @@ export default function ItemCard({
 
   return (
     <li className="rounded-xl bg-white/5 p-3">
-      <button onClick={toggle} className="w-full text-left">
-        <div className="flex flex-wrap items-center gap-x-2 text-xs text-sky-400">
-          <span>
-            {item.kind_icon} {item.kind_label}
-          </span>
-          <span className="text-white/30">·</span>
-          <span className="text-white/45">{item.group_name}</span>
-          <span className="ml-auto text-white/40">
-            {relTime(item.event_ts)}
-          </span>
-        </div>
-
-        <p className="mt-1 text-[15px] leading-snug font-medium">
-          {item.title}
-        </p>
-        {item.detail !== null && item.detail !== '' && (
-          <p className="mt-1 text-sm text-white/70">{item.detail}</p>
+      <div className="flex items-start gap-2">
+        {/* ⚠️ 多选框**必须在外层 button 之外**：HTML 不允许 `<button>` 里嵌交互
+            元素（`<input>` 也是），浏览器会把内层踢出来、点击行为变得不可预测
+            ——与下面操作条是同一条理由。`aria-label` 带上标题，否则一页 50 个
+            多选框在屏幕阅读器里全是"复选框"。 */}
+        {onSelect && (
+          <input
+            type="checkbox"
+            checked={selected === true}
+            onChange={() => onSelect(item.item_id)}
+            className="mt-1"
+            aria-label={`选择 ${item.title}`}
+          />
         )}
-
-        <div className="mt-2 flex flex-wrap gap-x-3 gap-y-1 text-xs text-white/50">
-          {/* 截止日只在数据层核验通过时才有值（NULL = 源文里找不到依据）*/}
-          {item.deadline_ts !== null && (
-            <span className="text-amber-400">
-              ⏰ {fmtDate(item.deadline_ts)} 截止
-            </span>
-          )}
-          {item.place !== null && item.place !== '' && (
-            <span>📍 {item.place}</span>
-          )}
-          {item.amount !== null && item.amount !== '' && (
-            <span>💰 {item.amount}</span>
-          )}
-          {item.actor !== null && item.actor !== '' && (
-            <span>@{item.actor}</span>
-          )}
-          {item.source_count > 0 && (
+        <button onClick={toggle} className="w-full min-w-0 flex-1 text-left">
+          <div className="flex flex-wrap items-center gap-x-2 text-xs text-sky-400">
             <span>
-              {open ? '▾' : '▸'} {item.source_count} 条源消息
+              {item.kind_icon} {item.kind_label}
             </span>
+            <span className="text-white/30">·</span>
+            <span className="text-white/45">{item.group_name}</span>
+            <span className="ml-auto text-white/40">
+              {relTime(item.event_ts)}
+            </span>
+          </div>
+
+          <p className="mt-1 text-[15px] leading-snug font-medium">
+            {item.title}
+          </p>
+          {item.detail !== null && item.detail !== '' && (
+            <p className="mt-1 text-sm text-white/70">{item.detail}</p>
           )}
-        </div>
-      </button>
+
+          <div className="mt-2 flex flex-wrap gap-x-3 gap-y-1 text-xs text-white/50">
+            {/* 截止日只在数据层核验通过时才有值（NULL = 源文里找不到依据）*/}
+            {item.deadline_ts !== null && (
+              <span className="text-amber-400">
+                ⏰ {fmtDate(item.deadline_ts)} 截止
+              </span>
+            )}
+            {item.place !== null && item.place !== '' && (
+              <span>📍 {item.place}</span>
+            )}
+            {item.amount !== null && item.amount !== '' && (
+              <span>💰 {item.amount}</span>
+            )}
+            {item.actor !== null && item.actor !== '' && (
+              <span>@{item.actor}</span>
+            )}
+            {item.source_count > 0 && (
+              <span>
+                {open ? '▾' : '▸'} {item.source_count} 条源消息
+              </span>
+            )}
+          </div>
+        </button>
+      </div>
 
       {/* ⚠️ 操作条在**外层 button 之外**：`<button>` 里不能再放 `<select>`/`<button>`
           （HTML 不允许嵌套交互元素），浏览器会把内层踢出去、点击行为变得不可预测。 */}

@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
-import { fetchCategories, fetchItems } from '../api.ts'
+import { bulkSetKind, bulkUndo, fetchCategories, fetchItems } from '../api.ts'
 import ItemCard from '../components/ItemCard.tsx'
 import PersonPicker from '../components/PersonPicker.tsx'
 import type { Category, Item } from '../types.ts'
@@ -47,6 +47,19 @@ export default function Feed({
   const [reloadTick, setReloadTick] = useState(0)
   // 请求序号：慢的旧请求晚于新请求返回时，不许覆盖新结果
   const seq = useRef(0)
+
+  // ── 多选批量改类目（M6 T11；D16 的「界面上多选批量改」那一半）──────────
+  //
+  // ⚠️ 一个 `Set<number>`、**跨分页保留**：用户会先挑几条、再往下翻着补几条
+  // （存在 Feed 里而不是 ItemCard 里，就是为了这件事）。
+  const [selected, setSelected] = useState<Set<number>>(new Set())
+  // ⚠️ `bulkActor` 是**撤销的键**：`bulkSetKind` 回给我们的那个 actor。
+  // 丢掉它，"改了 5 条、发现改错了"就只能一条条改回去。
+  const [bulkActor, setBulkActor] = useState<string | null>(null)
+  const [bulkCount, setBulkCount] = useState(0)
+  const [bulkKind, setBulkKind] = useState('')
+  const [bulkMsg, setBulkMsg] = useState<string | null>(null)
+  const [bulkBusy, setBulkBusy] = useState(false)
 
   // ⚠️ 数组本身的引用每次渲染都变，直接拿它当依赖会让 effect 无限重跑；
   // 而直接对数组做比较又会让"选中顺序不同但集合相同"被当成换了筛选条件。
@@ -142,6 +155,71 @@ export default function Feed({
     setReloadTick((t) => t + 1)
   }
 
+  // ── 多选批量改类目的三个动作 ────────────────────────────────────────
+
+  function toggleSelect(itemId: number) {
+    // ⚠️ 必须造一个新 Set：直接 `setSelected` 里改原对象的话引用没变，
+    // React 不会重渲染，而**屏幕上什么都不会发生**（勾了没反应）。
+    setSelected((prev) => {
+      const next = new Set(prev)
+      if (next.has(itemId)) next.delete(itemId)
+      else next.add(itemId)
+      return next
+    })
+  }
+
+  const kindLabel = (slug: string) =>
+    cats.find((c) => c.slug === slug)?.label ?? slug
+
+  async function applyBulk() {
+    if (selected.size === 0 || bulkKind === '') return
+    setBulkBusy(true)
+    setBulkMsg(null)
+    try {
+      // ⚠️ 一次提交**一个** `actor`（后端为整批共用一个）：那几条从此能被
+      // `POST /api/bulk-undo` 一次退回。逐条各发一次的话，"改了 5 条发现错了"
+      // 要撤 5 次，而中途任何别的操作都会把那一串切成两段。
+      const r = await bulkSetKind([...selected], bulkKind)
+      setBulkActor(r.actor)
+      setBulkCount(r.count)
+      setBulkMsg(
+        `已把 ${r.count} 条改成「${kindLabel(bulkKind)}」——` +
+          '「撤销这次批量改」可以一次退回去。',
+      )
+      setSelected(new Set())
+      // ⚠️ 重取**第一页**（`reload()`），**不是** `retry()`：后者在列表非空时走
+      // `loadMore()`，那是往后**追加**——屏幕上刚改过的那几条不会被刷新，
+      // 用户会以为改动没生效（M5 的 A-Minor-7 就是这个形状）。
+      reload()
+    } catch (e: unknown) {
+      setBulkMsg(e instanceof Error ? e.message : String(e))
+    } finally {
+      setBulkBusy(false)
+    }
+  }
+
+  async function undoBulk() {
+    if (bulkActor === null) return
+    setBulkBusy(true)
+    setBulkMsg(null)
+    try {
+      const r = await bulkUndo(bulkActor)
+      setBulkMsg(
+        r.undone
+          ? `已撤销这一批：${r.count} 条回到原来的类目。`
+          : '这一批没有可撤销的改动（可能已经撤过了）。',
+      )
+      // 撤过一次就把键放掉：那个 actor 底下已经没有事件了，留着它只会
+      // 让按钮再点一次、再看到同一句"没有可撤销的改动"。
+      setBulkActor(null)
+      reload()
+    } catch (e: unknown) {
+      setBulkMsg(e instanceof Error ? e.message : String(e))
+    } finally {
+      setBulkBusy(false)
+    }
+  }
+
   // 计数行里的标签与数字都取自 shown：它们说的是「屏幕上有什么」，
   // 而不是「用户刚选了什么」——后者在请求回来之前只是一句许愿
   const pickedKinds =
@@ -211,6 +289,58 @@ export default function Feed({
       {/* 说清「这句话覆盖的是什么」：带上筛选条件，别让一个数字看起来像全部 */}
       <p className="mt-3 text-xs text-white/40">{countLine}</p>
 
+      {/* ── 多选批量改（选中之后才出现）────────────────────────────────
+          条数写在这儿而不是写成"几条被改了"：`selected` 可能包含**翻页前**
+          选中的条目（这是刻意保留的），说清"已选几条"才对得上用户手里的事实。 */}
+      {selected.size > 0 && (
+        <div className="mt-3 flex flex-wrap items-center gap-2 rounded-lg bg-white/5 p-2.5 text-xs">
+          <span className="text-white/60">已选 {selected.size} 条</span>
+          <select
+            value={bulkKind}
+            onChange={(e) => setBulkKind(e.target.value)}
+            aria-label="批量改成的类目"
+            className="rounded-lg bg-black/30 px-2 py-1 text-xs text-white/70 outline-none"
+          >
+            <option value="">— 改成哪个类目 —</option>
+            {cats.map((c) => (
+              <option key={c.slug} value={c.slug}>
+                {c.icon} {c.label}
+              </option>
+            ))}
+          </select>
+          <button
+            onClick={applyBulk}
+            disabled={bulkBusy || bulkKind === ''}
+            className="rounded-lg bg-sky-500/20 px-3 py-1 text-xs text-sky-200 disabled:opacity-40"
+          >
+            改类目
+          </button>
+          <button
+            onClick={() => setSelected(new Set())}
+            className="rounded-lg bg-white/5 px-2 py-1 text-xs text-white/55"
+          >
+            清空选择
+          </button>
+        </div>
+      )}
+
+      {bulkActor !== null && (
+        <div className="mt-2 flex flex-wrap items-center gap-2 text-xs">
+          <button
+            onClick={undoBulk}
+            disabled={bulkBusy}
+            className="rounded-lg bg-white/5 px-3 py-1.5 text-white/60 disabled:opacity-40"
+          >
+            ↶ 撤销这次批量改（{bulkCount} 条）
+          </button>
+          {/* ⚠️ 说清这个按钮的**范围**：它只拿着最近一批的键，再改一批就换掉了。 */}
+          <span className="text-white/40">
+            它只认最近这一批；再改一批，这一批就撤不回来了。
+          </span>
+        </div>
+      )}
+      {bulkMsg !== null && <p className="mt-2 text-xs text-white/60">{bulkMsg}</p>}
+
       {err !== null && (
         <div className="mt-3 rounded-lg bg-red-500/10 p-3 text-sm text-red-400">
           <p>读取失败：{err}</p>
@@ -244,7 +374,13 @@ export default function Feed({
       <ul className="mt-3 space-y-2">
         {shown !== null &&
           shown.items.map((it) => (
-            <ItemCard key={it.item_id} item={it} onMutated={reload} />
+            <ItemCard
+              key={it.item_id}
+              item={it}
+              onMutated={reload}
+              onSelect={toggleSelect}
+              selected={selected.has(it.item_id)}
+            />
           ))}
       </ul>
 
