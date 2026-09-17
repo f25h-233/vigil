@@ -338,6 +338,25 @@ T6 的 `jobs.registry`（模块级单例）也必须一并考虑**——后者�
 
 ---
 
+### E9（T9 re-review 实测）⚠️ **本仓的 `git archive` 干净副本里，文件全是 CRLF**
+
+**实测**（T9 的 re-reviewer）：本仓 `core.autocrlf=true` + `* text=auto`
+⇒ **`git archive <commit> | tar -x` 导出的文件全是 CRLF**。
+
+⚠️ **影响的是方法论本身**：我在 T1–T11 的派发词里**统一要求**「要干净判据就用 `git archive` 造副本」，
+而**变异反证的针如果在 LF 副本里长成、拿到 CRLF 副本里用，就会命中 0 处**——
+**那正是假信号第 5 格（「变异没打上却报绿」），而本项目已经踩了 5 次。**
+
+⇒ **给所有后续评审/实施的一条硬要求**：
+在 `git archive` 副本里做变异时，**针必须自适应行尾**（或先把文件转成 LF 再改），
+且**每次改完必须核 sha256 与针命中数**。
+（⛔ 不要用 `grep -c $'$'` 判断行尾——M5 实测它是**静默假阴性**；用 `git ls-files --eol`。）
+
+⚠️ **同一条也说明**：`git archive` 副本与工作区的**逐字节差异是预期的**，不是污染。
+判"改干净了没有"要拿**副本内部的前后对比**，不是拿副本与工作区比。
+
+---
+
 ## Task 1: U-4 —— `strip_fake_header` 原子写 + `groups` 上锁
 
 **为什么要做（spec §1.6）**：`vigil groups` 列群列表靠 `strip_fake_header(...)`，它**就地截断重写** `data/cache/nt_msg_clear.db`，而 `export` 用的是**同一个文件**（`export._clear_db_path`）。并发时正在跑的 export 会读到半个文件，SQLite 报坏页 —— 于是「消息静默消失」被报告成「QQ 库物理坏页」，一个**指向错误方向**的诊断。
