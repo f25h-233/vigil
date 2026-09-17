@@ -111,6 +111,31 @@ def _reject_controls(value: str, field: str) -> None:
         )
 
 
+def _edit_id_of(body: dict | None) -> int | None:
+    """请求体里的 `edit_id`：**只接受真正的整数**，缺省/``null`` ⇒ ``None``（撤最近一条）。
+
+    ⚠️ 不能写成 `int(body.get("edit_id"))`（M5 终审 Important-4 实测）：
+    ``"abc"`` 抛 ``ValueError`` ⇒ **500**（而同一文件里 `_day_start` 早就把
+    「转不成就 400」做成了规矩）；``1.9`` 会被 ``int()`` **静默截断**成 1
+    ⇒ 撤掉的是**另一条**事件，而调用方从响应里看不出区别。
+    ``bool`` 也要挡：``True`` 是 ``int`` 的子类（``True == 1``），会静默变成 edit_id 1。
+
+    ⚠️ 契约是「整数」而不是「能转成整数的东西」：``"3"`` 这种字符串也拒——
+    给「静默转一下」留口子，就等于把「1.9 截断」那类缺陷换个形状请回来。
+    """
+    if not isinstance(body, dict):
+        return None
+    target = body.get("edit_id")
+    if target is None:
+        return None
+    if isinstance(target, bool) or not isinstance(target, int):
+        raise HTTPException(
+            status_code=400,
+            detail=f"edit_id 必须是整数（null = 撤最近一条），收到：{target!r}",
+        )
+    return target
+
+
 def create_app(config: Config) -> FastAPI:
     app = FastAPI(title="VIGIL 守夜人", docs_url=None, redoc_url=None)
 
@@ -255,10 +280,18 @@ def create_app(config: Config) -> FastAPI:
 
     @app.post("/api/items/{item_id}/kind")
     def api_set_kind(item_id: int, body: dict = Body(...)) -> dict:
-        """改一条条目的类目。**只写 overlay**（D11）。"""
+        """改一条条目的类目。**只写 overlay**（D11）。
+
+        ⚠️ `kind` 也要过 `_reject_controls`（与 `api_add_person` 的 label/note
+        同一条判据，同一个 helper——M5 终审 Important-2 实测）：`kind` 是
+        **日报的章节标题**（`digest.render_markdown` 按 kind 分桶），一个带换行的
+        kind 会让任意文本成为日报的一节，落进 `docs/digests/*.md`（**入 git 的归档**）
+        与 `digests.body_md`。这跟"名字里有没有换行"是同一件事，只是后果更重。
+        """
         kind = str(body.get("kind", "")).strip()
         if not kind:
             raise HTTPException(status_code=400, detail="kind 不能为空")
+        _reject_controls(kind, "kind")
         con = connect()
         try:
             if store.get_item(con, item_id) is None:
@@ -303,8 +336,15 @@ def create_app(config: Config) -> FastAPI:
 
     @app.post("/api/undo")
     def api_undo(body: dict = Body(default={})) -> dict:
-        """撤销一条编辑。`edit_id` 缺省 = 撤最近一条。"""
-        target = body.get("edit_id") if isinstance(body, dict) else None
+        """撤销一条编辑。`edit_id` 缺省 = 撤最近一条。
+
+        ⚠️ 非尾部 `edit_id` 只在**可证明惰性**时才允许（`overrides.undo` 的
+        docstring 有论证），否则 **409** —— 而不是把一条历史事件从日志中间抽走、
+        让条目的可见状态静默翻转（终审 Important-1：撤一条非尾部 `set_kind`
+        能让条目从 Web 与日报同时消失，而这里返回 `{"undone": true}`）。
+        409 而不是 400：请求本身是合法的，与**日志当前状态**冲突的是这次撤销。
+        """
+        target = _edit_id_of(body)
         ov = overrides.connect()
         try:
             if target is None:
@@ -312,7 +352,10 @@ def create_app(config: Config) -> FastAPI:
                 if last is None:
                     return {"undone": False}
                 target = last[0]
-            return {"undone": overrides.undo(ov, edit_id=int(target))}
+            try:
+                return {"undone": overrides.undo(ov, edit_id=target)}
+            except overrides.OverlayError as exc:
+                raise HTTPException(status_code=409, detail=str(exc))
         finally:
             ov.close()
 
