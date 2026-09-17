@@ -479,3 +479,141 @@ def test_delete_with_extra_sources_tombstones_every_message(ov):
     assert ov.execute(
         "SELECT COUNT(*) FROM item_state WHERE item_id=9"
     ).fetchone()[0] == 0, "undo 之后条目仍被隐藏：这就是「撤销报成功、界面毫无反应」"
+
+
+# --- M5 终审修复轮：非尾部 undo 不许静默弄坏状态（Important-1）-------
+
+
+def _state_row(conn, item_id: int):
+    row = conn.execute(
+        "SELECT kind, deleted FROM item_state WHERE item_id = ?", (item_id,)
+    ).fetchone()
+    return (row["kind"], row["deleted"]) if row else None
+
+
+def _edit_ids(conn) -> list[int]:
+    return [int(r[0]) for r in conn.execute("SELECT edit_id FROM item_edits ORDER BY edit_id")]
+
+
+def test_undo_refuses_when_it_would_re_hide_a_visible_item(ov):
+    """⭐ M5 终审 Important-1：撤一条「某条目最后一条」事件，会让它**重新被软删** ⇒ 拒绝。
+
+    形状（终审报的 `{life, deleted:0}` → `{kind:NULL, deleted:1}`）：先软删、
+    再改分类 ⇒ 条目可见；此时撤掉那条 set_kind，它前面那条 delete 重新生效，
+    条目从 Web 与日报同时消失，而调用方拿到「撤销成功」。
+
+    ⚠️ 为什么**不是**一律拒绝非尾部：`test_undo_accepts_an_explicit_edit_id` 钉着
+    「撤一条被后面 delete 覆盖的 set_kind 必须返回 True」——那种撤法对所有读取
+    路径都惰性（放行的那半在下面两条里钉）。这里拒绝的是**会改变用户看得见的
+    状态**的那一种。
+
+    变异「把 `_reject_non_tail_undo` 里那段 savepoint 试算/`raise` 去掉」⇒ 本条红。
+    """
+    e_del = overrides.delete_item(ov, item_id=9, msg_id=555)
+    e_kind = overrides.set_kind(ov, item_id=9, kind="life")
+    # ⚠️ 必须再有一条**别的条目**的事件：否则 `e_kind` 就是全局尾部，
+    # 而尾部的撤销是「回退最近一次操作」的既有语义，不走这道闸门。
+    e_other = overrides.set_kind(ov, item_id=10, kind="life")
+    assert e_del < e_kind < e_other
+    assert _state_row(ov, 9) == ("life", 0), "造场景失败：set_kind 之后条目该是可见的"
+
+    with pytest.raises(overrides.OverlayError, match="重新被软删"):
+        overrides.undo(ov, edit_id=e_kind)
+
+    assert _state_row(ov, 9) == ("life", 0), "被拒绝的撤销改动了状态——拒绝必须在写之前"
+    assert _edit_ids(ov) == [e_del, e_kind, e_other], "被拒绝的撤销动了事件日志"
+    assert overrides.deleted_msg_ids(ov) == frozenset(), "被拒绝的撤销动了墓碑集"
+
+    # 拒绝不是「卡死」：撤掉它后面那条无关的编辑之后，它就回到**尾部**、照旧撤得掉
+    # （尾部撤销 = 回退最近一次操作，那条软删重新生效是既有语义，不是本闸门的事）
+    assert overrides.undo(ov, edit_id=e_other) is True
+    assert overrides.undo(ov, edit_id=e_kind) is True
+    assert _state_row(ov, 9) == (None, 1), (
+        "尾部撤销应当让那条软删重新生效（deleted=1；kind 由 items 侧兜底）"
+    )
+
+
+def test_undo_allows_a_covered_event_and_a_plain_reclassification(ov):
+    """放行的那两种形状（**既有的、被钉住的**语义不许被这次修复动到）：
+
+    ① **被后面事件覆盖**的 set_kind ⇒ 惰性（最终态由那条决定），返回 True；
+    ② **改分类的条目没被软删过** ⇒ 撤掉它只是把类目退回基础值，条目照旧可见
+       ——「撤掉我早先给某条改的类目」是正常用法，不许被一刀切成 409。
+    """
+    # ① 同一个条目：set_kind 被后面那条 delete 覆盖，且后面还有别的条目的事件
+    e_kind_a = overrides.set_kind(ov, item_id=7, kind="life")
+    overrides.delete_item(ov, item_id=7, msg_id=1)
+    e_other = overrides.set_kind(ov, item_id=8, kind="life")
+    assert e_kind_a < e_other
+    assert _state_row(ov, 7) == ("life", 1), "造场景失败：delete 之后 item 7 该被软删"
+
+    assert overrides.undo(ov, edit_id=e_kind_a) is True, (
+        "被覆盖的事件是惰性的——既有语义（test_undo_accepts_an_explicit_edit_id）要求 True"
+    )
+    # ⚠️ 判据是**读取路径能看到的东西**：`deleted` 不变（条目照旧隐藏）、
+    # 墓碑集不变。`kind` 那一格会从 'life' 变成 NULL——它是 `delete` 折叠时
+    # 保留旧 kind 的副产物，而所有读取路径都 `_NOT_DELETED` 过滤 +
+    # `COALESCE(ost.kind, i.kind)` ⇒ 对一条**已被软删**的条目读不到。
+    assert _state_row(ov, 7)[1] == 1, "撤一条被覆盖的事件把条目弄成可见了"
+    assert overrides.deleted_msg_ids(ov) == frozenset({1}), "墓碑集也不该动"
+
+    # ② 没被软删过的条目：非尾部地撤掉它早先那次改分类 ⇒ 类目退回基础值、条目仍可见
+    e_kind_b = overrides.set_kind(ov, item_id=9, kind="work")
+    overrides.set_kind(ov, item_id=10, kind="life")
+    assert overrides.undo(ov, edit_id=e_kind_b) is True
+    assert _state_row(ov, 9) is None, (
+        "item 9 的事件被撤光了 ⇒ 物化表里不该留行（= 完全没被干预过）"
+    )
+
+
+def test_undo_refuses_a_tombstone_row(ov):
+    """墓碑行不是可独立撤销的操作：撤它不改变任何可见状态，却拆掉 D15 的保护。
+
+    终审记的第二形态原话：「undo 一条墓碑行 ⇒ 状态一点没变，照样返回 True
+    （用户点「撤销」、毫无反应、系统说成功）」。而 `deleted_msg_ids` 一旦少一条，
+    `refine --redo` 会把被软删的条目**以新 item_id 复活**。
+
+    变异「把 `undo` 里墓碑行那道 `raise` 去掉」⇒ 本条红。
+    """
+    e_del = overrides.delete_item(ov, item_id=9, msg_id=555, extra_msg_ids=[556, 557])
+    tombs = [
+        int(r[0])
+        for r in ov.execute(
+            "SELECT edit_id FROM item_edits WHERE action = 'tombstone' ORDER BY edit_id"
+        )
+    ]
+    assert len(tombs) == 2 and tombs[-1] < e_del, "造场景失败：墓碑行该垫在 delete 之前"
+    assert overrides.deleted_msg_ids(ov) == frozenset({555, 556, 557})
+
+    with pytest.raises(overrides.OverlayError, match="墓碑"):
+        overrides.undo(ov, edit_id=tombs[0])
+
+    assert _edit_ids(ov) == [*tombs, e_del]
+    assert overrides.deleted_msg_ids(ov) == frozenset({555, 556, 557})
+
+
+def test_undo_refusal_does_not_discard_caller_writes(ov):
+    """拒绝分支与 savepoint 试算都不许丢掉调用方**未提交**的写入（FIX 2 同族）。
+
+    `undo` 的试算是「真删一次、`rebuild_state`、然后 `ROLLBACK TO SAVEPOINT`」：
+    省掉那个 savepoint 就会把调用方已经写进来、还没 commit 的行一起回滚掉
+    ——这正是 reviewer 当年实测的 FIX 2（1→0）。而 savepoint 本身也是**写**，
+    所以这条要单独钉住。
+    """
+    e_del = overrides.delete_item(ov, item_id=9, msg_id=555)
+    e_kind = overrides.set_kind(ov, item_id=9, kind="life")
+    ov.execute(
+        "INSERT INTO item_edits (item_id, msg_id, action, actor, created_at)"
+        " VALUES (30, 31, 'delete', 't', 0)"
+    )
+
+    with pytest.raises(overrides.OverlayError):
+        overrides.undo(ov, edit_id=e_kind)
+
+    assert ov.execute(
+        "SELECT COUNT(*) FROM item_edits WHERE item_id = 30"
+    ).fetchone()[0] == 1, "undo 的拒绝分支把调用方未提交的写入回滚掉了"
+    assert len(_edit_ids(ov)) == 3, (
+        "试算那次 DELETE 没有被回滚干净：日志里只剩 3 条（两条真实的 + 调用方那一条）"
+    )
+    assert _state_row(ov, 9) == ("life", 0)

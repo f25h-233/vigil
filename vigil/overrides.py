@@ -293,18 +293,107 @@ def delete_item(
     )
 
 
+def _state_of(conn: sqlite3.Connection, item_id: int) -> tuple[str | None, int]:
+    """物化状态里一条 item 的 `(kind, deleted)`；没有行 ⇒ `(None, 0)`（= 没被干预过）。
+
+    ⚠️ 取 `item_state` 而不是自己把事件日志再折叠一遍：那张表的契约就是
+    「与折叠结果恒等」（`test_rebuild_state_matches_incremental` 守着）。
+    """
+    row = conn.execute(
+        "SELECT kind, deleted FROM item_state WHERE item_id = ?", (item_id,)
+    ).fetchone()
+    return (row[0], int(row[1])) if row else (None, 0)
+
+
+def _reject_non_tail_undo(
+    conn: sqlite3.Connection, *, edit_id: int, item_id: int, action: str, tail: int
+) -> None:
+    """非尾部事件的删除：会**静默弄坏状态**的那两种形状，响亮拒绝。
+
+    `undo` 的 docstring 里有完整论证。两条判据：
+
+    * **墓碑行一律拒绝**——它唯一的职责就是 D15 那道「永不被重抽复活」的保护。
+      撤掉它不会让条目回来（它对 `item_state` 惰性），却会让那条源消息失去保护；
+      而且整个状态**看上去一点没变**（终审记的第二形态：用户点「撤销」、
+      界面毫无反应、系统说成功）。
+    * **撤掉之后条目会从「可见」变成「被软删」⇒ 拒绝**。这是终审 Important-1 的
+      那一格：`delete` 之后再 `set_kind` 的条目本来是可见的，撤掉那条 `set_kind`
+      会让它之前那条软删**重新生效**，条目从 Web 与日报同时消失，
+      而调用方拿到的是「撤销成功」。
+
+    ⚠️ 试算是**真删一次再回滚**（savepoint），不是把折叠规则在这里抄第二遍
+    ——「两份实现会漂移」是本项目反复吃亏的形态，而这正是判据唯一说得清的地方。
+    """
+    if action == ACTION_TOMBSTONE:
+        raise OverlayError(
+            f"edit {edit_id} 是 item {item_id} 的墓碑行，不能单独撤：它不是一次"
+            "独立操作，而是那条删除事件的**一半**（垫在 delete 行之前）。撤掉它"
+            "不会让条目回来（墓碑行对 item_state 惰性），却会让这条源消息失去"
+            "「永不被重抽复活」的保护（D15）——`refine --redo` 会把条目以新 item_id"
+            "抽出来。要让条目回来，请撤销那条 delete 事件。"
+        )
+    before_deleted = _state_of(conn, item_id)[1]
+    conn.execute("SAVEPOINT undo_probe")
+    try:
+        conn.execute("DELETE FROM item_edits WHERE edit_id = ?", (edit_id,))
+        rebuild_state(conn)
+        after_deleted = _state_of(conn, item_id)[1]
+    finally:
+        # ⚠️ `ROLLBACK TO` 只撤掉试算写进去的东西，**不碰**调用方在这之前
+        # 未提交的写入（那是 FIX 2 最重的一半，见下面失败分支的注释）。
+        conn.execute("ROLLBACK TO SAVEPOINT undo_probe")
+        conn.execute("RELEASE SAVEPOINT undo_probe")
+    if before_deleted == 0 and after_deleted == 1:
+        raise OverlayError(
+            f"edit {edit_id} 是 item {item_id} 的**最后一条**事件，且撤掉它会让"
+            f"这个条目**重新被软删**（那条更早的 delete 会重新生效），但它不是"
+            f"日志尾部（尾部是 edit {tail}）：用户点的是「撤销改分类」，看到的会是"
+            "条目从 Web 与日报同时消失——而接口返回成功。请先撤掉它之后的编辑，"
+            "或直接撤销那条 delete 事件。"
+        )
+
+
 def undo(conn: sqlite3.Connection, *, edit_id: int) -> bool:
     """撤掉一条事件，然后重建状态。事件不存在返回 False。
 
     ⚠️ 这里是全模块**唯一**一处 DELETE——append-only 的例外。
     它的安全性来自「事件表的尾部没有外部引用」：没有任何东西按 edit_id 持有指针。
+
+    ⚠️ **非尾部事件不许静默弄坏状态**（M5 终审 Important-1 实测）。这条 DELETE
+    只按 `edit_id` 删行，而日志是**按顺序折叠**的（每条目的最终态由它**最后一条**
+    事件决定），于是从中间抽走一条会让它**后面**那些事件改换含义：
+
+      * 抽走**墓碑行** ⇒ `deleted_msg_ids` 少一条 ⇒ `refine --redo` 会把被软删的
+        条目**以新 item_id 复活**（直接违反 D15），而 `item_state` 看上去毫无变化。
+      * 抽走**某条目的最后一条**事件（但它不是全局尾部）⇒ 该条目倒退回上一条
+        事件决定的状态。最刺眼的形状是「先软删、后改分类」：撤销那次改分类会让
+        条目**重新被软删**，从 Web 与日报同时消失，而接口返回
+        `{"undone": true}`（终审用探针复现过）。
+      * 其余形状（被后面事件覆盖的、或只是把类目退回基础值的）⇒ **放行**，
+        且结果与终审之前逐字一致：`test_undo_accepts_an_explicit_edit_id` 钉着
+        「撤一条被后面 delete 覆盖的 set_kind 必须返回 True」，而"撤掉我早先给
+        某条改的类目"是正常用法，它退回 `items.kind` 正是用户要的。
+
+    被拒绝的那两种形状一律抛 `OverlayError`（API 侧映射成 409），**在写之前**
+    就抛出——调用方响亮地知道「这一撤会改变你看见的东西」，而不是静默地改掉它。
+
+    ⚠️ 失败分支**不许** rollback（reviewer 实测的 FIX 2，见下）。
     """
-    cur = conn.execute("DELETE FROM item_edits WHERE edit_id = ?", (edit_id,))
-    if cur.rowcount == 0:
+    row = conn.execute(
+        "SELECT item_id, action FROM item_edits WHERE edit_id = ?", (edit_id,)
+    ).fetchone()
+    if row is None:
         # ⚠️ **不许** rollback（reviewer 实测的 FIX 2）：调用方可能正开着一段事务
         # （T8 的"批量写 + 末尾校验"），回滚会把**它**写进去还没 commit 的东西一起丢掉
         # （实测 1→0）。失败分支本身什么都没改，不需要任何补偿动作。
         return False
+    item_id, action = int(row[0]), str(row[1])
+    tail = conn.execute("SELECT MAX(edit_id) FROM item_edits").fetchone()[0]
+    if edit_id != tail:
+        _reject_non_tail_undo(
+            conn, edit_id=edit_id, item_id=item_id, action=action, tail=int(tail)
+        )
+    conn.execute("DELETE FROM item_edits WHERE edit_id = ?", (edit_id,))
     rebuild_state(conn)
     conn.commit()
     return True
