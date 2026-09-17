@@ -142,11 +142,49 @@ def atomic_write_text(path: pathlib.Path, text: str) -> None:
         raise
 
 
+def _check_persons_shape(path: pathlib.Path, raw: dict) -> None:
+    """名单文件的**形状**不对就响亮报错（M5 终审 Minor-4 实测）。
+
+    ⚠️ 原实现是 `raw.get("persons", [])`：键名拼错时**静默返回空名单**。
+    而 `save_persons` 是**整体覆盖**写（「整体替换不是追加」是它刻意的语义，
+    否则删不掉人）⇒ 一次手误的后果是：
+
+        写 `[[person]]`（少个 s） → load 得到 () → 界面上「加一个人」时
+        load → append → save ⇒ **原有名单被整体覆盖掉，全程零报错**。
+
+    而 `config/persons.toml` 的文件头**自己邀请手工编辑**（「或手工往下面追加
+    一段 `[[persons]]`」），也就是说这条路径一定会被走到。
+
+    ⚠️ 与本模块的立场一致：「配置写错是我们自己的问题，**越早暴露越好**。
+    不猜、不兜底」。所以这里不"宽容地多认几个键名"，直接抛 `ConfigError`——
+    并且把最常见的那个形状（`[[person]]`）在消息里点名。
+    """
+    unknown = sorted(k for k in raw if k != "persons")
+    if unknown:
+        raise ConfigError(
+            f"{path}: 只认 `[[persons]]` 段，却发现了这些顶层键：{unknown}。"
+            "最常见的形状是 `[[person]]`（少写一个 s）——写错的段落会被**整体忽略**："
+            "读出来是一份空名单，而下一次保存是**整体覆盖**写，"
+            "手工加的人会无声消失（M5 终审实测）。请改成 `[[persons]]`。"
+        )
+    section = raw.get("persons", [])
+    if not isinstance(section, list):
+        raise ConfigError(
+            f"{path}: `persons` 必须是**数组表**（`[[persons]]`，两层方括号），"
+            f"实际是 {type(section).__name__}——写成 `[persons]` 时读出来的是"
+            "一张表而不是一串人，后面的逐条校验会以一个看不懂的异常收场。"
+        )
+
+
 def load_persons(path: pathlib.Path | None = None) -> tuple[Person, ...]:
     """读监视人物名单。
 
     ⚠️ **文件不存在返回空元组**（与 `load_config` 的快速失败不同）：
     "一个人都没监视"是完全合法的状态，而 `load_config` 面对的是一份**必需**的配置。
+
+    ⚠️ **但文件存在、形状却不对时必须响亮**（`_check_persons_shape`）：键名拼错
+    （`[[person]]`）在旧实现里静默读成空名单，而 `save_persons` 是整体覆盖写
+    ⇒ 一次手误会让手工加的人无声消失。
 
     ⚠️ `uin = 0` 是匿名哨兵（实测真库 98 行），**必须拒绝**——
     匿名者没有身份，把它加进监视名单是个不会生效的操作，越早暴露越好。
@@ -157,6 +195,8 @@ def load_persons(path: pathlib.Path | None = None) -> tuple[Person, ...]:
 
     with open(target, "rb") as f:
         raw = tomllib.load(f)
+
+    _check_persons_shape(target, raw)
 
     out: list[Person] = []
     seen: set[int] = set()
