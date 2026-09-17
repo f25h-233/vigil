@@ -617,3 +617,41 @@ def test_undo_refusal_does_not_discard_caller_writes(ov):
         "试算那次 DELETE 没有被回滚干净：日志里只剩 3 条（两条真实的 + 调用方那一条）"
     )
     assert _state_row(ov, 9) == ("life", 0)
+
+
+def test_undo_conflict_is_its_own_type_not_a_dumb_overlay_error(ov):
+    """⭐ M5 收尾 scoped re-review A2：两道闸门抛的是 **`UndoConflict`**。
+
+    `OverlayError` 这个父类罩着两种后果完全不同的病：
+      * **与日志状态冲突**（`_reject_non_tail_undo`）⇒ 请求合法、换一条编辑撤就能成
+        ⇒ API 侧该 409；
+      * **基础设施故障**（overlay 文件缺失/挂不上/路径非法）⇒ 服务端自己坏了
+        ⇒ API 侧该 5xx。
+
+    修复前 `api_undo` 一网打尽映成 409，于是 overlay 挂不上时客户端收到
+    「与日志状态冲突」，排障指向错方向。这条在**数据层**钉住判据的**类型**：
+    两处 raise 都必须给 `UndoConflict`（子类），同时它必须仍是 `OverlayError`
+    的子类（既有 `except OverlayError` 的调用方一个都不用改）。
+
+    变异「把两处 `raise UndoConflict(` 改回 `raise OverlayError(`」⇒ 本条红
+    （2 failed——两处各一条），而 API 侧那条 5xx 守卫也一起红。
+    """
+    assert issubclass(overrides.UndoConflict, overrides.OverlayError), (
+        "UndoConflict 必须仍是 OverlayError 的子类——否则既有的 except OverlayError 全漏"
+    )
+
+    # 闸门一：墓碑行
+    e_del = overrides.delete_item(ov, item_id=9, msg_id=555, extra_msg_ids=[556])
+    tomb = ov.execute(
+        "SELECT MIN(edit_id) FROM item_edits WHERE action = 'tombstone'"
+    ).fetchone()[0]
+    with pytest.raises(overrides.UndoConflict, match="墓碑"):
+        overrides.undo(ov, edit_id=int(tomb))
+
+    # 闸门二：撤掉会让可见条目重新被软删
+    e_kind = overrides.set_kind(ov, item_id=9, kind="life")
+    e_other = overrides.set_kind(ov, item_id=10, kind="life")
+    assert e_del < e_kind < e_other
+    with pytest.raises(overrides.UndoConflict, match="重新被软删"):
+        overrides.undo(ov, edit_id=e_kind)
+    assert _state_row(ov, 9) == ("life", 0), "被拒绝的撤销改动了状态"

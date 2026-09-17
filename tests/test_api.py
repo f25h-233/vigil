@@ -1195,6 +1195,80 @@ def test_undo_refuses_a_tombstone_row(client, db_path):
         ov.close()
 
 
+def test_undo_maps_infrastructure_failure_to_5xx_not_a_conflict(client, monkeypatch):
+    """⭐ M5 收尾 scoped re-review A2：overlay 的**基础设施故障**必须是 5xx。
+
+    失败场景（修复前）：`api_undo` 把**任何** `OverlayError` 都映成 409 ⇒
+    overlay 文件缺失 / 挂不上 / 路径非法时，客户端收到「与日志状态冲突」，
+    而真相是**服务端自己坏了** ⇒ 排障被指向错方向（去看「是不是有人并发改了日志」）。
+    `OverlayError` 这个父类同时罩着两种病，只按父类映射就必然合并它们。
+
+    判据是**两种病两个码**，缺一不可（本条两半都跑）：
+      ① 基础设施故障 ⇒ **5xx**（用 `attach_readonly` 那条真实的报错文案构造，
+         它就是「overlay 挂不上」时调用方会看到的那一句）；
+      ② 同一套映射里，**与日志状态冲突**仍必须是 **409** —— A2 的修复不许
+         把终审 Important-1 那两道闸门的语义弄坏。
+
+    ⚠️ **顺序是承重的：② 先跑、替身后打**，且全程**不许**调 `monkeypatch.undo()`。
+    原因（本轮实测，写下来免得再来一次）：`monkeypatch` 是**同一测试内共用的一个
+    夹具实例**，autouse 的 `_isolate_overrides_path` / `_isolate_lock_path` 打的补丁
+    也记在它身上 ⇒ 一句 `undo()` 会把它们**一起**撤掉。后果是 overlay 的
+    `OVERRIDES_DB` 被还原成仓库里**真实的** `data/overrides.db`——这条用例于是
+    往真库里写了 9 条事件，而**没有任何断言会红**（污染是静默的）。
+    所以：② 用真实现、① 只用 `setattr` 替掉一个函数，两者不互相纠缠。
+
+    变异「把 `except overrides.UndoConflict` 那支删掉」⇒ ② 红（409 变 5xx）；
+    变异「把 `except overrides.OverlayError` 那支删掉（或改回 409）」⇒ ① 红。
+    """
+    from vigil import overrides
+
+    # ── ② 真实现的状态冲突：delete 之后又 set_kind（只可能从 overlay 层来，
+    #    `api_set_kind` 对被软删条目会 404），撤那条非尾部的 set_kind
+    ov = overrides.connect()
+    try:
+        e_del = overrides.delete_item(ov, item_id=1, msg_id=11)
+        e_kind = overrides.set_kind(ov, item_id=1, kind="life")
+        e_other = overrides.set_kind(ov, item_id=2, kind="life")
+        assert e_del < e_kind < e_other, "造场景失败：edit_id 必须递增"
+    finally:
+        ov.close()
+    r2 = client.post("/api/undo", json={"edit_id": e_kind})
+    assert r2.status_code == 409, (
+        f"状态冲突返回了 {r2.status_code}：A2 的修复把既有的 409 语义弄坏了"
+        "（非尾部撤销那两道闸门仍必须是 409）"
+    )
+
+    def _log() -> list[int]:
+        conn = overrides.connect()
+        try:
+            return [
+                int(r[0])
+                for r in conn.execute("SELECT edit_id FROM item_edits ORDER BY edit_id")
+            ]
+        finally:
+            conn.close()
+
+    assert _log() == [e_del, e_kind, e_other], "被拒绝的撤销动了事件日志"
+
+    # ── ① 基础设施故障：替掉 `overrides.undo`（`api.py` 按模块属性调它），
+    #    抛的是 `attach_readonly` 那条真实的报错文案
+    def boom(conn, *, edit_id):
+        raise overrides.OverlayError(
+            "overlay 只读挂载失败（**不降级**）。常见原因：本连接不是"
+            " sqlite3.connect(..., uri=True) 打开的；或 data/ 不可写导致 WAL 的"
+            " -shm/-wal 无法重建。"
+        )
+
+    monkeypatch.setattr(overrides, "undo", boom)
+    r = client.post("/api/undo", json={"edit_id": e_kind})
+    assert r.status_code // 100 == 5, (
+        f"overlay 挂不上时返回了 {r.status_code}："
+        "基础设施故障必须是 5xx（409 会把排障指向「与日志状态冲突」这个错方向）"
+    )
+    assert "detail" in r.json()
+    assert _log() == [e_del, e_kind, e_other], "500 那条路动了事件日志"
+
+
 def test_set_kind_rejects_control_characters(client, db_path):
     """⭐ M5 终审 Important-2：`kind` 是**日报的章节标题**，注入会落进归档。
 

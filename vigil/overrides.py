@@ -68,6 +68,29 @@ class OverlayError(RuntimeError):
     """人工干预层的使用错误——快速失败。"""
 
 
+class UndoConflict(OverlayError):
+    """撤销与**日志当前状态**冲突（可证明会静默弄坏状态）⇒ API 侧映射 **409**。
+
+    ⚠️ **为什么必须与 `OverlayError` 分得开**（M5 收尾 scoped re-review A2）：
+    `OverlayError` 这个父类今天罩着**两种后果完全不同**的失败——
+
+    * **与数据冲突**：`_reject_non_tail_undo` 那两道闸门。请求本身合法，
+      冲突的是「日志现在长什么样」⇒ 客户端该收到 **409**，
+      而且**换一条编辑撤就能成**（有自救路径）。
+    * **基础设施故障**：overlay 文件缺失 / 挂不上 / 路径非法
+      （`attach_readonly` 的 `OverlayError`）。这是**服务端自己坏了**，
+      客户端重试多少次都一样 ⇒ 该是 **5xx**。
+
+    把两者映成同一个码（修复前是「任何 `OverlayError` ⇒ 409」），
+    排障会指向**错的方向**：运维去看「是不是有人并发改了日志」，
+    而真相是 overlay 挂不上。**同族教训**：`grep -c $'\\r$'` 那种「看着像量具、
+    其实量的是别的东西」的表述——这里量的就是把两种病合成了一种。
+
+    ⚠️ 仍是 `OverlayError` 的子类：既有的 `except OverlayError`（测试、
+    将来的调用方）一个都不用改，只是**新的**调用方要按需分开捕。
+    """
+
+
 def _qualified_ddl(schema: str) -> list[str]:
     """把 `_TABLES_DDL` 的库名限定到 `schema`，并按语句拆开返回。
 
@@ -323,9 +346,14 @@ def _reject_non_tail_undo(
 
     ⚠️ 试算是**真删一次再回滚**（savepoint），不是把折叠规则在这里抄第二遍
     ——「两份实现会漂移」是本项目反复吃亏的形态，而这正是判据唯一说得清的地方。
+
+    ⚠️ 抛的是 **`UndoConflict`**（`OverlayError` 的子类）而不是裸的 `OverlayError`：
+    API 侧要把它映成 409，而把 overlay 的**基础设施故障**映成 5xx——
+    两种病混在一个类型里，就会得到「overlay 挂不上 ⇒ 客户端看到『与日志状态冲突』」
+    这种把排障指向错方向的映射（M5 收尾 scoped re-review A2）。
     """
     if action == ACTION_TOMBSTONE:
-        raise OverlayError(
+        raise UndoConflict(
             f"edit {edit_id} 是 item {item_id} 的墓碑行，不能单独撤：它不是一次"
             "独立操作，而是那条删除事件的**一半**（垫在 delete 行之前）。撤掉它"
             "不会让条目回来（墓碑行对 item_state 惰性），却会让这条源消息失去"
@@ -344,7 +372,7 @@ def _reject_non_tail_undo(
         conn.execute("ROLLBACK TO SAVEPOINT undo_probe")
         conn.execute("RELEASE SAVEPOINT undo_probe")
     if before_deleted == 0 and after_deleted == 1:
-        raise OverlayError(
+        raise UndoConflict(
             f"edit {edit_id} 是 item {item_id} 的**最后一条**事件，且撤掉它会让"
             f"这个条目**重新被软删**（那条更早的 delete 会重新生效），但它不是"
             f"日志尾部（尾部是 edit {tail}）：用户点的是「撤销改分类」，看到的会是"
@@ -374,8 +402,9 @@ def undo(conn: sqlite3.Connection, *, edit_id: int) -> bool:
         「撤一条被后面 delete 覆盖的 set_kind 必须返回 True」，而"撤掉我早先给
         某条改的类目"是正常用法，它退回 `items.kind` 正是用户要的。
 
-    被拒绝的那两种形状一律抛 `OverlayError`（API 侧映射成 409），**在写之前**
-    就抛出——调用方响亮地知道「这一撤会改变你看见的东西」，而不是静默地改掉它。
+    被拒绝的那两种形状一律抛 `UndoConflict`（`OverlayError` 的子类；API 侧映射成
+    409，而基础设施故障映成 5xx），**在写之前**就抛出——调用方响亮地知道
+    「这一撤会改变你看见的东西」，而不是静默地改掉它。
 
     ⚠️ 失败分支**不许** rollback（reviewer 实测的 FIX 2，见下）。
     """

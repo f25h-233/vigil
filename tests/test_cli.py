@@ -1164,6 +1164,10 @@ def test_downgrade_apply_clears_the_inverted_deadline_and_reports_it(
     变异「把 `store.downgrade_item_fields` 换成 `store.clear_deadlines`」⇒
     本条红（place 那一列不会跟着降级）；变异「把 `scope` 里的软删过滤去掉」⇒
     软删那条会被改，而下面那句断言它**没被改**。
+
+    ⚠️ **显式带 `--fields both`**（M5 收尾 A1 之后）：命令行默认值已收窄成
+    `deadline`，而本条要守的正是「两列一起降级」这条路径 ⇒ 范围必须写出来。
+    断言一个字未改（`(None, None)` 那条仍钉着 place 也被降级）。
     """
     db = cli_env / "export.db"
     seen = _seed_downgradable(db)
@@ -1182,7 +1186,7 @@ def test_downgrade_apply_clears_the_inverted_deadline_and_reports_it(
         ro.close()
     assert 3 not in visible and 1 in visible, "造场景失败：软删没生效，这条守卫是空的"
 
-    assert cli.main(["downgrade", "--apply"]) == 0
+    assert cli.main(["downgrade", "--fields", "both", "--apply"]) == 0
     out = capsys.readouterr().out
 
     assert _item_row(db, 1) == (None, None), "倒挂的 deadline 该被降级（place 也在内）"
@@ -1239,3 +1243,65 @@ def test_downgrade_fields_deadline_leaves_place_alone(cli_env, monkeypatch):
 
     assert cli.main(["downgrade", "--fields", "deadline", "--apply"]) == 0
     assert _item_row(db, 1) == ("立德楼", None), "只该降 deadline，place 不许动"
+
+
+# ── M5 收尾 scoped re-review A1：`--fields` 的破坏性默认值 ──────────────
+#
+# 修复前默认 `both`：照 `--apply` 的惯例敲一遍、**不带 flag**，就会连带把
+# place 也置 NULL——而用户 2026-09-17 只批准了 deadline 那一次。
+# 真库操作不可逆，这种「顺手多清一列」没有任何一步会报错。
+
+
+def test_downgrade_fields_default_is_deadline_not_both(cli_env, monkeypatch):
+    """⭐ 解析层：`--fields` 的默认值逐字 == `deadline`。
+
+    ⚠️ 守的是**默认值本身**，不是某次运行的结果——用 `cmd_downgrade` 的替身
+    把解析出来的 `args.fields` 抓出来。变异「把 `default=` 改回 `"both"`」⇒ 本条红。
+    ⚠️ 与下面那条行为用例是**两层**：这条钉死解析结果、那条钉死「这个范围
+    真的写不进 place」。只有这条的话，「解析器默认对了、代码里却把 `fields`
+    又合并成 `both`」这种改法照样全绿。
+    """
+    seen = {}
+
+    def spy(args) -> int:
+        seen["fields"] = args.fields
+        return 0
+
+    monkeypatch.setattr(cli, "cmd_downgrade", spy)
+    assert cli.main(["downgrade"]) == 0, "不带任何 flag 的干跑必须仍然可用"
+    assert seen["fields"] == "deadline", (
+        f"`--fields` 的默认值是 {seen['fields']!r}——"
+        "默认必须是收窄的那一侧：不带 flag 跑 --apply 不可能意外清掉 place"
+    )
+
+
+def test_downgrade_apply_without_fields_never_clears_place(cli_env, monkeypatch, capsys):
+    """⭐ 行为层（A1 的判据）：**不带 `--fields`** 跑 `--apply` 清不掉 place。
+
+    判据分两步走，缺一不可：
+      ① 不带 flag ⇒ item 1 的 place 一个字不动（只有 deadline 被降）；
+      ② **阳性对照**：同一条目在 `--fields both` 下确实会被降 place
+         ——没有 ②，这条在「place 判据整个失效」时也照样绿（空守卫）。
+    变异「把默认值改回 `both`」⇒ ① 红；变异「place 闸门失效」⇒ ② 红。
+    """
+    db = cli_env / "export.db"
+    _seed_downgradable(db)
+    monkeypatch.setattr(cli, "_load_config_only", lambda: _config(cli_env))
+    monkeypatch.setattr(cli, "_require_export_db", lambda config: db)
+
+    # ① 不带 --fields
+    assert cli.main(["downgrade", "--apply"]) == 0
+    out = capsys.readouterr().out
+    assert _item_row(db, 1) == ("立德楼", None), (
+        "不带 --fields 的 --apply 动了 place——默认值是破坏性的那一侧（A1 原样复发）"
+    )
+    assert "降级字段：deadline" in out, (
+        f"范围没有打给用户看，清单与执行的口径无从对照：{out!r}"
+    )
+
+    # ② 阳性对照：这条目**确实**过不了 place 闸门（源文「档案袋封口时间：5 月 6 日」
+    #    里没有「立德楼」）⇒ ① 的「没被改」是默认值挡住的，不是判据本来就动不了它。
+    assert cli.main(["downgrade", "--fields", "both", "--apply"]) == 0
+    assert _item_row(db, 1) == (None, None), (
+        "阳性对照失败：place 都没有被降级 ⇒ ① 是空守卫（判据可能整个失效了）"
+    )
