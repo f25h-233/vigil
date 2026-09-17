@@ -211,6 +211,26 @@ def test_load_persons_rejects_a_wrong_bracket_shape(tmp_path):
         config.load_persons(p)
 
 
+def test_load_persons_rejects_an_entry_that_is_not_a_table(tmp_path):
+    """⭐ 与 `groups = [1, 2]` **完全同形**：`persons = [1, 2]` 也必须是 `ConfigError`。
+
+    ⚠️ 上一条挡的是「段不是数组」（`[persons]` ⇒ dict，`entry` 是**键**）。
+    本条挡的是「**元素**不是表」（TOML 允许数组装标量 ⇒ `entry` 是那个标量）。
+    两者落在同一行 `entry.get("uin")` 上：修前实测
+    `AttributeError: 'int' object has no attribute 'get'`——**绕过本模块只捕
+    `ConfigError` 的契约**（`cli` / `api`），用户看到裸 traceback。
+
+    ⚠️ 为什么它和 C6 一起收：`config/persons.toml` 的文件头**自己邀请手工编辑**，
+    而 `/api/persons` 就在这条读路径上（一次手误 ⇒ 整页 500）。
+
+    ⚠️ 变异反证：把 `load_persons` 循环里那句 `isinstance(entry, dict)`
+    的守卫删掉 ⇒ 本条**必红**（抛的是 `AttributeError`）。
+    """
+    p = _write(tmp_path, "persons = [1, 2]\n")
+    with pytest.raises(config.ConfigError, match="键值表"):
+        config.load_persons(p)
+
+
 def test_load_persons_empty_file_is_still_legal(tmp_path):
     """阳性对照：**空文件**是合法的（一个人都没监视），不许被上面两条顺带拒掉。"""
     assert config.load_persons(_write(tmp_path, "")) == ()
@@ -420,6 +440,38 @@ def test_load_config_rejects_a_wrong_bracket_shape(tmp_path):
         encoding="utf-8",
     )
     with pytest.raises(config.ConfigError, match="数组段"):
+        config.load_config(p)
+
+
+def test_load_config_rejects_a_group_entry_that_is_not_a_table(tmp_path):
+    """⭐ `groups = [1, 2]` 必须响亮——T2 的 C6，T7 之前收（它挡着配置包）。
+
+    ⚠️ 上一条（`test_load_config_rejects_a_wrong_bracket_shape`）挡的是
+    「**段本身**不是数组」（`[groups]` ⇒ 解析成 dict）。本条挡的是**另一种形状**：
+    段确实是数组，但**元素不是表**（`groups = [1, 2]`，TOML 允许数组装标量）。
+    两种形状不同，却落在同一行代码上——`entry.get("id")`：
+    段是 dict 时 `entry` 是**键**（str），元素不是表时 `entry` 是那个标量。
+
+    ⚠️ 不挡的话：`entry` 是 `int` ⇒ `AttributeError` ⇒ **绕过只捕 `ConfigError`
+    的契约**（`cli._load_config_only`），用户看到的是裸 traceback。
+    实测（2026-09-17 探针，修前）：`AttributeError: 'int' object has no attribute 'get'`。
+
+    ⚠️ **为什么这条必须挡在配置包（T7）之前**：`configpack.parse` 要消费
+    `validate_config_raw`，而它接的是**外部文件**（用户拷来的包）。形状错的外部
+    输入撞上 `AttributeError` ⇒ **500 而不是 400**，且排障方向完全错：报错指向
+    服务端，真相是包写错了。
+
+    ⚠️ `groups = [1, 2]` 写在 `[settings]` **之前**是承重的：TOML 里落在
+    `[settings]` 之后的裸键是 `settings.groups`，那样探不到顶层这一支
+    （T2 报告记过这个自己踩的坑）。
+    """
+    p = tmp_path / "groups.toml"
+    p.write_text(
+        "groups = [1, 2]\n\n"
+        f'[settings]\nqq_db_dir = "{tmp_path.as_posix()}"\noutput_db = "data/vigil.db"\n',
+        encoding="utf-8",
+    )
+    with pytest.raises(config.ConfigError, match="键值表"):
         config.load_config(p)
 
 

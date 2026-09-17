@@ -146,6 +146,33 @@ def validate_config_raw(
 
     groups: list[Group] = []
     for entry in entries:
+        # ⚠️ **元素**也必须是表（M6 T2 的 C6，T7 之前收）。`groups = [1, 2]` 里
+        # `entry` 是 `int` ⇒ 下一行 `entry.get("id")` 抛 `AttributeError`——**绕过
+        # 本模块只捕 `ConfigError` 的契约**（`cli._load_config_only` /
+        # `api.current_config`），用户看到的是**裸 traceback**。
+        # 实测（T2 复审探针 2026-09-17；T7 修前 2026-09-18 复现同形）：
+        # `AttributeError: 'int' object has no attribute 'get'`。
+        #
+        # ⚠️ 上面那两道守卫**挡不住它**：它们查的是「**段**是不是数组」，而这里段的
+        # 形状是对的（list）——坏的是**元素**。而 TOML 允许数组里装标量，所以
+        # `groups = [1, 2]` 是一份**语法完全合法**的文件，TOML 层面没有任何报错。
+        #
+        # ⚠️ **它对 T7 的配置包尤其要紧**：`configpack.parse` 消费本函数，而它接的是
+        # **外部文件**（用户拷来拷去的包）。形状错的外部输入撞上 `AttributeError`
+        # ⇒ 端点回 **500 而不是 400**，排障方向**完全错**：报错指向服务端，
+        # 而真相是包写错了。
+        #
+        # ⚠️ `categories.py` 的 `[[categories]]` 有**同形**的守卫（`isinstance(entry, dict)`），
+        # 但两处的理由各自写在自己的文件里——一条「见某某处」的注释是**把理由搬走**：
+        # 删掉那边时这一处不会有任何东西变红，而注释还在说"有理由"
+        # （本项目最贵的一课：缺的论证与错的论证都让后来者以为自己理解了）。
+        if not isinstance(entry, dict):
+            raise ConfigError(
+                f"{path}: 每个 [[groups]] 段都必须是键值表，"
+                f"实际是 {type(entry).__name__}——最常见的成因是把群号直接写成了"
+                "数组元素（`groups = [111, 222]`），而本段要的形状是 `[[groups]]` "
+                "后跟一行 `id = 111`。"
+            )
         gid = entry.get("id")
         if not isinstance(gid, int) or gid <= 0:
             raise ConfigError(f"{path}: 群号必须为正整数，实际是 {gid!r}")
@@ -351,6 +378,21 @@ def load_persons(path: pathlib.Path | None = None) -> tuple[Person, ...]:
     out: list[Person] = []
     seen: set[int] = set()
     for entry in raw.get("persons", []):
+        # ⚠️ **元素**也必须是表——与 `validate_config_raw` 里 `groups` 那处
+        # **完全同形**（M6 T7 一并收，见那里的长注释）：`persons = [1, 2]` 是
+        # **语法完全合法**的 TOML（数组里可以装标量），而 `_check_persons_shape`
+        # 只看段名与段的类型 ⇒ `entry.get("uin")` 抛 `AttributeError`、**绕过
+        # 本模块只捕 `ConfigError` 的契约**，用户看到的是裸 traceback。
+        # 实测（2026-09-18，修前）：`AttributeError: 'int' object has no attribute 'get'`。
+        # ⚠️ 这条路径会被走到：`config/persons.toml` 的文件头**自己邀请手工编辑**，
+        # 而 `/api/persons` 就在它上面。
+        if not isinstance(entry, dict):
+            raise ConfigError(
+                f"{target}: 每个 [[persons]] 段都必须是键值表，"
+                f"实际是 {type(entry).__name__}——最常见的成因是把 uin 直接写成了"
+                "数组元素（`persons = [100000001]`），而本文件要的形状是 "
+                "`[[persons]]` 后跟一行 `uin = 100000001`。"
+            )
         uin = entry.get("uin")
         if not isinstance(uin, int) or uin <= 0:
             raise ConfigError(
