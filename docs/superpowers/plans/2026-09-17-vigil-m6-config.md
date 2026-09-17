@@ -228,6 +228,59 @@ x = 1
 
 ---
 
+### E5（T3 implementer 实测，**controller 采信**）⚠️ **计划给 T3 写的那条"端到端"变异反证是假的**
+
+**brief 原文**（T3 Step 1 的 `test_the_end_to_end_wire_format_omits_the_field`）声称：
+
+> ⚠️ 变异反证：把 `refine.py` 里构造 `LLMConfig` 那行的
+> `enable_thinking=enable_thinking` 改成 `enable_thinking=False` ⇒ 本条**必红**。
+
+**实测：变异后 10 passed，一条都不红。** 原因很直白——
+
+> 那条测试**自己手工构造 `LLMConfig`**，它**一次都没有调 `refine()`**。
+> 它测的是 `llm.chat_json` 的报文形态，而 `refine.py` 那行变异**根本不在它的执行路径上**。
+
+⇒ **它测的层与被变异的那层不是同一层**，所以那条"变异反证"是**装饰**，不是证据。
+⇒ T3 补了 `test_refine_forwards_the_configured_endpoint_to_the_wire`（**真调 `refine()`**），
+   两个方向的变异（M1/M2）**实测各自 RED**。
+
+**⚠️ 这是今天第三条由我（controller）写进计划的错变异反证**——前两条是：
+- **E4**：段序那条（变异根本不会红）
+- **T2 审查 E4-(2)**：我提议的替换断言**永远执行不到**（前一行先抛异常）
+
+**三条的形态是同一个**：
+
+> **一条"变异反证"看起来像证据，但它可以是空的。**
+> 判据不是"我写了变异反证"，而是**"那个变异跑过、而且真的红了"**——
+> 且**变异体必须落在被测代码的执行路径上**。
+
+⇒ **对 T4–T10 的要求**：本计划给出的每一条变异反证，实施时**必须真跑**，
+并把**原始输出**贴进报告。**若某条变异没红，第一反应是"这条反证是假的"，
+不是"这条守卫很强"**——后者是自我恭维，前者才是实测。
+
+### E6（T3 implementer 实测）⚠️ **新增的默认路径常量没被 conftest 隔离**，而这是 Global Constraint 9 的字面后果
+
+**实测**：改 `config/llm.toml` 里的 `model`（**这正是 T3 的核心用法**）会让两条**无关**用例变红：
+
+- `tests/test_daily.py::test_stage_arguments_are_wired_from_the_day_window`
+- `tests/test_refine.py::test_cli_refine_model_falls_back_to_default`
+
+原因：`config.DEFAULT_LLM_TOML` 是一个**新增的模块级默认路径常量**，而 `tests/conftest.py`
+的两道 autouse 夹具只隔离了 `overrides.OVERRIDES_DB` 与 `lock.LOCK_PATH`。
+
+**Global Constraint 9 白纸黑字写着**：
+
+> **新增的默认路径常量必须同时被夹具隔离**，否则测试会写进真实仓库。
+
+⇒ **这是计划自己的疏漏**：约束写了，但没有把它派成任何一个 Step。
+⇒ **修法**：在 `tests/conftest.py` 加第三道 autouse 夹具（与既有两道同形），
+把 `config.DEFAULT_LLM_TOML` 指向 `tmp_path`。
+⚠️ **T4 的 `groups_snapshot.default_path`（它是函数、不是常量，但同族）与
+T6 的 `jobs.registry`（模块级单例）也必须一并考虑**——后者尤其危险：
+一个用例残留的 running job 会让下一个用例撞 `JobBusy`，而那是**与环境相关的假红**。
+
+---
+
 ## Task 1: U-4 —— `strip_fake_header` 原子写 + `groups` 上锁
 
 **为什么要做（spec §1.6）**：`vigil groups` 列群列表靠 `strip_fake_header(...)`，它**就地截断重写** `data/cache/nt_msg_clear.db`，而 `export` 用的是**同一个文件**（`export._clear_db_path`）。并发时正在跑的 export 会读到半个文件，SQLite 报坏页 —— 于是「消息静默消失」被报告成「QQ 库物理坏页」，一个**指向错误方向**的诊断。
