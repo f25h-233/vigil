@@ -4,9 +4,11 @@ import {
   deleteItem,
   fetchItem,
   fetchItems,
+  removeCategory,
   removePerson,
   setItemKind,
   undoLast,
+  updateCategory,
 } from '../api'
 
 describe('fetchItems 的查询串', () => {
@@ -219,4 +221,40 @@ it('写端点失败时把后端的 detail 当错误消息抛出来', async () =>
     json: async () => ({ detail: '没有这条条目：999' }),
   }))
   await expect(deleteItem(999)).rejects.toThrow('没有这条条目：999')
+})
+
+// ── T9 fix loop 1 / m2：类目那两处 slug 拼接必须**同一条待遇** ──────────
+//
+// ⚠️ 这两条不是在修一个眼前的 bug：今天 slug 受后端 `_SLUG_RE` 约束、
+// 不会出现需要转义的字符。它们钉的是**形状**——`removeCategory` 一直编码、
+// `updateCategory` 不编码，同一文件里两处同形的东西待遇相反，
+// 下一个人照着哪一处写都说得通；照着错的那一处写，只会在某个
+// 含 `/` 或空格的取值上才现形（而那时它是**一条 404**，不是一句配置错误）。
+// ⇒ 两条成对，就是为了让"只有一处被改回去"也能被抓到。
+
+it('改类目：slug 必须 encodeURIComponent', async () => {
+  const spy = vi.fn().mockResolvedValue({
+    ok: true,
+    status: 200,
+    json: async () => ({ slug: 'a/b' }),
+  })
+  vi.stubGlobal('fetch', spy)
+
+  await updateCategory('a/b', { label: 'x' })
+  expect(spy.mock.calls[0][0]).toBe('/api/categories/a%2Fb')
+  expect(spy.mock.calls[0][1].method).toBe('PUT')
+})
+
+it('删类目：slug 同理（与上一条逐字对照）', async () => {
+  const spy = vi.fn().mockResolvedValue({
+    ok: true,
+    status: 204,
+    json: async () => {
+      throw new Error('204 没有 body')
+    },
+  })
+  vi.stubGlobal('fetch', spy)
+
+  await removeCategory('a/b', 'life')
+  expect(spy.mock.calls[0][0]).toBe('/api/categories/a%2Fb?migrate_to=life')
 })

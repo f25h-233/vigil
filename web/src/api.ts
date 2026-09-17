@@ -150,7 +150,16 @@ export const addCategory = (slug: string, label: string, desc: string, icon: str
 export const updateCategory = (
   slug: string,
   body: { slug?: string; label?: string; desc?: string; icon?: string },
-) => sendJSON<{ slug: string }>(`/api/categories/${slug}`, 'PUT', body)
+// ⚠️ slug 必须 `encodeURIComponent`——与 `removeCategory` **同一条待遇**（Fix loop 1 / m2）。
+// 今天 slug 受后端的 `_SLUG_RE` 约束、里面不会出现需要转义的字符，所以这不是在修一个
+// 眼前的 bug：**同文件里两处同形的 URL 拼接，一处编码一处不编码**，下一个人照着哪一处
+// 写都说得通——而照着错的那一处写，只会在某个含 `/` 或空格的取值上才现形。
+) =>
+  sendJSON<{ slug: string }>(
+    `/api/categories/${encodeURIComponent(slug)}`,
+    'PUT',
+    body,
+  )
 
 export const removeCategory = (slug: string, migrateTo?: string) =>
   sendJSON<void>(

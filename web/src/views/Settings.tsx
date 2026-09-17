@@ -58,6 +58,10 @@ function GroupsSection() {
   const [id, setId] = useState('')
   const [name, setName] = useState('')
   const [msg, setMsg] = useState<string | null>(null)
+  // ⚠️ **提交中必须禁掉按钮**（Fix loop 1 / m5）：一次请求在飞的时候再点一下，
+  // 第二次多半撞 409「群已经在配置里了」——而那句红字会盖掉第一句成功提示，
+  // 用户看到的是"我刚加的那个群报错了"（与 `ItemCard` 的 `busy` 同形）。
+  const [busy, setBusy] = useState(false)
 
   useEffect(() => {
     setErr(null)
@@ -74,6 +78,7 @@ function GroupsSection() {
       setMsg('群号必须是正整数')
       return
     }
+    setBusy(true)
     try {
       await api.addGroup(n, name.trim(), 'normal')
       setMsg(`已加入 ${n}。⚠️ 下次 vigil export 会拉它的**全部历史**——首轮实测大群约 1,664 条 / 21 批 / 6.3 分钟。`)
@@ -81,6 +86,8 @@ function GroupsSection() {
       setTick((t) => t + 1)
     } catch (e) {
       setMsg(e instanceof Error ? e.message : String(e))
+    } finally {
+      setBusy(false)
     }
   }
 
@@ -113,7 +120,8 @@ function GroupsSection() {
                className="w-32 rounded-lg bg-white/5 px-2 py-1.5 text-sm" />
         <input value={name} onChange={(e) => setName(e.target.value)} placeholder="群名"
                className="flex-1 rounded-lg bg-white/5 px-2 py-1.5 text-sm" />
-        <button onClick={submit} className="rounded-lg bg-sky-500/20 px-3 py-1.5 text-sm text-sky-200">
+        <button onClick={submit} disabled={busy}
+                className="rounded-lg bg-sky-500/20 px-3 py-1.5 text-sm text-sky-200 disabled:opacity-40">
           加入监视
         </button>
       </div>
@@ -325,8 +333,18 @@ function LlmSection() {
         enable_thinking: thinking === 'omit' ? null : thinking === 'true',
       }
       const back = await api.saveLlmSettings(s)
-      // ⚠️ 显示的是**服务端回给的那个值**，不是本地的输入框状态：
-      // 后端将来若做了归一化（比如补全 URL），界面上必须看得见差别。
+      // ⚠️ 三个字段都按**服务端回给的那个值**回填，不是留着本地的输入框状态
+      // （Fix loop 1 / m3）。
+      //
+      // ⚠️ 这句注释原来只说了半句真话（reviewer 抓到的）：那时只有 `thinking`
+      // 真的回填了，`base_url`/`model` 还是本地 state——而**本地 state 与服务端
+      // 存下去的值是可以不同的**：`save()` 发出去的是 `trim()` 过的，输入的
+      // 首尾空白会被后端丢掉。于是"所见即所存"这句话在界面上不成立，
+      // 用户看到的还是他自己那串带空白的输入。
+      // 两处一起改（注释 + 行为）：`trim()` 是**写侧的归一化**，
+      // 界面上必须看得见它的结果——不然下一次 `GET` 回来会"变样"。
+      setBaseUrl(back.base_url)
+      setModel(back.model)
       setThinking(choiceOf(back.enable_thinking))
       setMsg(`已保存：${back.base_url} · ${back.model} · ${describeThinking(back.enable_thinking)}`)
     } catch (e) {
@@ -549,8 +567,19 @@ function CategoriesSection() {
           改过名的类目：{Object.entries(aliases).map(([o, n]) => `${o} → ${n}`).join('、')}
         </p>
       )}
-      <button onClick={() => api.undoCategorieChange().then(() => setTick((t) => t + 1))}
-              className="mt-3 rounded-lg bg-white/5 px-3 py-1.5 text-xs text-white/60">
+      {/* ⚠️ **必须有 `.catch()`**（Fix loop 1 / m1）：没有它的话，撤销失败
+          （空栈时后端 409、overlay 锁住时 5xx）会变成一条**未处理的 rejection**
+          ——控制台里一行红字，而**界面上一个字都没有**：用户点了撤销、
+          什么都没发生、也没有任何话说。与同文件其它失败分支同形处理。 */}
+      <button
+        onClick={() =>
+          api
+            .undoCategorieChange()
+            .then(() => setTick((t) => t + 1))
+            .catch((e) => setMsg(e instanceof Error ? e.message : String(e)))
+        }
+        className="mt-3 rounded-lg bg-white/5 px-3 py-1.5 text-xs text-white/60"
+      >
         ↶ 撤销上一次类目改动
       </button>
       {msg !== null && <p className="mt-2 text-xs text-white/60">{msg}</p>}
@@ -660,7 +689,10 @@ function PackSection() {
 
       <div className="border-t border-white/10 pt-3">
         <p className="text-xs text-white/55">导入</p>
-        <input type="file" accept=".toml,text/plain"
+        {/* ⚠️ `aria-label` 不是装饰：`<input type="file">` **没有隐式 ARIA role**，
+            没有它就只能靠 `querySelector('input[type=file]')` 去抓——那种抓法
+            在用例里长得像"内部实现细节"，也让屏幕阅读器只能念出一句"按钮"。 */}
+        <input type="file" accept=".toml,text/plain" aria-label="选择配置包文件"
                onChange={(e) => { const f = e.target.files?.[0]; if (f) readFile(f) }}
                className="mt-1 block w-full text-xs text-white/60" />
         <textarea value={importText} onChange={(e) => setImportText(e.target.value)} rows={8}

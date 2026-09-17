@@ -1,54 +1,115 @@
-import { render, screen } from '@testing-library/react'
+import { render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { afterEach, expect, test, vi } from 'vitest'
 import App from '../App.tsx'
 import Settings from '../views/Settings.tsx'
-import type { CategoriesResponse, GroupsResponse } from '../types.ts'
+import type { CategoriesResponse, GroupsResponse, LlmSettings } from '../types.ts'
 
-type Call = { url: string; method: string }
+type Call = { url: string; method: string; body?: unknown }
 
 type Fake = {
   groups?: GroupsResponse
   categories?: CategoriesResponse
+  /** `POST /api/categories/undo` 的状态码（默认 200）。 */
+  undoStatus?: number
+  /** `POST /api/persons` 的响应（默认 201 成功）。 */
+  personPost?: { status: number; body: unknown }
+  /** `POST /api/config/pack` 的响应（默认 200 + 一个最小成功体）。 */
+  packPost?: { status: number; body: unknown }
+  /** `GET /api/llm` 的回值。 */
+  llm?: LlmSettings
+  /** `PUT /api/llm` 的回值（默认与 GET 同一份）；刻意可以**不同**——见那条回填用例。 */
+  llmPut?: LlmSettings
+  /** 让 `POST /api/groups` **挂住不返回**（用来观察提交中的 busy 态）。 */
+  holdGroupPost?: boolean
+}
+
+const DEFAULT_LLM: LlmSettings = {
+  base_url: 'https://x/v1',
+  model: 'm',
+  enable_thinking: null,
 }
 
 /**
  * 装一个**有状态**的假 fetch（骨架照抄 T8 的 `Feed.dom.test.tsx`）。
  *
  * ⚠️ 必须 mock 全局 `fetch` 而**不是** mock `../api.ts`：本文件要钉的缺陷
- * 恰恰是「组件有没有把后端给的东西显示出来、有没有真的发那一次请求」。
- * mock 掉 api 层就把被测的那一层换掉了，测试会退化成
+ * 恰恰是「组件有没有把后端给的东西显示出来、有没有真的发那一次请求、
+ * 请求里装的是什么」。mock 掉 api 层就把被测的那一层换掉了，测试会退化成
  * 「我 mock 的函数被我调用了」——与真实行为无关。
+ *
+ * ⚠️ `Call.body` 也记下来（Fix loop 1）：`apply` / `keep_settings` 这类
+ * **请求体里的契约**只有把它记下来才断言得到；只看 URL 的话，
+ * 一个永远发 `apply: false` 的实现照样绿。
  */
 function installFetch(f: Fake) {
   const calls: Call[] = []
+  let release: (() => void) | null = null
+  const held = f.holdGroupPost
+    ? new Promise<void>((r) => {
+        release = r
+      })
+    : null
+
   vi.stubGlobal(
     'fetch',
     vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input)
-      calls.push({ url, method: init?.method ?? 'GET' })
-      const ok = (body: unknown) => ({ ok: true, status: 200, json: async () => body })
+      const method = init?.method ?? 'GET'
+      const body = init?.body === undefined ? undefined : JSON.parse(String(init.body))
+      calls.push({ url, method, body })
+      const ok = (b: unknown, status = 200) => ({ ok: status < 400, status, json: async () => b })
+      const fail = (status: number, detail: string) => ({
+        ok: false,
+        status,
+        json: async () => ({ detail }),
+      })
 
+      if (method === 'POST' && url === '/api/groups') {
+        if (held) await held
+        return ok({ id: 444 })
+      }
+      if (method === 'POST' && url === '/api/persons') {
+        const r = f.personPost ?? { status: 201, body: { uin: 1, label: 'x' } }
+        return ok(r.body, r.status)
+      }
+      if (url.startsWith('/api/persons')) return ok({ persons: [] })
+      if (method === 'POST' && url.endsWith('/api/categories/undo')) {
+        if (f.undoStatus && f.undoStatus >= 400) {
+          return fail(f.undoStatus, '没有可撤销的类目改动')
+        }
+        return ok({ undone: true })
+      }
+      if (method === 'POST' && url === '/api/config/pack') {
+        const r = f.packPost ?? { status: 200, body: { applied: true } }
+        return ok(r.body, r.status)
+      }
+      if (url.startsWith('/api/config/pack')) {
+        // ⚠️ 导出那份 TOML 与用例里"上传的包"**刻意不同**：相同的话
+        // `getByDisplayValue` 会同时命中两个 textarea，红出来的原因是
+        // "找到多个元素"——一条与被测行为毫无关系的失败。
+        return ok({ toml: '# pack\n[[groups]]\nid = 1\n' })
+      }
+      if (url === '/api/llm' && method === 'PUT') return ok(f.llmPut ?? f.llm ?? DEFAULT_LLM)
+      if (url.startsWith('/api/llm')) return ok(f.llm ?? DEFAULT_LLM)
       if (url.startsWith('/api/groups')) {
         return ok(f.groups ?? { available: true, reason: '', generated_at: 0, groups: [] })
       }
       if (url.startsWith('/api/categories')) {
         return ok(f.categories ?? { categories: [], aliases: {} })
       }
-      if (url.startsWith('/api/persons')) return ok({ persons: [] })
-      if (url.startsWith('/api/llm')) {
-        return ok({ base_url: 'https://x/v1', model: 'm', enable_thinking: null })
-      }
-      if (url.startsWith('/api/config/pack')) return ok({ toml: '# pack\n' })
       if (url.startsWith('/api/items')) return ok({ items: [], total: 0, limit: 50, offset: 0 })
       if (url.startsWith('/api/digests')) return ok({ digests: [] })
       return ok({})
     }),
   )
-  return calls
+  return { calls, release: () => release?.() }
 }
 
-afterEach(() => vi.unstubAllGlobals())
+afterEach(() => {
+  vi.unstubAllGlobals()
+  vi.restoreAllMocks()
+})
 
 const AVAILABLE: GroupsResponse = {
   available: true,
@@ -59,15 +120,31 @@ const AVAILABLE: GroupsResponse = {
   ],
 }
 
+const CATS: CategoriesResponse = {
+  categories: [
+    { slug: 'notice', label: '通知公告', icon: '📋', desc: 'x', count: 5 },
+    { slug: 'academic', label: '学业', icon: '📚', desc: 'y', count: 0 },
+  ],
+  aliases: {},
+}
+
+/** 进入某一节（`Settings` 自己渲染在 `App` 之外时，「类目」这类名字不会与导航撞车）。 */
+async function openSection(name: string) {
+  await userEvent.click(screen.getByRole('button', { name }))
+}
+
+// ── 群 / 快照 ─────────────────────────────────────────────────────────
+
 test('没有群快照时必须显示原因，而不是一张空表', async () => {
   /**
    * ⭐ 「一个群都没有」与「还没读过」是**两句不同的话**。
    * 空表会被读成前者——一句假话，而且是最容易让人不再信任这个页面的那种。
    *
    * ⚠️ 变异反证：让 `GroupsSection` 在 `!available` 时照样渲染
-   * `<ul>`（拿到一个空 `groups` 就画空表）⇒ 本条**必红**。
-   * ⚠️ 这条与后端 `groups_snapshot.load` 返回 `None` 时的行为是一对——
-   * 两边都守，是因为界面**完全可能**忽略那个字段（它只是个布尔）。
+   * `<ul>`（拿到一个空 `groups` 就画空表）⇒ 本条**必红**（断言①）。
+   * ⚠️ FM1b 是为此补的**探针**：保留原因横幅、另画一张空表 ⇒ 红在断言②
+   * （`expected <ul></ul> to be null`）——**证明第②条断言有独立的牙**，
+   * 不是被断言①捎带着守住的。两边都守，是因为界面**完全可能**忽略那个布尔字段。
    */
   installFetch({
     groups: {
@@ -90,7 +167,9 @@ test('群清单必须写出快照的生成时刻（快照会过期）', async ()
    * ⭐ spec §4.2 ③ 的硬要求之一：快照是 CLI **预生成**的产物，会过期。
    * 不写时刻的话，用户会拿一份三天前的清单做决定。
    *
-   * ⚠️ 变异反证：把「清单来自 … 的快照」那句删掉 ⇒ 本条**必红**。
+   * ⚠️ 变异反证：① 把「清单来自 … 的快照」那句整段删掉 ⇒ 红在 `findByText(/清单来自/)`；
+   * ② 把 `* 1000` 拿掉（秒当毫秒）⇒ 红在第二条断言
+   * （实测 `expected '清单来自 1970/1/21 …' to contain '2023/11/15 …'`）。
    */
   installFetch({ groups: AVAILABLE })
   render(<Settings />)
@@ -111,7 +190,7 @@ test('加群之后必须说清代价：下次 export 会拉全量历史', async 
    * ⚠️ 变异反证：把 `submit()` 里那句 `setMsg(...)` 换成一句「已加入」
    * （或删掉）⇒ 本条**必红**。
    */
-  const calls = installFetch({ groups: AVAILABLE })
+  const { calls } = installFetch({ groups: AVAILABLE })
   render(<Settings />)
 
   await screen.findByText('甲群')
@@ -126,6 +205,43 @@ test('加群之后必须说清代价：下次 export 会拉全量历史', async 
   expect(calls.some((c) => c.method === 'POST' && c.url === '/api/groups')).toBe(true)
 })
 
+test('提交中的「加入监视」必须点不动（双击不许发两次 POST）', async () => {
+  /**
+   * ⭐ Fix loop 1 / m5：一次请求在飞的时候再点一下，第二次会撞 409
+   * 「群已经在配置里了」——而那句红字会盖掉第一句成功提示，
+   * 用户看到的是"我刚加的那个群报错了"。
+   *
+   * ⚠️ 变异反证：把按钮上的 `disabled={busy}` 或 `busy` 整个状态去掉
+   * ⇒ 本条**必红**（`expected false to be true`）。
+   *
+   * ⚠️ 判据取「按钮此刻是不是禁用的」+「POST 只发了一次」两条：
+   * 只有前者的话，一个"禁用了但 onClick 照跑"的实现照样绿
+   * （React 里那是不可能的，但这条断言是**行为**层面的，不依赖那个内部知识）；
+   * 只有后者的话，不点第二下就恒为 1（今天这条用例就是只点一下）。
+   */
+  const { calls, release } = installFetch({ groups: AVAILABLE, holdGroupPost: true })
+  render(<Settings />)
+
+  await screen.findByText('甲群')
+  await userEvent.type(screen.getByPlaceholderText('群号'), '444')
+  await userEvent.click(screen.getByRole('button', { name: '加入监视' }))
+
+  await waitFor(() => {
+    const btn = screen.getByRole('button', { name: '加入监视' }) as HTMLButtonElement
+    expect(btn.disabled).toBe(true)
+  })
+
+  // 第二下：按钮已经禁用了，`userEvent` 对禁用元素不会派发 click
+  // （真浏览器里也是这个行为）——所以下面数 POST 的条数才是"点不动"的证据。
+  await userEvent.click(screen.getByRole('button', { name: '加入监视' }))
+  expect(calls.filter((c) => c.method === 'POST' && c.url === '/api/groups').length).toBe(1)
+
+  release()
+  expect(await screen.findByText(/全部历史/)).toBeTruthy()
+})
+
+// ── 类目 ──────────────────────────────────────────────────────────────
+
 test('删类目时未知条目数就必须要求选择迁移目标', async () => {
   /**
    * ⭐ 出口判据 6 的界面形态：「不允许静默留下指向不存在 slug 的条目」。
@@ -139,18 +255,10 @@ test('删类目时未知条目数就必须要求选择迁移目标', async () =>
    *   ③ **选了目标之后按钮要点得动**——只有 ② 的话，一个把按钮永久禁用的
    *      实现照样绿，而那等于这个类目永远删不掉。
    */
-  installFetch({
-    categories: {
-      categories: [
-        { slug: 'notice', label: '通知公告', icon: '📋', desc: 'x', count: 5 },
-        { slug: 'academic', label: '学业', icon: '📚', desc: 'y', count: 0 },
-      ],
-      aliases: {},
-    },
-  })
+  installFetch({ categories: CATS })
   render(<Settings />)
 
-  await userEvent.click(screen.getByRole('button', { name: '类目' }))
+  await openSection('类目')
   await screen.findByText(/通知公告/)
   await userEvent.click(screen.getAllByRole('button', { name: '删除' })[0])
 
@@ -165,12 +273,284 @@ test('删类目时未知条目数就必须要求选择迁移目标', async () =>
   ).toBe(false)
 })
 
+test('撤销类目改动失败时必须有话说（未处理的 rejection 不算话）', async () => {
+  /**
+   * ⭐ Fix loop 1 / m1：原来只有 `.then()`，没有 `.catch()`。
+   * 撤销失败（空栈 409、overlay 锁住 5xx）会变成一条**未处理的 rejection**：
+   * 控制台一行红字，界面**一个字都没有**——用户点了撤销、什么都没发生。
+   *
+   * ⚠️ 变异反证：去掉 `.catch(...)` ⇒ 本条**必红**（那句话不会出现）。
+   */
+  const { calls } = installFetch({ categories: CATS, undoStatus: 409 })
+  render(<Settings />)
+
+  await openSection('类目')
+  await screen.findByText(/通知公告/)
+  await userEvent.click(screen.getByRole('button', { name: /撤销上一次类目改动/ }))
+
+  expect(await screen.findByText(/没有可撤销的类目改动/)).toBeTruthy()
+  expect(calls.some((c) => c.url.endsWith('/api/categories/undo'))).toBe(true)
+})
+
+// ── 人物 ──────────────────────────────────────────────────────────────
+
+test('加人失败必须说出来（客户端拦下 & 服务端拒绝两个分支）', async () => {
+  /**
+   * ⭐ Fix loop 1：人物节的失败分支**零覆盖**——把 `setErr` 删掉，
+   * 30 条前端用例全绿，而界面上是静默的。
+   *
+   * ⚠️ 变异反证：删掉 `add()` 的 `catch` 里的 `setErr(...)` ⇒ 本条**必红**。
+   *
+   * ⚠️ 两个分支要分清：客户端拦下时**一个请求都不该发**（0 不是有效账号，
+   * 发出去只会拿回一个 400）；服务端拒绝时那句话必须**显示出来**。
+   * 只测后者的话，"不发请求"这个更便宜的性质没人守。
+   */
+  const { calls } = installFetch({
+    personPost: { status: 400, body: { detail: '服务端拒绝了：这个 uin 不在允许名单里' } },
+  })
+  render(<Settings />)
+
+  await openSection('人物')
+  const uinBox = await screen.findByPlaceholderText('QQ 号')
+  await userEvent.type(uinBox, '0')
+  await userEvent.type(screen.getByPlaceholderText('名字（辅导员某辅导员）'), '谁')
+  await userEvent.click(screen.getByRole('button', { name: '新增' }))
+
+  expect(await screen.findByText(/QQ 号必须是正整数/)).toBeTruthy()
+  expect(
+    calls.some((c) => c.method === 'POST' && c.url === '/api/persons'),
+    '客户端已经知道它是个坏值，却还是把请求发出去了',
+  ).toBe(false)
+
+  await userEvent.clear(uinBox)
+  await userEvent.type(uinBox, '123456')
+  await userEvent.click(screen.getByRole('button', { name: '新增' }))
+  expect(await screen.findByText(/不在允许名单里/)).toBeTruthy()
+})
+
+// ── 导入导出 ──────────────────────────────────────────────────────────
+
+test('导入一个包：FileReader 读出来 → POST → notes / warnings 显示出来', async () => {
+  /**
+   * ⭐ Fix loop 1：`PackSection` 的导入半边**零覆盖**——
+   * 把 `run()` / `readFile()` 整个删掉，30 条用例全绿，而这条路径是
+   * 「配置的导入」唯一的人口。
+   *
+   * ⚠️ 变异反证：
+   *   ① `readFile()` 改成 no-op ⇒ 红在 `findByText(/已读入 pack.toml/)`；
+   *   ② `run()` 改成 no-op（或删掉两个按钮的 onClick）⇒ 红在 notes 那句。
+   *
+   * ⚠️ `notes` / `warnings` 必须**看得见**：T7 的 I4 专门修过这件事
+   * （`on_progress` 曾经是个空 lambda）——后端把话带回来了，
+   * 界面丢掉的话，用户只会看到一句"导入成功"，而他的 `qq_db_dir`
+   * 已经被换成**别台机器**的路径了。
+   *
+   * ⚠️ 请求体也要断言（`apply` / `keep_settings`）：只断言"页面上有字"
+   * 的话，一个永远发 `apply: false` 的实现能绿——而它一个字节都不写。
+   */
+  const { calls } = installFetch({
+    packPost: {
+      status: 200,
+      body: {
+        applied: true,
+        groups: 15,
+        categories: 7,
+        persons: 2,
+        aliases: 1,
+        notes: ['本机那份 groups.toml 读不出来，已整份采用包里的 [settings]'],
+        warnings: ['包里的 qq_db_dir 指向别台机器：C:/别人家的/nt_db'],
+      },
+    },
+  })
+  render(<Settings />)
+
+  await openSection('导入导出')
+  const file = new File(['schema = 1\n[settings]\n'], 'pack.toml', { type: 'text/plain' })
+  await userEvent.upload(screen.getByLabelText('选择配置包文件'), file)
+
+  // ⚠️ `FileReader` 是**异步**的 ⇒ 必须等界面上的那句话，不能紧接着断言
+  expect(await screen.findByText(/已读入 pack.toml/)).toBeTruthy()
+  expect(screen.getByDisplayValue(/schema = 1/)).toBeTruthy()
+
+  await userEvent.click(screen.getByRole('button', { name: '导入并覆盖本机配置' }))
+
+  expect(await screen.findByText(/已整份采用包里的 \[settings\]/)).toBeTruthy()
+  expect(screen.getByText(/C:\/别人家的\/nt_db/)).toBeTruthy()
+  expect(screen.getByText(/已应用/)).toBeTruthy()
+
+  const post = calls.find((c) => c.method === 'POST' && c.url === '/api/config/pack')
+  expect(post?.body).toEqual({
+    toml: 'schema = 1\n[settings]\n',
+    apply: true,
+    keep_settings: true,
+  })
+})
+
+test('「先校验不写入」必须发 apply=false，并且空包不许发出去', async () => {
+  /**
+   * ⭐ 预校验是**导入的安全带**：它必须真的走 `apply: false`
+   * （后端那条路一个字节都不写），而不是"前端自己看看格式"。
+   *
+   * ⚠️ 变异反证：把 `run(false)` 改成 `run(true)`（或把
+   * `disabled={busy || !importText.trim()}` 的第二个条件删掉）⇒ 本条**必红**。
+   */
+  const { calls } = installFetch({
+    packPost: {
+      status: 200,
+      body: { applied: false, groups: 15, categories: 7, persons: 2, aliases: 1 },
+    },
+  })
+  render(<Settings />)
+
+  await openSection('导入导出')
+  const check = screen.getByRole('button', { name: '先校验不写入' }) as HTMLButtonElement
+  expect(check.disabled, '空包也让它发出去？那只会拿回一个 400').toBe(true)
+
+  await userEvent.upload(
+    screen.getByLabelText('选择配置包文件'),
+    new File(['schema = 1\n'], 'pack.toml', { type: 'text/plain' }),
+  )
+  await screen.findByText(/已读入 pack.toml/)
+  await userEvent.click(screen.getByRole('button', { name: '先校验不写入' }))
+
+  expect(await screen.findByText(/校验通过/)).toBeTruthy()
+  const post = calls.find((c) => c.method === 'POST' && c.url === '/api/config/pack')
+  expect((post?.body as { apply: unknown }).apply).toBe(false)
+})
+
+test('导入失败（服务端 400）必须把原因说出来，而不是静默', async () => {
+  /**
+   * ⚠️ 变异反证：删掉 `run()` 的 `catch` 里的 `setErr(...)` ⇒ 本条**必红**。
+   *
+   * ⚠️ 400 与 500 是**两句不同的话**：400 是"这个包有问题"（用户能自己改），
+   * 500 是"服务坏了"。这句判据落在**界面上显示的是哪一句**——
+   * `api.ts` 的 `sendJSON` 已经把后端的 `detail` 抛上来了，别在这里丢掉它。
+   */
+  installFetch({
+    packPost: {
+      status: 400,
+      body: { detail: '配置包读不出来：第 3 行 [[person]] 少写了一个 s（会静默读成 0 个人）' },
+    },
+  })
+  render(<Settings />)
+
+  await openSection('导入导出')
+  await userEvent.upload(
+    screen.getByLabelText('选择配置包文件'),
+    new File(['[[person]]\n'], 'bad.toml', { type: 'text/plain' }),
+  )
+  await screen.findByText(/已读入 bad.toml/)
+  await userEvent.click(screen.getByRole('button', { name: '导入并覆盖本机配置' }))
+
+  expect(await screen.findByText(/少写了一个 s/)).toBeTruthy()
+})
+
+test('「下载 .toml」必须造出 Blob 链接、挂对文件名、用完 revoke', async () => {
+  /**
+   * ⭐ Fix loop 1：下载按钮**零覆盖**——把 `download()` 删掉，30 条用例全绿。
+   *
+   * ⚠️ 变异反证：`download()` 改成 no-op ⇒ 本条**必红**（`createObjectURL` 不会被调用）。
+   *
+   * ⚠️ 三件事都要断言，缺一条就是一个"看起来在守"的空壳：
+   *   ① `createObjectURL` 收到的**是个 Blob 且里面装着 TOML**（不是空串）；
+   *   ② `<a download>` 的**文件名**对；
+   *   ③ 用完 `revokeObjectURL`——不撤的话每点一次都在页面里留一个句柄，
+   *      而"泄漏了看不见"正是本项目最讨厌的形状。
+   * ⚠️ jsdom **没有实现** `URL.createObjectURL`（直接调会抛），所以这里是
+   * 挂上去一个替身而不是 mock 一个已有实现——挂之前它在不在都不影响。
+   */
+  // ⚠️ 形参必须**声明出来**（`_b: Blob`）：不声明的话 `mock.calls` 是空元组类型，
+  // `calls[0][0]` 在 `tsc -b` 下直接报 TS2493/TS2352——而 `npm test` 照样绿。
+  // 这正是「改前端必须跑 `npm run build`」那条纪律存在的理由。
+  const createUrl = vi.fn((_b: Blob) => 'blob:http://localhost/fake-uuid')
+  const revokeUrl = vi.fn((_u: string) => undefined)
+  ;(URL as unknown as { createObjectURL: unknown }).createObjectURL = createUrl
+  ;(URL as unknown as { revokeObjectURL: unknown }).revokeObjectURL = revokeUrl
+  const clickSpy = vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(() => {})
+
+  // ⚠️ 只抓 `<a>`：React 19 造每个 DOM 节点都走 `document.createElement`，
+  // 于是这个 spy 会看到很多别的东西（Settings 里本来没有 <a>，所以 <a> 就是我们的）。
+  const anchors: HTMLAnchorElement[] = []
+  const origCreate = document.createElement.bind(document)
+  vi.spyOn(document, 'createElement').mockImplementation(((
+    tag: string,
+    options?: ElementCreationOptions,
+  ) => {
+    const el = origCreate(tag, options)
+    if (tag === 'a') anchors.push(el as HTMLAnchorElement)
+    return el
+  }) as typeof document.createElement)
+
+  installFetch({})
+  render(<Settings />)
+
+  await openSection('导入导出')
+  const btn = (await screen.findByRole('button', { name: '下载 .toml' })) as HTMLButtonElement
+  await waitFor(() => expect(btn.disabled).toBe(false))
+  await userEvent.click(btn)
+
+  expect(createUrl).toHaveBeenCalledTimes(1)
+  const blob = createUrl.mock.calls[0][0] as Blob
+  expect(blob).toBeInstanceOf(Blob)
+  expect(await blob.text()).toBe('# pack\n[[groups]]\nid = 1\n')
+
+  expect(anchors.length).toBe(1)
+  expect(anchors[0].download).toBe('vigil-config.toml')
+  expect(anchors[0].href).toContain('blob:')
+  expect(clickSpy).toHaveBeenCalledTimes(1)
+  expect(revokeUrl).toHaveBeenCalledTimes(1)
+})
+
+// ── LLM ───────────────────────────────────────────────────────────────
+
+test('保存 LLM 之后输入框显示的是服务端回的值（不是本地那串带空白的输入）', async () => {
+  /**
+   * ⭐ Fix loop 1 / m3 的行为那一半。
+   *
+   * ⚠️ 原来的注释说「显示的是**服务端回给的那个值**」，而实际只回填了
+   * `thinking`——`base_url`/`model` 还是本地 state，**于是那句注释是半句假话**。
+   * 这条用例钉的是「所见即所存」：`save()` 发出的是 `trim()` 过的值，
+   * 后端存下、回给你的也是 trim 过的 ⇒ 输入框必须跟着变成**那个值**。
+   *
+   * ⚠️ 判据设计：输入的与回给的两者必须**不同**（这里输入 `  https://b/v1  `、
+   * 服务端回 `https://b/v1`），否则这条用例区分不出"回填了"与"没回填"
+   * （T3 I1/I2 的同一条判据）。
+   *
+   * ⚠️ 变异反证：去掉 `setBaseUrl(back.base_url)` ⇒ 本条**必红**
+   * （输入框里留着 `  https://b/v1  `）。
+   */
+  const { calls } = installFetch({
+    llm: { base_url: 'https://a/v1', model: 'm', enable_thinking: null },
+    llmPut: { base_url: 'https://b/v1', model: 'm', enable_thinking: null },
+  })
+  render(<Settings />)
+
+  await openSection('LLM')
+  const base = (await screen.findByDisplayValue('https://a/v1')) as HTMLInputElement
+  await userEvent.clear(base)
+  await userEvent.type(base, '  https://b/v1  ')
+  await userEvent.click(screen.getByRole('button', { name: '保存' }))
+
+  await waitFor(() => {
+    expect((screen.getByDisplayValue('https://b/v1') as HTMLInputElement).value).toBe(
+      'https://b/v1',
+    )
+  })
+  expect(
+    (calls.find((c) => c.method === 'PUT' && c.url === '/api/llm')?.body as { base_url: string })
+      .base_url,
+    '发出去的必须是 trim 过的——界面上显示的那个值',
+  ).toBe('https://b/v1')
+})
+
+// ── tab ───────────────────────────────────────────────────────────────
+
 test('「配置」tab 在 App 里挂得上，且真的去读了群清单', async () => {
   /**
    * ⚠️ 变异反证：把 `App.tsx` 的 `{tab === 'settings' && <Settings />}`
    * 删掉 ⇒ 本条**必红**（点完「配置」页面上什么都没有）。
    */
-  const calls = installFetch({ groups: AVAILABLE })
+  const { calls } = installFetch({ groups: AVAILABLE })
   render(<App />)
 
   await userEvent.click(await screen.findByRole('button', { name: '配置' }))

@@ -416,7 +416,18 @@ def _assert_no_new_files_under_data(data_root, before) -> None:
 
 
 def test_no_web_endpoint_creates_anything_at_all_under_data(data_root, client):
-    """⭐ D11 的**完整**版本：Web 侧跑一遍所有写端点，`data/` 下**一个文件都不许多**。
+    """⭐ D11 的完整版本：Web 侧跑一遍写端点，`data/` 下**一个文件都不许多**。
+
+    ⚠️ **这句话原来写得比实际宽**（M6 T9 fix loop 1 / m4）：正文只跑了 5 条，
+    而 `PUT /api/llm`（T9 新增的、**唯一往 `data/` 之外**写的端点）不在里面。
+    ⇒ 现已补上它。剩下的写端点（`/api/categories*`、`/api/groups*`、
+    `/api/items/kinds`、`/api/bulk-undo`、`/api/reorder`、`/api/jobs/*`）
+    **仍然不在这张表里**——它们是**代表性子集**，不是字面上的"所有"：
+    这几条各自需要有效的请求体（类目 slug、job id…），
+    把它们都塞进来会让这条守卫变成"夹具练习"。它们各自的用例在
+    `tests/test_api.py`（含 D11 的主库指纹那条）与 `tests/test_overlay_e2e.py`
+    的其他用例里；**这里守的是"新增文件"这个维度**，而 `/api/llm` 是本批里
+    唯一一个"写的东西不在 `data/`"的端点，正是这个维度上最需要被罩住的一条。
 
     ⚠️ 为什么不能只盯 `data/vigil.db` 的指纹（既有那条守卫做的事）：
     spec §8 白纸黑字说旧表述「挡不住『我可以写 `data/cache/` 啊』」，
@@ -434,6 +445,16 @@ def test_no_web_endpoint_creates_anything_at_all_under_data(data_root, client):
     client.delete("/api/persons/100000001")
     client.post("/api/items/1/kind", json={"kind": "life"})
     client.post("/api/undo", json={})
+    # ⚠️ T9 新增：`PUT /api/llm` 写的是 `config/llm.toml`（**D11 允许的 `config/`**），
+    # 正是"Web 的写边界钉在具体文件上"这条的第二个落点——
+    # 它若被写成往 `data/` 下丢一份副本（或往 `data/cache/` 丢临时文件），
+    # 下面那条断言必须翻脸。`data_root` 夹具已经把 `api.REPO_ROOT` 挪到 tmp，
+    # 所以它写的是 tmp 的 `config/`，不会碰真实仓库。
+    r = client.put(
+        "/api/llm",
+        json={"base_url": "https://x/v1", "model": "m", "enable_thinking": None},
+    )
+    assert r.status_code == 200, r.text
 
     _assert_no_new_files_under_data(data_root, before)
 
