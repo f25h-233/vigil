@@ -1,16 +1,65 @@
-import { useState } from 'react'
-import { fetchItem } from '../api.ts'
+import { useEffect, useState } from 'react'
+import { deleteItem, fetchCategories, fetchItem, setItemKind } from '../api.ts'
 import { fmtDate, relTime } from '../format.ts'
-import type { Item, Source } from '../types.ts'
+import type { Category, Item, Source } from '../types.ts'
 import SourceList from './SourceList.tsx'
 
-export default function ItemCard({ item }: { item: Item }) {
+export default function ItemCard({
+  item,
+  onMutated,
+}: {
+  item: Item
+  /** 改动成功后通知父级重取列表。不传则只读（日报页就是这样用的）。 */
+  onMutated?: () => void
+}) {
   const [open, setOpen] = useState(false)
   const [sources, setSources] = useState<Source[] | null>(null)
   const [err, setErr] = useState<string | null>(null)
   // 「请求在飞」。它**不是** `sources === null` 的同义词：后者把「还没读过」
   // 与「读失败了」混在一起，而这两句话对用户的意思完全不同。
   const [loading, setLoading] = useState(false)
+  const [busy, setBusy] = useState(false)
+  const [actErr, setActErr] = useState<string | null>(null)
+  const [cats, setCats] = useState<Category[]>([])
+
+  // ⚠️ 依赖是「这张卡片可不可改」这个**布尔值**，不是 `onMutated` 本身：
+  // Feed 传下来的 `retry` 是每次渲染新建的函数，直接依赖它会让一页 50 张
+  // 卡片在父组件每次重渲染时各自重发一次 `/api/categories`。
+  const mutable = onMutated !== undefined
+  useEffect(() => {
+    if (!mutable) return
+    fetchCategories()
+      .then((r) => setCats(r.categories))
+      // 类目拉不到只该让下拉框空着，不该把整张卡片变成错误态：
+      // 「改不了分类」与「读不到源消息」不是一回事。
+      .catch(() => setCats([]))
+  }, [mutable])
+
+  async function changeKind(slug: string) {
+    setBusy(true)
+    setActErr(null)
+    try {
+      await setItemKind(item.item_id, slug)
+      onMutated?.()
+    } catch (e: unknown) {
+      setActErr(e instanceof Error ? e.message : String(e))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  async function remove() {
+    setBusy(true)
+    setActErr(null)
+    try {
+      await deleteItem(item.item_id)
+      onMutated?.()
+    } catch (e: unknown) {
+      setActErr(e instanceof Error ? e.message : String(e))
+    } finally {
+      setBusy(false)
+    }
+  }
 
   // 源消息**按需拉取**：列表一次 50 条，全带上原文会把响应撑大好几倍，
   // 而绝大多数条目用户不会展开。
@@ -82,6 +131,33 @@ export default function ItemCard({ item }: { item: Item }) {
           )}
         </div>
       </button>
+
+      {/* ⚠️ 操作条在**外层 button 之外**：`<button>` 里不能再放 `<select>`/`<button>`
+          （HTML 不允许嵌套交互元素），浏览器会把内层踢出去、点击行为变得不可预测。 */}
+      {onMutated && (
+        <div className="mt-2 flex flex-wrap items-center gap-2 border-t border-white/5 pt-2 text-xs">
+          <select
+            value={item.kind}
+            disabled={busy}
+            onChange={(e) => changeKind(e.target.value)}
+            className="rounded-lg bg-black/30 px-2 py-1 text-xs text-white/70 outline-none"
+          >
+            {cats.map((c) => (
+              <option key={c.slug} value={c.slug}>
+                {c.icon} {c.label}
+              </option>
+            ))}
+          </select>
+          <button
+            onClick={remove}
+            disabled={busy}
+            className="rounded-lg bg-red-500/10 px-2 py-1 text-red-300 disabled:opacity-40"
+          >
+            删除
+          </button>
+          {actErr !== null && <span className="text-red-400">{actErr}</span>}
+        </div>
+      )}
 
       {open && (
         <div className="mt-3 border-t border-white/10 pt-3">
