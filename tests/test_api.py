@@ -1817,3 +1817,48 @@ def test_api_rename_category_reports_aliases(client_factory):
     old_kind = c.get(f"/api/items/{item_id}").json()["kind"]
     assert c.put(f"/api/categories/{old_kind}", json={"slug": "life_v2"}).status_code == 200
     assert c.get("/api/categories").json()["aliases"] == {old_kind: "life_v2"}
+
+
+# ── M6 T4 复审 ⚠️-3：显示路径降级、配置载荷保持响亮 ────────────────────
+
+
+def test_a_broken_config_degrades_the_display_paths_but_not_the_config_payload(
+    client, db_path
+):
+    """⭐ 配置读不出来时：显示路径**降级**（200 + 裸群号），配置载荷**响亮**（500）。
+
+    ⚠️ 三条显示路径（`/api/items`、`/api/items/{id}`、`/api/digests/{id}`）只需要
+    一个**显示用**的群名——为它把**信息流**（主页面）整页黑成 500，与
+    `groups_snapshot.load` 刻意「增强项不许 500」是同一条判据的反面。
+    ⚠️ 而 `/api/groups` 的**载荷就是配置**：读不出来必须 500——否则它会若无其事地
+    回一句「还没有群清单快照」（一句假话：真相是配置文件坏了）。
+
+    ⚠️ 变异反证：把 `group_names_map()` 的降级去掉（恢复直接 `current_config()`）
+    ⇒ 前三条断言红（500）。
+
+    ⚠️ 坏掉的是**临时那份** `groups.toml`（conftest 的 autouse 夹具把
+    `api.REPO_ROOT` 挪到了 tmp 根）——真实仓库里那份先 assert 确认碰不到。
+    """
+    from vigil import api as _api
+    from vigil import config as _config
+
+    _seed_digest(db_path)
+    cfg_path = _api.REPO_ROOT / "config" / "groups.toml"
+    assert cfg_path != _config.DEFAULT_CONFIG, (
+        "夹具没把 `api.REPO_ROOT` 挪走 ⇒ 本条会去改仓库里真实的 groups.toml"
+    )
+    cfg_path.write_text("[[groups]\n", encoding="utf-8")  # 故意的 TOML 语法错
+
+    r = client.get("/api/items")
+    assert r.status_code == 200, "配置坏掉不许把信息流整页黑掉（显示路径要降级）"
+    assert r.json()["items"][0]["group_name"] == "12345", (
+        "降级必须是**裸群号字符串**——不是空串、不是 None、更不是 500"
+    )
+    one = client.get("/api/items/1")
+    assert one.status_code == 200 and one.json()["group_name"] == "12345"
+    assert client.get("/api/digests/1").status_code == 200
+
+    # 阳性对照的另一半：**配置就是载荷**的那条保持响亮
+    assert client.get("/api/groups").status_code == 500, (
+        "`/api/groups` 读不出配置必须响亮——否则它会回一句「还没有快照」的假话"
+    )

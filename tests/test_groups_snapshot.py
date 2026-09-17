@@ -48,14 +48,56 @@ def test_load_returns_none_for_a_corrupt_file(tmp_path):
     ⚠️ 与 `load_config` 的「快速失败」**不矛盾**：`groups.toml` 是**必需**的
     配置，写错了要立刻死；而快照是**派生物**，它坏了只意味着"该重跑一次
     export"，把整个服务拖死是过度反应。
+
+    ⚠️ **每条输入都必须真的走到它要测的那道闸**（M6 T4 复审 Important-1，
+    E7 的「输入到不了」形态）：原稿的三条里，后两条都**缺 `schema`**，
+    于是它们在**版本闸**就返回了 `None` —— `load()` 的「`groups` 是不是 list」
+    与「逐条校验」**一行都没被执行过**，而测试看起来覆盖了「坏文件」。
+    所以这里：① 每条坏输入都**只坏一处**（其余字段与阳性对照逐字相同）；
+    ② 先跑阳性对照——它必须 `load` 得回来，否则说明这些 `None` 都是
+    **更早的闸**给的，本条判据（连同它下面的每一条）就是空的。
     """
     p = tmp_path / "s.json"
+
+    def load_of(payload) -> groups_snapshot.Snapshot | None:
+        p.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        return groups_snapshot.load(p)
+
+    # ── 0. 阳性对照：下面每条坏输入都是**在它身上只坏一处** ──────────
+    good = {
+        "schema": groups_snapshot.SCHEMA_VERSION,
+        "generated_at": 1,
+        "groups": [{"id": 111, "name": "甲群", "messages": 1, "last_ts": 2}],
+    }
+    assert load_of(good) is not None, (
+        "阳性对照都 load 不回来 ⇒ 下面那些 `None` 是更早的闸给的，本条是空守卫"
+    )
+
+    # ── 1. 连 JSON 都不是 / 顶层不是表 ────────────────────────────
     p.write_text("{not json", encoding="utf-8")
     assert groups_snapshot.load(p) is None
-    p.write_text('{"generated_at": 1}', encoding="utf-8")
+    p.write_text("[1, 2]", encoding="utf-8")
     assert groups_snapshot.load(p) is None
-    p.write_text('{"generated_at": 1, "groups": [{"id": "x"}]}', encoding="utf-8")
-    assert groups_snapshot.load(p) is None
+
+    # ── 2. 版本闸（其余字段全对）──────────────────────────────────
+    assert load_of({**good, "schema": groups_snapshot.SCHEMA_VERSION + 1}) is None
+
+    # ── 3. 形状错：generated_at / groups ──────────────────────────
+    assert load_of({**good, "generated_at": "1700000000"}) is None, (
+        "generated_at 不是整数 ⇒ 必须 None（否则 `int()` 那行在旧代码里会抛）"
+    )
+    assert load_of({**good, "groups": {}}) is None, "`groups` 不是列表 ⇒ 必须 None"
+    assert load_of({**good, "groups": [[1, 2]]}) is None, "列表元素不是表 ⇒ 必须 None"
+
+    # ── 4. 逐条校验（⚠️ 这一节是原稿**到不了**的那一段）────────────
+    # 4a. 字段**全在、类型全错**：够得到 `int()` / `str()` 那四行，
+    #     也只有它能证明「不是随便 `GroupInfo(**e)` 就放行」
+    #     （缺键那条走的是同一个 except，但 `GroupInfo(**e)` 也会抛，
+    #      所以单靠它区分不出「有校验」与「没校验」）。
+    assert load_of({**good, "groups": [{"id": "x", "name": "甲群",
+                                       "messages": 1, "last_ts": 2}]}) is None
+    # 4b. 缺键
+    assert load_of({**good, "groups": [{"id": 111}]}) is None
 
 
 def test_load_refuses_a_future_schema_version(tmp_path):

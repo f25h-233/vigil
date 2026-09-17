@@ -316,3 +316,40 @@ def test_export_refreshes_the_groups_snapshot(env, monkeypatch):
         "取不到群名时必须是空串（`collect` 的契约）——写成 '?' 会让界面上的"
         "「(无名)」看起来像一个真名字"
     )
+
+
+def test_snapshot_progress_failure_is_not_reported_as_a_snapshot_failure(env, monkeypatch):
+    """⭐ 快照那行的**报进度失败**不许被吞成「群清单快照写不出去」。
+
+    与 `test_media_index_progress_failure_is_not_swallowed` 是同一条规矩
+    （`export.py` 里「本地图片缓存」那一段的完整论证）：能吞的只有
+    「打扫类」失败，**报进度是本次运行的记录**。
+
+    ⚠️ 实测过的坏形状（M6 T4 复审 Minor-3）：`on_progress(...)` 原本写在
+    那个 `try` **里面**，于是日志写不进去（`logs.emit` 抛 `OSError`）会被
+    `except Exception` 吞掉、改写成一句**假的**「群清单快照写不出去」——
+    排障的人于是去查快照，而真相是日志。
+
+    ⚠️ 判据是「**那句假话不许出现**」而不是「异常必须冒出来」：两种写法下
+    异常最终都会冒出来（写坏的 `on_progress` 在 `except` 分支里会再抛一次），
+    只有「seen 里有没有那句假警告」能分开它们。变异（把 emit 挪回 `try` 内）
+    实测红，见 task-4-report.md 的 Fix loop 1。
+    """
+    # 让快照那一段**顺利跑完**：本用例测的不是「失败降级」，是「报进度」。
+    monkeypatch.setattr(export_mod.qqdb, "list_group_message_counts", lambda conn: [])
+    seen: list[str] = []
+
+    def boom(msg: str) -> None:
+        seen.append(msg)
+        if "群清单快照" in msg:
+            raise _EmitBoom("日志写不进去")
+
+    with pytest.raises(_EmitBoom):
+        export_mod.export(_config(env), "k-db", on_progress=boom)
+
+    assert any("群清单快照" in m for m in seen), (
+        "★ 得先确认异常真的来自快照那行，否则本条什么都没钉"
+    )
+    assert not any("写不出去" in m for m in seen), (
+        f"报进度失败被吞成了「快照写不出去」——那是假的诊断，真相是日志：{seen!r}"
+    )

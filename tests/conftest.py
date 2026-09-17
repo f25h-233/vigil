@@ -77,6 +77,24 @@ desc = "隔离用类目：兼职招聘"
 """
 
 
+# ── 默认路径 / REPO_ROOT 的隔离（autouse）─────────────────────────────
+#
+# ⚠️ **约定（M6 T4 复审 ⚠️-2，对 T5–T9 都成立）：测试里凡是要落到临时根的
+#    路径，一律写绝对路径（`pathlib.Path(...).as_posix()`）**——不许在临时配置
+#    里写相对路径、指望被测代码去拼 `REPO_ROOT`。三条理由：
+#
+#      · `config.REPO_ROOT` 与 `api.REPO_ROOT` 是**两个模块全局**
+#        （`config.py` / `api.py` 各一个），下面的夹具只挪得动其中一个；
+#      · `validate_config_raw` 对**相对** `output_db` 的解析基准是
+#        `config.REPO_ROOT`——那是 import 期算好的常量，`monkeypatch` 够不着；
+#      · 于是「只挪了 `api.REPO_ROOT`，而临时 `groups.toml` 里写的是相对
+#        `output_db`」会把产物**指回真实仓库的 `data/`**：快照路径
+#        （`groups_snapshot.default_path` = `output_db.parent / …`）正是从它推出来的。
+#        而外部断言全都在看 tmp 根 ⇒ **空守卫**（评审已复现这条链）。
+#
+#   同理一律 `.as_posix()`：反斜杠在 TOML 基本字符串里是转义字符。
+
+
 @pytest.fixture(autouse=True)
 def _isolate_overrides_path(tmp_path_factory, monkeypatch):
     """把人工干预层的默认路径挪出仓库——**否则写路径会建真实的 `data/overrides.db`**。

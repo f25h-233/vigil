@@ -386,6 +386,35 @@ def client(data_root):
     return TestClient(create_app(cfg))
 
 
+# ⚠️ `data/overrides.db` 是 **D11 明确允许**的例外（人工干预层），它连同
+# `-wal` / `-shm` 都在允许列表里；其余一律不许新增。
+# ⚠️ 写成**模块常量**而不是函数里的局部量（M6 T4 复审 ⚠️-1）：它原先在
+# `test_no_web_endpoint_creates_anything_at_all_under_data` 里是**死代码**——
+# conftest 的 `_isolate_overrides_path` 把 `OVERRIDES_DB` 挪到**另一个** mktemp
+# 目录 ⇒ `data/overrides.db*` 永远不会出现在 `data_root` 里 ⇒ 这条例外
+# **从未被行使**（实测 `before=['vigil.db']`）。抽成常量之后，
+# 下面那条 `test_the_d11_exception_is_alive_and_still_narrow` 才能用**同一个**
+# 集合把「例外真的被行使」与「例外仍然窄」两边都钉住。
+_D11_ALLOWED_UNDER_DATA = frozenset({
+    pathlib.Path("overrides.db"),
+    pathlib.Path("overrides.db-wal"),
+    pathlib.Path("overrides.db-shm"),
+})
+
+
+def _assert_no_new_files_under_data(data_root, before) -> None:
+    """守卫本体：`data/` 下的文件集合**只许多出 D11 允许的那几条**。
+
+    ⚠️ 抽成函数是为了让「容忍」与「抓得住」两侧走**同一条**判据：
+    只看一份副本的断言会在判据被改坏时静默失效（本项目的墓碑清单里有同形的事）。
+    """
+    after = {p.relative_to(data_root) for p in data_root.rglob("*") if p.is_file()}
+    assert after - before <= _D11_ALLOWED_UNDER_DATA, (
+        f"Web 侧往 data/ 里新增了文件：{sorted(after - before - _D11_ALLOWED_UNDER_DATA)} —— "
+        "D11 只允许写 data/overrides.db 与 config/"
+    )
+
+
 def test_no_web_endpoint_creates_anything_at_all_under_data(data_root, client):
     """⭐ D11 的**完整**版本：Web 侧跑一遍所有写端点，`data/` 下**一个文件都不许多**。
 
@@ -406,15 +435,51 @@ def test_no_web_endpoint_creates_anything_at_all_under_data(data_root, client):
     client.post("/api/items/1/kind", json={"kind": "life"})
     client.post("/api/undo", json={})
 
-    after = {p.relative_to(data_root) for p in data_root.rglob("*") if p.is_file()}
-    # ⚠️ `data/overrides.db` 是 **D11 明确允许**的例外（人工干预层），
-    # 它连同 `-wal` / `-shm` 都在允许列表里；其余一律不许新增。
-    allowed = {
-        pathlib.Path("overrides.db"),
-        pathlib.Path("overrides.db-wal"),
-        pathlib.Path("overrides.db-shm"),
-    }
-    assert after - before <= allowed, (
-        f"Web 侧往 data/ 里新增了文件：{sorted(after - before - allowed)} —— "
-        "D11 只允许写 data/overrides.db 与 config/"
+    _assert_no_new_files_under_data(data_root, before)
+
+
+def test_the_d11_exception_is_alive_and_still_narrow(data_root, monkeypatch):
+    """⭐ `data/overrides.db*` 真的出现过：守卫**容忍**它，但**不放行别的**。
+
+    ⚠️ 为什么要有这一条（M6 T4 复审 ⚠️-1）：上面那条守卫里的 `allowed` 三条
+    在默认夹具下**从未被行使**（`OVERRIDES_DB` 被 conftest 挪到另一个目录了）
+    ——「看起来有、其实没人看」的代码，本项目是给过墓碑的
+    （`daily.RunReport.counters`）。这里让它**活**：
+    把 `OVERRIDES_DB` 指进 `data_root`，于是那条例外真的被用到。
+
+    ⚠️ 判据三件，缺一条就会退化成空守卫：
+      ① **阳性对照**：`overrides.db*` 必须真的落进 `data_root`；
+      ② 守卫**容忍**它（用上面那条一模一样的 `_assert_no_new_files_under_data`）；
+      ③ 但它**只**容忍它——亲手多写一个 `cache/nt_msg_clear.db`
+         （= §1.6 那个地雷的形状），守卫必须**翻脸**。
+    """
+    monkeypatch.setattr(overrides, "OVERRIDES_DB", data_root / "overrides.db")
+    # ⚠️ 必须**重造 app**：`overrides.ensure_schema()` 是在 `create_app` 里跑的，
+    # 而 `client` 夹具是在这次 monkeypatch **之前**造出来的。
+    cfg = Config(
+        qq_db_dir=data_root.parent / "qqdb",
+        output_db=data_root / "vigil.db",
+        groups=(Group(id=GID, name="测试群"),),
     )
+    # ⚠️ `before` 必须在**造 app 之前**取：`create_app` 里的
+    # `overrides.ensure_schema()` 就会把 `overrides.db` 建出来（那也算 Web 侧写
+    # `data/`），在它之后取快照的话，这个文件会被算进「本来就有的」⇒ 阳性对照
+    # 永远是空的（实测第一版就踩了这个：`new=set()`）。
+    before = {p.relative_to(data_root) for p in data_root.rglob("*") if p.is_file()}
+    c = TestClient(create_app(cfg))
+
+    assert c.post("/api/items/1/kind", json={"kind": "life"}).status_code == 200
+    new = {p.relative_to(data_root) for p in data_root.rglob("*") if p.is_file()} - before
+
+    assert any(p.name.startswith("overrides.db") for p in new), (
+        f"阳性对照失败：`data/overrides.db*` 没有出现 ⇒ 本条与上面那条一样是空守卫（new={new}）"
+    )
+    # ② 走**同一条**守卫判据：容忍例外
+    _assert_no_new_files_under_data(data_root, before)
+
+    # ③ 例外是**窄**的：§1.6 的地雷仍然要被抓住
+    cache_dir = data_root / "cache"
+    cache_dir.mkdir(exist_ok=True)
+    (cache_dir / "nt_msg_clear.db").write_bytes(b"x")
+    with pytest.raises(AssertionError):
+        _assert_no_new_files_under_data(data_root, before)

@@ -362,6 +362,7 @@ def export(config: Config, key: str, *, on_progress=print) -> ExportStats:
         # `nt_msg.db`）。但外层**不许**写成裸 `except:`——那会连 `KeyboardInterrupt`
         # 一起吞掉。
         # ⚠️ 失败只警告不中断：快照是增强项，export 的主业是把消息导出来。
+        snap_note = ""
         try:
             counts = qqdb.list_group_message_counts(src)
             names: dict[str, str] = {}
@@ -373,9 +374,15 @@ def export(config: Config, key: str, *, on_progress=print) -> ExportStats:
                 groups_snapshot.collect(counts, names),
                 groups_snapshot.default_path(config),
             )
-            on_progress(f"群清单快照：{len(counts)} 个群")
+            snap_note = f"群清单快照：{len(counts)} 个群"
         except Exception as exc:  # noqa: BLE001 — 增强项，不该拖垮导出
-            on_progress(f"[警告] 群清单快照写不出去：{str(exc)[:80]}")
+            snap_note = f"[警告] 群清单快照写不出去：{str(exc)[:80]}"
+        # ⚠️ **报进度必须留在 try 外面**（M6 T4 复审 Minor-3，规矩见下面
+        # 「本地图片缓存」那一段的完整论证）：写在 `try` 里的话，
+        # 「日志写不进去」会被上面那句 `except Exception` 吞成一句
+        # 「群清单快照写不出去」——**一个指向错误方向的诊断**：真相是日志的问题，
+        # 而报告让人去查快照。能吞的只有「打扫类」失败；**报进度是本次运行的记录**。
+        on_progress(snap_note)
 
         # 本地图片缓存索引：只扫一次，所有群共用。图片是增强项，取不到不拖垮导出。
         #

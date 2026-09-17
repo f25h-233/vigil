@@ -109,14 +109,21 @@ def _cmd_groups_locked(args) -> int:
     # ⚠️ 顺手写快照（M6 T4）：Web 的「配置」页只读这个文件，永远不碰 QQ 库。
     # ⚠️ 失败**只警告不中断**：快照是增强项，而 `vigil groups` 的主业是
     # 把那张家底表打到屏幕上（人工排障时最需要的东西）。
+    # ⚠️ `except` 必须是 `Exception`、**不是** `OSError`（M6 T4 复审 Minor-2）：
+    # 磁盘/权限之外的失败同样不该让整条命令中断——`collect()` 撞上形状不对的
+    # `counts` 会抛 `TypeError`，而它对用户是同一条处置：表格照打、退出码照 0。
+    # 只捕 `OSError` 的话，「失败只警告不中断」就只覆盖了一半（实测：
+    # `TypeError` 会径直冒出 `_cmd_groups_locked`）。
+    # ⚠️ 措辞也不能想当然：表格是在这段**之后**才打印的（M6 T4 复审 Minor-1），
+    # 写「不影响上面的列表」是错的。
     try:
         snap_path = groups_snapshot.write(
             groups_snapshot.collect(counts, names),
             groups_snapshot.default_path(config),
         )
         print(f"[快照] 已写 {snap_path}", file=sys.stderr)
-    except OSError as exc:
-        print(f"[警告] 群清单快照写不出去（不影响上面的列表）：{exc}", file=sys.stderr)
+    except Exception as exc:  # noqa: BLE001 — 快照是增强项，任何失败都只警告
+        print(f"[警告] 群清单快照写不出去（不影响群列表）：{exc}", file=sys.stderr)
 
     watched = {g.id for g in config.enabled_groups}
     known = {g.id for g in config.groups}

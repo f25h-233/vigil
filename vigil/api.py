@@ -22,7 +22,7 @@ from fastapi import Body, FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse, HTMLResponse
 
 from . import categories as categories_mod
-from . import groups_snapshot, overrides, store
+from . import groups_snapshot, logs, overrides, store
 from .categories import Category, load_categories
 from .config import (
     REPO_ROOT,
@@ -320,8 +320,24 @@ def create_app(config: Config) -> FastAPI:
 
         ⚠️ 只在**端点入口**读一次、再传进 `item_out`：列表接口一页 50 条，
         写在 `item_out` 里就是 50 次读同一份 3KB 的 TOML。
+
+        ⚠️ **读不出来时降级成空映射，绝不 500**（M6 T4 复审 ⚠️-3 的裁定）：
+        用它的三条是**显示路径**（`/api/items`、`/api/items/{id}`、
+        `/api/digests/{id}`），它们只需要一个**显示用**的群名——配置坏掉时
+        退回裸群号（`item_out` 的 `names.get(..., str(gid))` 本来就是这么写的），
+        而不是把**信息流**（主页面）整页黑成 500。这与 `groups_snapshot.load`
+        刻意「增强项不许 500」是同一条判据。
+        ⚠️ 而 `/api/groups` 与四个写端点**保持响亮**（它们走 `current_config()`）：
+        配置就是它们的载荷 / 前提，读不出来必须让人看见。
+        ⚠️ 但降级**必须留痕**：静默降级等于把「配置坏了」藏起来，
+        用户只会看到一屏裸群号而不知道为什么。
         """
-        return {g.id: g.name for g in current_config().groups}
+        try:
+            cfg = current_config()
+        except HTTPException as exc:
+            logs.emit(f"[警告] 群名读取失败，信息流退回裸群号：{exc.detail}")
+            return {}
+        return {g.id: g.name for g in cfg.groups}
 
     def item_out(
         it: store.ApiItem, names: dict[int, str], cats: dict[str, Category]

@@ -1327,3 +1327,86 @@ def test_groups_refuses_to_run_while_another_instance_holds_the_lock(cli_env, mo
     monkeypatch.setattr(lock.SingleInstance, "__enter__", boom)
     rc = cli.main(["groups"])
     assert rc == 2
+
+
+# ── groups：末尾顺手写群清单快照（M6 T4；复审 Important-2 补的覆盖）────
+
+
+def test_groups_writes_the_snapshot_that_the_web_side_reads(cli_env, monkeypatch):
+    """⭐ `vigil groups` 必须把群清单快照写到 `groups_snapshot.default_path(config)`。
+
+    ⚠️ 为什么非要有守卫（M6 T4 复审 Important-2）：快照是 Web「配置」页**唯一**
+    的只读数据源（spec §1.6：Web 永不接触 QQ 库、不拿密钥），而它只有两个
+    生产者（`vigil groups` 与 `vigil export`）。把这一段整块删掉 ⇒ 界面永远
+    停在「还没有快照，请先跑一次 export」——**而全量 663 条没有一条会红**
+    （复审已实测）。
+
+    ⚠️ `open_encrypted` / `list_group_message_counts` / `group_names` 换成替身：
+    本用例测的是**那一小段写快照的代码**，不是 qqdb 的查询（真
+    `open_encrypted` 走 sqlcipher3，对明文库必然解密失败）。
+    `strip_fake_header` 用**真实现**——它只是字节搬运，本夹具造的就是它的输入形状。
+    """
+    import sqlite3
+
+    from vigil import groups_snapshot
+
+    _fake_source_db(cli_env / "qq" / "nt_msg.db")
+    _fake_source_db(cli_env / "qq" / "group_info.db")
+    monkeypatch.setattr(
+        "vigil.qqdb.open_encrypted", lambda path, key: sqlite3.connect(str(path))
+    )
+    monkeypatch.setattr(
+        "vigil.qqdb.list_group_message_counts", lambda conn: [(100, 7, 1_700_000_000)]
+    )
+    monkeypatch.setattr("vigil.qqdb.group_names", lambda conn: {"100": "班级群"})
+
+    assert cli.main(["groups"]) == 0
+
+    snap = groups_snapshot.load(cli_env / "groups-snapshot.json")
+    assert snap is not None, (
+        "`vigil groups` 没写快照 ⇒ Web 的配置页永远停在「还没有快照」"
+        "（而快照只有它和 `vigil export` 两个生产者）"
+    )
+    assert snap.groups == (
+        groups_snapshot.GroupInfo(
+            id=100, name="班级群", messages=7, last_ts=1_700_000_000
+        ),
+    ), "快照内容与 `collect()` 的拼装不符"
+
+
+def test_groups_survives_a_snapshot_failure_that_is_not_an_oserror(
+    cli_env, monkeypatch, capsys
+):
+    """⭐ 「快照写失败只警告不中断」必须覆盖**非磁盘类**失败（复审 Minor-2）。
+
+    ⚠️ 原实现只捕 `OSError`（实测：`collect()` 抛 `TypeError` 会**冒出**
+    `_cmd_groups_locked`、整条命令中断）——而 `except OSError` 与 `export()` 的
+    `except Exception` 宽窄不一致，本文件已经把后者写成了规矩。
+    对用户来说「磁盘满」与「counts 形状不对」是同一条处置：**表格照打、退出码 0**。
+
+    ⚠️ 判据三条一起：rc=0、**表格还在**（`stdout` 非空——复审实测过坏形状下
+    stdout 为空）、并且**说出了那句警告**（静默降级在本项目是不许的）。
+    """
+    import sqlite3
+
+    from vigil import groups_snapshot
+
+    _fake_source_db(cli_env / "qq" / "nt_msg.db")
+    monkeypatch.setattr(
+        "vigil.qqdb.open_encrypted", lambda path, key: sqlite3.connect(str(path))
+    )
+    monkeypatch.setattr(
+        "vigil.qqdb.list_group_message_counts", lambda conn: [(100, 7, 1_700_000_000)]
+    )
+
+    def boom(counts, names):
+        raise TypeError("counts 的形状不对")
+
+    monkeypatch.setattr(groups_snapshot, "collect", boom)
+
+    assert cli.main(["groups"]) == 0, "非磁盘类失败不许把整条 `vigil groups` 中断"
+    captured = capsys.readouterr()
+    assert "消息数" in captured.out, "表格必须照打（快照失败不该影响主业）"
+    assert "[警告] 群清单快照写不出去" in captured.err, (
+        "失败必须说出来——静默降级等于把「快照没写成」藏起来"
+    )
