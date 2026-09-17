@@ -375,6 +375,13 @@ def test_keep_settings_says_so_when_the_local_settings_cannot_be_kept(roots, sha
     assert "手工" in text or "修好" in text, (
         f"措辞要能让人行动（怎么才能用上本机路径）——实际：{text!r}"
     )
+    # ⚠️ **摘要行也不许说假话**（Fix loop 2 / FIX 2）：它从前用的是「用户勾了框」
+    # （`if keep_settings`）而不是「真的跳过了」（`report.settings_skipped`），
+    # 于是这一支的摘要会跟着打「（保留本机 [settings]）」——而它**恰恰没保留**。
+    # 那句话还会作为 `notes` 回到 API 响应里给前端显示。
+    assert "（保留本机 [settings]）" not in lines[-1], (
+        f"摘要行在说谎：本机设置没保住，却打了「保留本机 [settings]」——{lines[-1]!r}"
+    )
 
     # 行为不变：本机那份读不出来 ⇒ 只能整份用包里的（**不是**拒绝导入）
     assert config.load_config(b.groups).qq_db_dir == a.qq
@@ -491,6 +498,14 @@ def test_parse_rejects_a_single_bracket_section(roots):
     ⚠️ 但**段不在**仍然合法（"这份包不带人物"是 `build` 对空名单的正常产物，
     见 `test_export_then_import_into_another_root` 之外的几个用例）——本条的阳性
     对照就在 `test_import_prunes_an_alias_that_shadows_a_live_slug`（`persons=()`）。
+
+    ⚠️ **本条买到的是"话说得对"，不是"400 vs 500"**（Fix loop 2 / FIX 3，
+    reviewer 指出）：去掉 `_array_section` 那道形状检查，逐条那句
+    `isinstance(entry, dict)` 照样抛 `ConfigError` ⇒ 端点**仍然是 400**，
+    只是文案变成一句指向错误方向的"每个 [[persons]] 段都必须是键值表"。
+    ⇒ 所以**这条判据的红落在 message 正则上**（上面 `match="数组表"`），
+    而"端点真的是 400"由
+    `test_api.py::test_api_import_pack_returns_400_for_a_single_bracket_section` 钉住。
     """
     a, _ = roots
     # ⚠️ 类目**必须合法**：`validate_categories` 在 persons 之前跑，喂空类目的话
@@ -502,3 +517,192 @@ def test_parse_rejects_a_single_bracket_section(roots):
     assert "[persons]" in single
     with pytest.raises(config.ConfigError, match="数组表"):
         configpack.parse(single, pathlib.Path("single.toml"))
+
+
+# ── Fix loop 2 / FIX 1：跨包别名冲突（Important-a）──────────────────────
+#
+# ⚠️ 背景（reviewer 实测，推翻了我上一轮的论证）：我说过「成环已静态挡下，
+# 剩下的 OverlayError 只可能来自本机 overlay 故障」——**那是错的**。
+# 本机那条别名恰恰是**上一次导入**写进去的 ⇒ **两份各自 parse 通过的正常包，
+# 先后导入就撞车**：API 500、CLI 裸 traceback，而且逐条 `set_kind_alias`
+# 各自 commit ⇒ 失败前写的行**留在表里**（「全有或全无」被破）。
+
+
+def _alias_table():
+    ov = _open_overlay()
+    try:
+        return overrides.kind_aliases(ov)
+    finally:
+        ov.close()
+
+
+def _two_valid_packs_that_conflict(roots):
+    """造两份**各自合法**的包：第一份建 `life_old→notice`，第二份要 `notice→life_old`。
+
+    ⚠️ 别名两端要用**包里真实存在的 slug**（`notice`）当靶子：`new_kind` 指向一个
+    不存在的类目，那条别名会被导入第 ③ 步的 `prune_kind_aliases` **当场剪掉**
+    （"指向不存在的目标"），于是第二份包撞不上冲突——用例会以**假绿**收场
+    （第一版就是这么写的：实测 `assert {} == {'a_kind': 'b_kind'}`）。
+    """
+    a, b = roots
+    _seed(a)
+    cfg, cats, people = (
+        config.load_config(a.groups),
+        categories.load_categories(a.cats),
+        config.load_persons(a.persons),
+    )
+    first = configpack.parse(
+        configpack.build(
+            config=cfg, cats=cats, persons=people, aliases=(("life_old", "notice"),)
+        ),
+        pathlib.Path("first.toml"),
+    )
+    # ⚠️ 第二份包里**故意有两条**：第一条（`z_kind→notice`）**是合法的**，
+    # 第二条才冲突。这正是 reviewer 实测出「半张表」的形状——逐条
+    # `set_kind_alias` 各自 commit 时，第一条已经落库、第二条才炸。
+    second = configpack.parse(
+        configpack.build(
+            config=cfg, cats=cats, persons=people,
+            aliases=(("z_kind", "notice"), ("notice", "life_old")),
+        ),
+        pathlib.Path("second.toml"),
+    )
+    paths = configpack.Paths(groups=b.groups, categories=b.cats, persons=b.persons)
+    return first, second, paths
+
+
+def test_a_second_pack_conflicting_with_the_first_is_refused(roots):
+    """⭐ FIX 1a/1b：第二份包必须**响亮拒绝**，且**一个字节都不写**。
+
+    判据三条一起（缺一条就是一个空守卫）：
+      · 抛的是 `ConfigError`（⇒ CLI 一行报错、API 400）；
+      · 消息里**两边的映射都印出来**（用户才能自己判断怎么办——只说"冲突了"
+        等于把排查丢回给他）；
+      · **别名表与三份配置文件都没变**（这是"全有或全无"的机械形式）。
+
+    ⚠️ 变异反证：把 `import_pack` 的别名写入打回「逐条 `set_kind_alias`、
+    不先做合并校验」⇒ 本条**必红**（`OverlayError` 冒出来 + 表里留下 `{'b_kind': 'a_kind'}`）。
+    """
+    first, second, paths = _two_valid_packs_that_conflict(roots)
+
+    configpack.import_pack(first, keep_settings=False, paths=paths)
+    after_first = _alias_table()
+    assert after_first == {"life_old": "notice"}, (
+        f"第一份包应当正常落库（实测拿到 {after_first}）"
+    )
+    snap = {p: p.read_text(encoding="utf-8") for p in (paths.groups, paths.categories, paths.persons)}
+
+    with pytest.raises(config.ConfigError, match="冲突") as excinfo:
+        configpack.import_pack(second, keep_settings=False, paths=paths)
+
+    message = str(excinfo.value)
+    assert "life_old" in message and "notice" in message, (
+        f"两边的映射都要印出来（本机现有 / 包里要写）：{message!r}"
+    )
+    assert _alias_table() == after_first, (
+        "冲突时别名表不许被改动——逐条 set_kind_alias 各自 commit 会留下半张表"
+    )
+    for p, text in snap.items():
+        assert p.read_text(encoding="utf-8") == text, f"{p} 被改了：破了「全有或全无」"
+
+
+def test_merge_aliases_matches_the_write_path(roots):
+    """⭐ 防漂移：纯函数算出的**最终表**，必须与逐条 `set_kind_alias` 落库的结果一致。
+
+    ⚠️ 为什么需要它：FIX 1b 把别名写入改成「**静态算出最终表** + 一次整表写」，
+    于是「成环判定 + 压平语义」在**两处**各有一份实现。两份一旦漂移，症状是
+    "静态检查说没问题、写进去却炸"（或反过来），而那种缺陷只在**罕见形状**下现形
+    （正是本项目最贵的那类）。这条用例把两条路径并排跑，用同一组输入逐字节比。
+
+    ⚠️ 环的形状两边都要**抛**：一条抛 `ConfigError`（导入路径的契约）、一条抛
+    `OverlayError`（T5 的写路径契约）——不是同一个异常，但必须**同时发生**。
+    """
+    cases = [
+        ({}, [("x", "y")]),
+        ({"x": "y"}, [("z", "x")]),                 # 链式：z → x → y ⇒ z→y
+        ({"x": "y"}, [("y", "z")]),                 # 传播：旧行 x→y 也要走到 z
+        ({"a": "b", "x": "y"}, [("c", "a"), ("d", "x")]),
+        ({"a": "b"}, [("b", "c"), ("c", "d")]),     # 两条串起来
+    ]
+    for local, wanted in cases:
+        ov = _open_overlay()
+        try:
+            overrides.replace_kind_aliases(ov, local)
+            for old, new in wanted:
+                overrides.set_kind_alias(ov, old_kind=old, new_kind=new)
+            from_db = overrides.kind_aliases(ov)
+        finally:
+            ov.close()
+        assert configpack._merge_aliases(local, wanted) == from_db, (
+            f"静态合并与写路径不一致：local={local} wanted={wanted}"
+        )
+
+    # 环：两边都抛
+    ov = _open_overlay()
+    try:
+        overrides.replace_kind_aliases(ov, {"a": "b"})
+        with pytest.raises(overrides.OverlayError):
+            overrides.set_kind_alias(ov, old_kind="b", new_kind="a")
+    finally:
+        ov.close()
+    with pytest.raises(config.ConfigError, match="冲突"):
+        configpack._merge_aliases({"a": "b"}, [("b", "a")])
+
+
+def test_the_summary_line_claims_kept_settings_when_they_were_kept(roots):
+    """⭐ FIX 2 的**阳性对照**：真的保住了，摘要就该说保住（否则上面那条一删就全绿）。
+
+    ⚠️ 没有这一条的话，"摘要行永远不打那句话"也能让上面那条绿——而它意味着
+    用户**永远**看不到"本机路径保住了"的确认，两种状态在输出上不可区分。
+    """
+    a, b = roots
+    _seed(a)
+    config.save_config(b.make_config([config.Group(id=999, name="本机群")]), b.groups)
+
+    pack = configpack.parse(
+        configpack.build(
+            config=config.load_config(a.groups),
+            cats=categories.load_categories(a.cats),
+            persons=config.load_persons(a.persons),
+            aliases=(),
+        ),
+        pathlib.Path("pack.toml"),
+    )
+    lines: list[str] = []
+    report = configpack.import_pack(
+        pack, keep_settings=True,
+        paths=configpack.Paths(groups=b.groups, categories=b.cats, persons=b.persons),
+        on_progress=lines.append,
+    )
+    assert report.settings_skipped is True
+    assert "（保留本机 [settings]）" in lines[-1], lines[-1]
+
+
+def test_a_conflicting_import_never_leaves_a_partial_alias_table(roots):
+    """⭐ FIX 1b：冲突时**别名表不许留下写了一半的行**（reviewer 实测的「半张表」）。
+
+    ⚠️ 与上一条**刻意分工**：上一条钉**异常类型与文案**（400 的契约），
+    这一条只钉**表的最终状态** ⇒ 所以它**故意不挑异常类**（`except Exception`）——
+    否则"抛了别的异常"会让它提前离场，而这半条判据就**永远执行不到**
+    （勘误 E7 的形态 2）。
+
+    ⚠️ 场景里第二份包有**两条别名**：`z_kind→notice`（合法）与
+    `notice→life_old`（与本机冲突）。逐条 `set_kind_alias` 各自 commit 的写法下，
+    第一条**已经落库**、第二条才炸 ⇒ 表里留下 `{'life_old': 'notice', 'z_kind': 'notice'}`
+    ——那正是 reviewer 实测的 `{'b':'a','x':'y'}` 形状。
+
+    ⚠️ 变异反证：把别名写入打回逐条 `set_kind_alias` ⇒ 本条**必红**
+    （表里多出 `z_kind`）。
+    """
+    first, second, paths = _two_valid_packs_that_conflict(roots)
+    configpack.import_pack(first, keep_settings=False, paths=paths)
+    after_first = _alias_table()
+
+    try:
+        configpack.import_pack(second, keep_settings=False, paths=paths)
+    except Exception:  # noqa: BLE001 —— 见 docstring：这一条只管表的最终状态
+        pass
+
+    assert _alias_table() == after_first, (
+        f"表被写了一半：{_alias_table()} —— 与 before 的 {after_first} 不同"
+    )

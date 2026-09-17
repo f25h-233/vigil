@@ -3098,3 +3098,94 @@ def test_api_put_llm_rejects_an_empty_or_non_http_endpoint(llm_client_factory):
         c.put("/api/llm", json={"base_url": "ftp://x/v1", "model": "m"}).status_code
         == 400
     )
+
+
+def _pack_text_with(tmp_path, *, aliases, slug):
+    """造一份**合法**的包文本（settings 指向真实存在的 tmp 目录）。"""
+    from vigil import configpack
+    from vigil.categories import Category
+    from vigil.config import Config, Group
+
+    return configpack.build(
+        config=Config(
+            qq_db_dir=tmp_path,
+            output_db=tmp_path / "vigil.db",
+            groups=(Group(id=111, name="甲群"),),
+        ),
+        cats=(Category(slug=slug, label=slug, desc=f"{slug} 的说明"),),
+        persons=(),
+        aliases=aliases,
+    )
+
+
+def test_api_import_pack_reports_a_cross_pack_alias_conflict_as_400(client_factory, tmp_path):
+    """⭐ FIX 1a（Fix loop 2）：**两份各自合法的包**先后导入 ⇒ 第二份是 **400**，不是 500。
+
+    ⚠️ 这是 reviewer 实测出来的场景，也是我上一轮**被推翻的那条论证**：
+    我说「成环已被静态挡下，剩下的 `OverlayError` 只可能来自本机 overlay 故障」
+    ——而本机那条别名**就是上一次导入写进去的**（这一条用例里的第一份包）。
+    逐条 `set_kind_alias` 各自 commit ⇒ 从前这里既是 **500**、又**留下半张表**。
+
+    ⚠️ 判据三条一起：
+      · 第二份 **400**（`ConfigError` 在端点被映射成 400，而 `import_pack` 从前
+        不在那个 try 里 ⇒ 500）；
+      · 消息里**两边都印出来**；
+      · **类目文件一个字都没变**（第二份包的类目是 `life`，本机此刻是
+        `notice`——半写会立刻现形）。
+
+    ⚠️ 变异反证：把 `api_import_pack` 里那句 `except ConfigError` 从
+    `import_pack` 那一圈拿掉 ⇒ 本条**必红**（TestClient 把 `ConfigError` 重抛）。
+    """
+    c = client_factory()
+    cats_file = tmp_path / "fake_root" / "config" / "categories.toml"
+
+    r1 = c.post(
+        "/api/config/pack",
+        json={"toml": _pack_text_with(tmp_path, aliases=(("life_old", "notice"),), slug="notice"), "apply": True},
+    )
+    assert r1.status_code == 200, r1.text
+    after_first = cats_file.read_text(encoding="utf-8")
+
+    r2 = c.post(
+        "/api/config/pack",
+        json={"toml": _pack_text_with(tmp_path, aliases=(("notice", "life_old"),), slug="life"), "apply": True},
+    )
+    assert r2.status_code == 400, r2.text
+    detail = r2.json()["detail"]
+    assert "冲突" in detail and "life_old" in detail and "notice" in detail, detail
+    assert cats_file.read_text(encoding="utf-8") == after_first, (
+        "冲突时类目文件不许被改——第二份包的类目是 life，半写会立刻现形"
+    )
+
+
+def test_api_import_pack_returns_400_for_a_single_bracket_section(client_factory, tmp_path):
+    """⭐ FIX 3①（Fix loop 2）：`[persons]`（单层方括号）在**端点**上真的是 **400**。
+
+    ⚠️ **如实标注这条守卫买到的是什么**（reviewer 指出，不许写成它没有的作用）：
+    去掉 `_array_section` 那道形状检查，端点回的**仍然是 400**——
+    逐条 `isinstance(entry, dict)` 会兜住它（`for entry in <dict>` 迭代出的是**键**，
+    字符串不是表 ⇒ 同样 `ConfigError`）。⇒ 那道守卫买到的是**文案**
+    （"`persons` 必须是数组表"vs 一句指向错误方向的"每个 [[persons]] 段都必须是键值表"），
+    **不是"400 vs 500"**。`test_parse_rejects_a_single_bracket_section` 的红
+    也确实落在 message 正则上（勘误 E7：红要看红的是不是那条断言）。
+    ⇒ 这一条把**状态码**那一半单独钉住：它是真的 400，而且**不是** 500。
+    """
+    from vigil import configpack
+    from vigil.categories import Category
+    from vigil.config import Config, Group, Person
+
+    text = configpack.build(
+        config=Config(
+            qq_db_dir=tmp_path,
+            output_db=tmp_path / "vigil.db",
+            groups=(Group(id=111, name="甲群"),),
+        ),
+        cats=(Category(slug="notice", label="通知", desc="正式通知"),),
+        persons=(Person(uin=10001, label="甲"),),
+        aliases=(),
+    ).replace("[[persons]]", "[persons]")
+    assert "[persons]" in text and "[[persons]]" not in text
+
+    r = client_factory().post("/api/config/pack", json={"toml": text, "apply": True})
+    assert r.status_code == 400, r.text
+    assert "数组表" in r.json()["detail"], r.json()["detail"]

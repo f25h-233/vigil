@@ -1269,17 +1269,26 @@ def create_app(config: Config) -> FastAPI:
         # 塞空 lambda 等于把它扔进黑洞——前端只能显示"导入成功"，而用户
         # 根本不知道自己的路径被换掉了。这里收进 `notes` 随响应回去。
         notes: list[str] = []
-        with write_lock:
-            report = configpack.import_pack(
-                pack,
-                keep_settings=keep_settings,
-                paths=configpack.Paths(
-                    groups=config_path(),
-                    categories=categories_path(),
-                    persons=persons_path(),
-                ),
-                on_progress=notes.append,
-            )
+        try:
+            with write_lock:
+                report = configpack.import_pack(
+                    pack,
+                    keep_settings=keep_settings,
+                    paths=configpack.Paths(
+                        groups=config_path(),
+                        categories=categories_path(),
+                        persons=persons_path(),
+                    ),
+                    on_progress=notes.append,
+                )
+        except ConfigError as exc:
+            # ⚠️ **`import_pack` 自己也会抛 `ConfigError`**（Fix loop 2 / FIX 1a），
+            # 最典型的一条是**跨包别名冲突**：本次导入的映射与本机现有的合起来成环
+            # （本机那条往往就是**上一次导入**写进去的）。从前它不在这个 try 里
+            # ⇒ 端点回 **500**，而真相是"这份包与本机冲突"= **400**。
+            # ⚠️ 它发生在**任何写入之前**（`_merge_aliases` 是纯函数，跑在 ① 的最前面），
+            # 所以 400 与"什么都没写"是一致的两句话。
+            raise HTTPException(status_code=400, detail=str(exc))
         return {
             "applied": True,
             "groups": report.groups,

@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import pathlib
 import tomllib
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 
 from . import overrides
@@ -315,6 +315,59 @@ def _fallback_warning(why: str, qq_db_dir: pathlib.Path, local: pathlib.Path) ->
     )
 
 
+def _fmt_aliases(table: Mapping[str, str]) -> str:
+    """把别名表印成一行给人看的东西（`a→b, c→d`）。空表印 `（空）`。"""
+    if not table:
+        return "（空）"
+    return "，".join(f"{k}→{v}" for k, v in sorted(table.items()))
+
+
+def _merge_aliases(
+    local: Mapping[str, str],
+    wanted: Sequence[tuple[str, str]],
+) -> dict[str, str]:
+    """把包里的别名逐条施加到**本机现有的表**上，返回**最终表**（纯函数，不碰数据库）。
+
+    ⚠️ **语义必须与 `overrides.set_kind_alias` 逐步一致**（跟到底 + 链式传播）：
+      · `final` = 从 `new_kind` 沿表一路跟到的终点；
+      · 表里所有**指向 `old_kind`** 的行一起改指 `final`（链式传播）；
+      · 再记下 `old_kind → final`。
+    `test_merge_aliases_matches_the_write_path` 把两条路径并排跑，逐字节比——
+    **两份实现一旦漂移，症状是"静态检查放行、写进去却炸"**，而那正是本轮
+    要修的那类缺陷（只在罕见形状下现形）。
+
+    ⚠️ **合起来会成环 ⇒ `ConfigError`**（Fix loop 2 / FIX 1a）：这是 reviewer 实测
+    出来的场景，也是我上一轮**被推翻的那条论证**——本机那条别名往往**就是上一次
+    导入写进去的**，所以「两份各自 parse 通过的正常包」先后导入就会撞车。
+    ⇒ 消息里**两边的映射都要印出来**：只说"冲突了"等于把排查丢回给用户。
+
+    ⚠️ 它必须在**任何写入之前**跑完（`import_pack` 就是这么用的）：那是
+    「全有或全无」在别名这一段上的机械形式。
+    """
+    merged = dict(local)
+    for old, new in wanted:
+        final = new
+        seen = {old}
+        while final in merged:
+            if merged[final] in seen:
+                raise ConfigError(
+                    "导入的别名映射与**本机现有的**冲突（合并起来会成环）："
+                    f"本机现有 {_fmt_aliases(local)}；包里要写 "
+                    f"{_fmt_aliases(dict(wanted))}；冲突点是 {old} → {new} 这条"
+                    f"会绕回 {merged[final]}。"
+                    "⚠️ 本机那条多半是**上一次导入**（或一次改名）写进去的——"
+                    "两份各自合法的包先后导入就会撞上这一条。"
+                    "要导入这份包：先在本机把冲突的那条别名处理掉"
+                    "（网页「类目」页再改一次名，或手工修 `data/overrides.db` 的 "
+                    "`kind_alias` 表），再导一次。"
+                )
+            seen.add(final)
+            final = merged[final]
+        merged = {k: (final if v == old else v) for k, v in merged.items()}
+        merged[old] = final
+    return merged
+
+
 def _array_section(raw: dict, key: str, path: pathlib.Path) -> list:
     """取一个 `[[…]]` 段：**段不在 ⇒ 空列表**；**是别的形状 ⇒ 响亮**（I2）。
 
@@ -327,6 +380,17 @@ def _array_section(raw: dict, key: str, path: pathlib.Path) -> list:
     （"这份包不带人物"是正常产物），所以这一支返回空列表、不报错。
     对应地，「段为空」与「段不在」在今天**语义相同**（都是"没有"）——
     真正要分开的是**形状**，不是长度。
+
+    ⚠️ **这道守卫买到的是「话说得对」，不是「400 vs 500」**（Fix loop 2 / FIX 3，
+    reviewer 指出——**不许写成它没有的作用**）：去掉它，下面
+    `for entry in _array_section(...)` 会去迭代 dict 的**键**（字符串），
+    逐条那句 `isinstance(entry, dict)` 照样抛 `ConfigError` ⇒ 端点**仍然是 400**。
+    差别只在**文案**：一句"`persons` 必须是数组表（`[[persons]]`）"，
+    对上一句指向**错误方向**的"每个 `[[persons]]` 段都必须是键值表"
+    （用户会去查那些条目，而真正写错的是段头那一层方括号）。
+    ⇒ 它的判据也只能是 message（`test_parse_rejects_a_single_bracket_section`
+    的红正落在正则上；端点那一半由 `test_api_import_pack_returns_400_for_a_
+    single_bracket_section` 单独钉住）。
     """
     section = raw.get(key, [])
     if not isinstance(section, list):
@@ -391,8 +455,19 @@ def import_pack(
             overrides.ensure_schema()
             ov = overrides.connect()
             try:
-                for old, new in pack.aliases:
-                    overrides.set_kind_alias(ov, old_kind=old, new_kind=new)
+                # ⚠️ **先整体算出最终表、再整体落**（Fix loop 2 / FIX 1a+1b）。
+                # 从前的写法是**逐条 `set_kind_alias`**，而那个函数**每写一行就
+                # 自己 commit** ⇒ 中途抛错时前面写的行留在库里：
+                # reviewer 实测「`{'b':'a','x':'y'}` 落库、而类目文件未动」——
+                # **「全有或全无」在别名这一段是假的**。
+                # ⇒ 现在：① `_merge_aliases` **纯函数**算出合并结果，冲突
+                #    （跨包成环）在**写任何东西之前**以 `ConfigError` 响亮拒绝；
+                # ② 落库走**已有的** `replace_kind_aliases`（T5 的整表写路径，
+                #    DELETE + INSERT + **一次** commit）⇒ 要么全落、要么全不落。
+                # ⚠️ 代价如实记：`created_at` 会被刷成写入时刻——那是**留痕**字段，
+                # 没有任何读路径依赖它（`replace_kind_aliases` 的 docstring 记过）。
+                merged = _merge_aliases(overrides.kind_aliases(ov), pack.aliases)
+                overrides.replace_kind_aliases(ov, merged)
             finally:
                 ov.close()
             report.aliases = len(pack.aliases)
@@ -469,9 +544,14 @@ def import_pack(
             # 只能靠 `report.warnings` 把它带出 `create_app` 的闭包。
             report.warnings.append(warning)
 
+    # ⚠️ 摘要行那句「保留本机 [settings]」的判据是 **`report.settings_skipped`**，
+    # **不是**用户勾没勾框（`keep_settings`）——Fix loop 2 / FIX 2。
+    # 回落分支（本机那份读不出来）恰恰**没**保留本机设置，而它同样带着
+    # `--keep-settings` ⇒ 用 `keep_settings` 判就会在摘要里说一句**假话**，
+    # 而那句话还会作为 `notes` 回到 API 响应里给前端显示。
     on_progress(
         f"[导入] 群 {report.groups} / 类目 {report.categories} / "
         f"人物 {report.persons} / 改名 {report.aliases}"
-        + ("（保留本机 [settings]）" if keep_settings else "")
+        + ("（保留本机 [settings]）" if report.settings_skipped else "")
     )
     return report

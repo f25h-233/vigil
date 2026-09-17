@@ -1095,6 +1095,14 @@ def cmd_config_import(args) -> int:
                 paths=_config_pack_paths(),
                 on_progress=logs.emit,
             )
+    except ConfigError as exc:
+        # ⚠️ **`import_pack` 自己也会抛 `ConfigError`**（Fix loop 2 / FIX 1a）：
+        # 最典型的一条是**跨包别名冲突**（本次导入的映射与本机现有的合起来成环
+        # ——而本机那条往往就是**上一次导入**写进去的）。
+        # 从前这圈 `except` 只罩着 `parse`，于是它直接冒出 `cli.main`：
+        # 用户看到一坨 traceback，任务计划只看见一个数字。
+        # ⚠️ 它发生在**任何写入之前**（纯函数合并校验跑在最前面）。
+        sys.exit(f"[配置错误] {exc}")
     except lock.AlreadyRunning as exc:
         logs.emit(f"[跳过] {exc}")
         return 2

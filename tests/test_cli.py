@@ -1676,3 +1676,53 @@ def test_config_import_returns_2_when_another_instance_holds_the_lock(pack_env):
         "撞车时一个字节都不许写——先写后报 2 会留下半新半旧的配置"
     )
     assert cli.main(["config", "import", str(src)]) == 0   # 锁放掉后照常
+
+
+def test_config_import_reports_a_cross_pack_conflict_readably(pack_env):
+    """⭐ FIX 1a（CLI 侧，Fix loop 2）：跨包别名冲突 ⇒ **一行 `[配置错误]`**，不是 traceback。
+
+    ⚠️ reviewer 实测的原文是「同一路径 CLI ⇒ `OverlayError` **直接冒出
+    `cli.main`**」：`cmd_config_import` 的 `except ConfigError` 只罩着 `parse`，
+    而 `import_pack` 在它外面 ⇒ 用户看到的是一坨 traceback（或者"退出码 1"，
+    任务计划只能看见一个数字，看不见"为什么"）。
+
+    ⚠️ 判据两条一起：**退出码是字符串**（`_exit_code_of` 对 `sys.exit(str)` 返回
+    那个字符串，对未捕获异常返回 **1**——所以 `isinstance(rc, str)` 正是
+    "不是 traceback"的机械形式）+ **一个字都没写**。
+
+    ⚠️ 变异反证：把 `cmd_config_import` 里那圈 `except ConfigError` 拿掉
+    ⇒ 本条**必红**（`_exit_code_of` 返回 1，且消息里没有"冲突"）。
+    """
+    from vigil import configpack
+
+    base = cli._load_config_only()
+    first = pack_env / "first.toml"
+    second = pack_env / "second.toml"
+    first.write_text(
+        _pack_with(
+            (configpack.Category(slug="notice", label="通知", desc="正式通知"),),
+            aliases=(("life_old", "notice"),),
+        ),
+        encoding="utf-8",
+    )
+    # ⚠️ 第二份的类目**故意不同**（life）：半写会让下面的内容断言立刻现形
+    second.write_text(
+        _pack_with(
+            (configpack.Category(slug="life", label="生活", desc="生活"),),
+            aliases=(("notice", "life_old"),),
+        ),
+        encoding="utf-8",
+    )
+    assert base.groups, "夹具里的本机配置得有群（parse 要求 settings 里的目录存在）"
+
+    assert cli.main(["config", "import", str(first)]) == 0
+    before = (pack_env / "config" / "categories.toml").read_text(encoding="utf-8")
+
+    rc = _exit_code_of(["config", "import", str(second)])
+    assert isinstance(rc, str) and rc.startswith("[配置错误]"), (
+        f"不是一行可读的报错（退出码 {rc!r}）——裸 traceback 会让任务计划只看见一个数字"
+    )
+    assert "冲突" in rc, rc
+    assert (pack_env / "config" / "categories.toml").read_text(encoding="utf-8") == before, (
+        "冲突时一个字节都不许写"
+    )
