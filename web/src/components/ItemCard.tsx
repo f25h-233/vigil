@@ -23,7 +23,7 @@ export default function ItemCard({
   const [cats, setCats] = useState<Category[]>([])
 
   // ⚠️ 依赖是「这张卡片可不可改」这个**布尔值**，不是 `onMutated` 本身：
-  // Feed 传下来的 `retry` 是每次渲染新建的函数，直接依赖它会让一页 50 张
+  // Feed 传下来的 `reload` 是每次渲染新建的函数，直接依赖它会让一页 50 张
   // 卡片在父组件每次重渲染时各自重发一次 `/api/categories`。
   const mutable = onMutated !== undefined
   useEffect(() => {

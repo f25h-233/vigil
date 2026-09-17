@@ -3,13 +3,15 @@ import { undoLast } from './api.ts'
 import Categories from './views/Categories.tsx'
 import Digests from './views/Digests.tsx'
 import Feed from './views/Feed.tsx'
+import Settings from './views/Settings.tsx'
 
-type Tab = 'feed' | 'cats' | 'digests'
+type Tab = 'feed' | 'cats' | 'digests' | 'settings'
 
 const TABS: { key: Tab; label: string }[] = [
   { key: 'feed', label: '信息流' },
   { key: 'cats', label: '类目' },
   { key: 'digests', label: '日报' },
+  { key: 'settings', label: '配置' },
 ]
 
 export default function App() {
@@ -97,6 +99,7 @@ export default function App() {
           />
         )}
         {tab === 'digests' && <Digests />}
+        {tab === 'settings' && <Settings />}
       </main>
     </div>
   )

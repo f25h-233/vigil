@@ -75,3 +75,59 @@ export type Person = {
   note: string
   count: number
 }
+
+/** 一个 QQ 本地库里的群（**来自 CLI 预生成的快照**，不是实时查询）。 */
+export type GroupRow = {
+  id: number
+  name: string
+  /** 该群在 QQ 库里的**全量**历史消息条数（不是已导出的）。 */
+  messages: number
+  last_ts: number
+  /** 已纳入且 **enabled**。 */
+  watched: boolean
+  /** 已纳入但可能被停用。 */
+  known: boolean
+}
+
+export type GroupsResponse = {
+  /**
+   * ⚠️ `false` = **还没有快照**，此时 `reason` 一定非空、`groups` 一定是空数组。
+   * 界面**必须**把这两件事分开显示：「一个群都没有」与「还没读过」是两句不同的话，
+   * 混起来说的后果是用户以为自己的 QQ 库是空的。
+   */
+  available: boolean
+  reason: string
+  generated_at: number | null
+  groups: GroupRow[]
+}
+
+export type CategoryDetail = Category & {
+  /** 类目判据，会**逐字**进提示词。编辑器必须能改它。 */
+  desc: string
+}
+
+export type CategoriesResponse = {
+  categories: CategoryDetail[]
+  /** `{旧 slug: 新 slug}` —— 改过名的类目在这里留痕。 */
+  aliases: Record<string, string>
+}
+
+export type LlmSettings = {
+  base_url: string
+  model: string
+  /** `null` = **不发这个字段**（通用 OpenAI 端点最安全的形状）。 */
+  enable_thinking: boolean | null
+}
+
+export type JobRow = {
+  job_id: string
+  kind: string
+  state: 'running' | 'done' | 'failed' | 'cancelled'
+  total: number
+  done: number
+  message: string
+  error: string
+  actor: string
+  started_at: number
+  finished_at: number | null
+}

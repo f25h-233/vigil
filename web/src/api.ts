@@ -1,9 +1,13 @@
 import type {
+  CategoriesResponse,
   Category,
   DigestDetail,
   DigestSummary,
+  GroupsResponse,
   ItemDetail,
   ItemPage,
+  JobRow,
+  LlmSettings,
   Person,
 } from './types'
 
@@ -117,4 +121,65 @@ export const deleteItem = (itemId: number) =>
 export const undoLast = (editId?: number) =>
   sendJSON<{ undone: boolean }>('/api/undo', 'POST', {
     edit_id: editId ?? null,
+  })
+
+// ── M6 T9：配置界面用的端点 ───────────────────────────────────────────
+//
+// ⚠️ 群那一组走的是**快照**（T4）：`/api/groups` 回的是 CLI 预生成的
+// `data/groups-snapshot.json`，不是实时查 QQ 库——所以它有 `available`
+// 这个字段，界面必须把「还没读过」与「一个群都没有」分开显示。
+
+export const fetchGroups = () => getJSON<GroupsResponse>('/api/groups')
+
+export const addGroup = (id: number, name: string, tier: string) =>
+  sendJSON<{ id: number }>('/api/groups', 'POST', { id, name, tier })
+
+export const patchGroup = (
+  id: number,
+  patch: { name?: string; enabled?: boolean; tier?: string },
+) => sendJSON<{ id: number }>(`/api/groups/${id}`, 'PATCH', patch)
+
+export const removeGroup = (id: number) => sendJSON<void>(`/api/groups/${id}`, 'DELETE')
+
+export const fetchCategoriesDetailed = () =>
+  getJSON<CategoriesResponse>('/api/categories')
+
+export const addCategory = (slug: string, label: string, desc: string, icon: string) =>
+  sendJSON<{ slug: string }>('/api/categories', 'POST', { slug, label, desc, icon })
+
+export const updateCategory = (
+  slug: string,
+  body: { slug?: string; label?: string; desc?: string; icon?: string },
+) => sendJSON<{ slug: string }>(`/api/categories/${slug}`, 'PUT', body)
+
+export const removeCategory = (slug: string, migrateTo?: string) =>
+  sendJSON<void>(
+    `/api/categories/${encodeURIComponent(slug)}` +
+      (migrateTo ? `?migrate_to=${encodeURIComponent(migrateTo)}` : ''),
+    'DELETE',
+  )
+
+export const undoCategorieChange = () =>
+  sendJSON<{ undone: boolean }>('/api/categories/undo', 'POST')
+
+export const fetchLlmSettings = () => getJSON<LlmSettings>('/api/llm')
+
+export const saveLlmSettings = (s: LlmSettings) =>
+  sendJSON<LlmSettings>('/api/llm', 'PUT', s)
+
+export const startReorder = () =>
+  sendJSON<JobRow>('/api/reorder', 'POST')
+
+export const fetchJob = (jobId: string) => getJSON<JobRow>(`/api/jobs/${jobId}`)
+
+export const undoJob = (jobId: string) =>
+  sendJSON<{ undone: boolean; count: number }>(`/api/jobs/${jobId}/undo`, 'POST')
+
+export const exportPack = () => getJSON<{ toml: string }>('/api/config/pack')
+
+export const importPack = (toml: string, apply: boolean, keepSettings: boolean) =>
+  sendJSON<Record<string, unknown>>('/api/config/pack', 'POST', {
+    toml,
+    apply,
+    keep_settings: keepSettings,
   })

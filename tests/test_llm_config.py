@@ -208,6 +208,44 @@ def test_save_then_load_roundtrips(tmp_path, monkeypatch):
     assert config.load_llm_settings(p).enable_thinking is None
 
 
+@pytest.mark.parametrize(
+    "bad",
+    ["false", "true", "关", 0, 1],
+    ids=["'false'", "'true'", "'关'", "0", "1"],
+)
+def test_a_non_bool_enable_thinking_is_rejected_on_the_save_side(tmp_path, bad):
+    """⭐ 写侧对 `enable_thinking` 的类型守卫（T3 deferred，**T9 之前必须收**）。
+
+    ⚠️ **实测的静默反转**（修复前，本文件跑过原始输出）：
+
+        save_llm_settings(LLMSettings(base_url="https://x/v1", model="m",
+                                      enable_thinking='false'))
+        ⇒ 产物里是 `enable_thinking = true`，读回来 `True`
+
+    因为落盘那一行是 `'true' if settings.enable_thinking else 'false'`——
+    **非空字符串是 truthy**，于是"关"被写成"开"。而**读侧是严格的**
+    （`test_a_non_bool_enable_thinking_is_rejected` 就是它）：同一个文件里
+    两侧待遇相反，写侧的坏值要等下一次读才现形、且现形的是一句
+    "文件里的 enable_thinking 写错了"，方向完全不对。
+
+    ⚠️ **为什么赶在 T9 之前**：T9 的配置界面走 JSON，
+    `body.get("enable_thinking")` 拿到字符串是完全可能的，而后果是
+    **用户选了「关」，存进去变成「开」**——比报错糟得多（本项目反复禁止
+    「静默改语义」）。`0` / `1` 那一档是同一个形状的另一半：
+    **falsy 的非布尔**（`0`）会被静默写成 `false`，同样不是用户的意思。
+
+    ⚠️ 判据是 `ConfigError` 且**一个字节都不落盘**：先写文件再报错的话，
+    磁盘上会留下一份"报错之前"的半成品，而调用方以为它失败了。
+    """
+    out = tmp_path / "llm.toml"
+    with pytest.raises(config.ConfigError, match="enable_thinking"):
+        config.save_llm_settings(
+            config.LLMSettings(base_url="https://x/v1", model="m", enable_thinking=bad),
+            out,
+        )
+    assert not out.exists(), "报错之前就落盘了——失败路径上不许留下半成品"
+
+
 def test_saved_llm_toml_contains_no_key():
     """⭐ **密钥永远不进配置文件**（spec §3.2）。
 

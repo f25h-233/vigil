@@ -21,6 +21,7 @@ from fastapi.testclient import TestClient
 # ⚠️ 模块级别名（`_cats_mod`）：`_groups_root` 要在**造 app 之前**把它指向假根下那份
 # （Fix loop 3 / FIX 3），而夹具是模块级函数、拿不到函数内的局部 import。
 from vigil import categories as _cats_mod
+from vigil import config as _config_mod
 from vigil import groups_snapshot, store
 from vigil.api import create_app
 from vigil.config import Config, Group
@@ -2949,3 +2950,151 @@ def test_api_import_pack_reports_what_it_could_not_keep(client_factory, tmp_path
     assert body["warnings"], "回落分支一句话都没说"
     assert "qq_db_dir" in body["warnings"][0], body["warnings"]
     assert body["notes"], "on_progress 收的是空 lambda ⇒ notes 永远是空列表"
+
+
+# ── M6 T9：LLM 端点（`config/llm.toml` 的网页读写）────────────────────
+#
+# ⚠️ **偏差（逃逸舱，夹具侧）**：brief 给的两个端点是「GET 读
+# `config.DEFAULT_LLM_TOML`（不传 path）、PUT 写 `api.REPO_ROOT/config/llm.toml`」。
+# **生产里这是同一个文件**（两个常量都是 `REPO_ROOT / "config" / "llm.toml"`，
+# 已用一行实测核对过，见 T9 报告），但测试里 `conftest.py` 的 autouse 夹具
+# `_isolate_llm_toml_path` 把前者挪去了 tmp ⇒ 不补这一刀的话，「存进去 ⇒ 读回来」
+# 读的是**另一个文件**，用例会以一条与被测行为无关的理由红。
+# 补法就是把两者指到同一个文件：**端点读的那份 = 端点写的那份**
+# （与 T5 Fix loop 3 / FIX 3 的判据同形）。
+#
+# ⚠️ 工厂（而不是单个 client）：`test_api_put_llm_persists…` 要开**第二个 app**
+# 来验「重启后仍在」——那是出口判据 1 的机械形式。
+
+
+@pytest.fixture()
+def llm_client_factory(tmp_path, monkeypatch):
+    make = _groups_root(tmp_path, monkeypatch, snapshot=_QQ_GROUPS)
+    monkeypatch.setattr(
+        _config_mod,
+        "DEFAULT_LLM_TOML",
+        tmp_path / "fake_root" / "config" / "llm.toml",
+    )
+    return make
+
+
+def _llm_file(tmp_path) -> pathlib.Path:
+    return tmp_path / "fake_root" / "config" / "llm.toml"
+
+
+def test_api_get_llm_never_echoes_anything_but_the_three_fields(llm_client_factory, tmp_path):
+    """⭐ 响应里**恰好**只有那三个键——文件里塞了 `api_key` 也一个字都不许漏。
+
+    ⚠️ TOML 允许 `[llm]` 下有本程序不认识的键，`load_llm_settings` 会忽略它们
+    ——而"忽略"与"回吐"是两回事：一个把整张表转手出去的实现（`return raw["llm"]`）
+    同样能满足「响应里有 base_url / model」这种断言。判据必须是**键集合相等**。
+    ⚠️ 密钥走仓库根的 `.env`（spec §3.2），配置文件是**要进 git** 的——
+    这条用例挡的是"将来有人顺手把密钥放进这份配置、再被端点原样回吐"。
+    """
+    _llm_file(tmp_path).write_text(
+        '[llm]\nbase_url = "https://x/v1"\nmodel = "m"\n'
+        'api_key = "sk-DO-NOT-LEAK"\n',
+        encoding="utf-8",
+    )
+    r = llm_client_factory().get("/api/llm")
+    assert r.status_code == 200
+    assert set(r.json()) == {"base_url", "model", "enable_thinking"}
+    assert "sk-DO-NOT-LEAK" not in r.text
+
+
+def test_api_put_llm_persists_where_the_cli_reads_it(llm_client_factory, tmp_path):
+    """⭐⭐ **出口判据 1 的机械形式**：网页上改端点 ⇒ 落盘 ⇒ 重启后仍在。
+
+    ⚠️ 「落盘」的判据不是响应体，也不是"文件存在"——而是**CLI 用的那个读取函数
+    读出来的值**：`config.load_llm_settings(path)`。只断言响应体的话，一个
+    "内存里改了、磁盘上没写"的实现照样绿，而它在重启后静默消失
+    （用户要等下一次 `vigil refine` 打到老端点上才发现）。
+    """
+    c = llm_client_factory()
+    r = c.put(
+        "/api/llm",
+        json={
+            "base_url": "https://my-host.example/v1/chat/completions",
+            "model": "my-model",
+            "enable_thinking": False,
+        },
+    )
+    assert r.status_code == 200, r.text
+    assert _llm_file(tmp_path).is_file(), "PUT 没有写 config/llm.toml"
+
+    s = _config_mod.load_llm_settings(_llm_file(tmp_path))
+    assert (s.base_url, s.model, s.enable_thinking) == (
+        "https://my-host.example/v1/chat/completions",
+        "my-model",
+        False,
+    ), "CLI 的读取函数读到的不是网页刚存下去的那一份"
+
+    # 换一个**全新的 app**（等价于重启服务）后再读
+    body = llm_client_factory().get("/api/llm").json()
+    assert body == {
+        "base_url": "https://my-host.example/v1/chat/completions",
+        "model": "my-model",
+        "enable_thinking": False,
+    }
+
+
+def test_api_put_llm_null_means_do_not_send_the_field(llm_client_factory, tmp_path):
+    """⭐ `null` = **整行不写**（R12 的第三态），而不是 `enable_thinking = false`。
+
+    ⚠️ 这两者在界面上看不出区别，报文里却是两个不同的东西：`false` 发给
+    通用 OpenAI 端点会 **400**，而"不发"才是对它们安全的形状；
+    反过来对 Qwen3 混合思考模型，"不发"会让单批从 2.8s 涨到 111.5s（实测 40 倍）。
+    ⚠️ 判据落在**产物**上（TOML 里那个键在不在），不是响应体：响应体是端点
+    自己算的，它与文件不一致时只有产物能说话。
+    """
+    import tomllib
+
+    c = llm_client_factory()
+    r = c.put(
+        "/api/llm",
+        json={"base_url": "https://x/v1", "model": "m", "enable_thinking": None},
+    )
+    assert r.status_code == 200, r.text
+    raw = tomllib.loads(_llm_file(tmp_path).read_text(encoding="utf-8"))
+    assert "enable_thinking" not in raw["llm"], (
+        "`null` 被写成了 `enable_thinking = false`——那不是同一件事"
+    )
+    assert c.get("/api/llm").json()["enable_thinking"] is None
+
+
+@pytest.mark.parametrize(
+    "bad", ["false", "true", 1, 0], ids=["'false'", "'true'", "1", "0"]
+)
+def test_api_put_llm_rejects_a_non_bool_enable_thinking(
+    llm_client_factory, tmp_path, bad
+):
+    """⭐ 坏值必须**在入口**被挡成 400，而不是让它一路走到 `ConfigError` ⇒ 500。
+
+    ⚠️ 这条与 `test_a_non_bool_enable_thinking_is_rejected_on_the_save_side`
+    （`tests/test_llm_config.py`）是一对，守的是**两件不同的事**：
+      · 那条守 `save_llm_settings` 的契约（写侧不许猜）；
+      · 这条守**端点的响应**——`ConfigError` 在 FastAPI 里是**未捕获异常**，
+        用户拿到的是 500「服务器错误」，而真相是他填错了一个字段
+        （排障方向完全错，本项目反复禁止）。
+    ⚠️ 修复前的另一半更贵：`'false'` 会被**静默写成 `true`**（静默反转）。
+    ⚠️ `1` / `0` 那一档是必要的：JSON 里 `true` 与 `1` 是**两个不同的类型**，
+    而 `isinstance(True, int)` 为真、`isinstance(1, bool)` 为假——
+    只判前者会漏掉后者（与 `api_add_group` 挡 `id = true` 是同一条判据）。
+    """
+    # `raise_server_exceptions=False`：不这样的话，漏过去的 `ConfigError` 会在
+    # 测试里**被 TestClient 重新抛出**，于是判据退化成"它抛了"，
+    # 而"响应是什么"根本断言不到（勘误 E7 形态 4）。
+    c = llm_client_factory(raise_server_exceptions=False)
+    r = c.put("/api/llm", json={"base_url": "https://x/v1", "model": "m", "enable_thinking": bad})
+    assert r.status_code == 400, f"{bad!r} 没被挡在入口：{r.status_code} {r.text[:200]}"
+    assert not _llm_file(tmp_path).exists(), "校验失败却已经把文件写了"
+
+
+def test_api_put_llm_rejects_an_empty_or_non_http_endpoint(llm_client_factory):
+    c = llm_client_factory()
+    assert c.put("/api/llm", json={"base_url": "", "model": "m"}).status_code == 400
+    assert c.put("/api/llm", json={"base_url": "https://x/v1", "model": " "}).status_code == 400
+    assert (
+        c.put("/api/llm", json={"base_url": "ftp://x/v1", "model": "m"}).status_code
+        == 400
+    )

@@ -34,6 +34,7 @@ from .config import (
     Config,
     ConfigError,
     Group,
+    LLMSettings,
     Person,
     atomic_write_text,
     load_config,
@@ -41,6 +42,7 @@ from .config import (
     load_llm_settings,
     load_persons,
     save_config,
+    save_llm_settings,
     save_persons,
 )
 
@@ -1444,6 +1446,69 @@ def create_app(config: Config) -> FastAPI:
                 path,
             )
         return None
+
+    # ── LLM 端点配置：`config/llm.toml` 的读写（M6 T9 / spec §4.2 ④）──────
+    #
+    # ⚠️ **这两个端点属于 T9，不是 T3**——T3 只做了配置文件层（`config.py` 的
+    # load/save）与 CLI 的三级优先级；网页上要看、要改那个端点，是这一节。
+    #
+    # ⚠️ **路径每次现读**（Global Constraint 11，与 `config_path()` 同形）：
+    # 在 `create_app` 时算好冻进闭包的话，`monkeypatch.setattr(api, "REPO_ROOT", …)`
+    # 够不着它，测试里的 PUT 会静默去写**真实仓库的 `config/llm.toml`**
+    # （本机那份是有内容的 ⇒ 那是一颗真的地雷，不是理论风险）。
+    def llm_path() -> pathlib.Path:
+        return REPO_ROOT / "config" / "llm.toml"
+
+    @app.get("/api/llm")
+    def api_get_llm() -> dict:
+        """读 LLM 端点配置。**永远不返回密钥**（它不在这份配置里，spec §3.2）。"""
+        s = load_llm_settings()
+        return {
+            "base_url": s.base_url,
+            "model": s.model,
+            "enable_thinking": s.enable_thinking,
+        }
+
+    @app.put("/api/llm")
+    def api_put_llm(body: dict = Body(...)) -> dict:
+        """整体替换 `config/llm.toml`（原子写 ⇒ D11 允许的「Web 可写 `config/`」）。
+
+        ⚠️ **`enable_thinking` 是三态**（`LLMSettings` 的 docstring 有完整表格）：
+        JSON 这边用 `true` / `false` / **`null`** 表达，`null` = **不发这个字段**
+        （通用 OpenAI 端点最安全的形状）。**非布尔的值得在这里挡成 400**：
+        放它过去的话，`save_llm_settings` 的写侧守卫会抛 `ConfigError`，
+        而那是**未捕获异常 ⇒ 500**——排障方向完全错（用户以为服务坏了，
+        真相是他填错了字段），而且 `'false'` 这个值**曾经会被静默写成 `true`**
+        （T3 deferred 的静默反转，本任务开工前才补上写侧守卫）。
+        """
+        base_url = str(body.get("base_url", "")).strip()
+        model = str(body.get("model", "")).strip()
+        if not base_url or not model:
+            raise HTTPException(status_code=400, detail="base_url 与 model 都不能为空")
+        if not base_url.startswith(("http://", "https://")):
+            raise HTTPException(status_code=400, detail="base_url 必须以 http:// 或 https:// 开头")
+        _reject_controls(base_url, "base_url")
+        _reject_controls(model, "model")
+
+        raw_thinking = body.get("enable_thinking")
+        if raw_thinking is None:
+            thinking: bool | None = None
+        elif isinstance(raw_thinking, bool):
+            thinking = raw_thinking
+        else:
+            # ⚠️ `isinstance(True, int)` 为真、`isinstance(1, bool)` 为假 ⇒
+            # JSON 里写 `1` / `"false"` 都会落到这一支。**闸必须在入口**，
+            # 与 `api_add_group` 挡 `id = true` 是同一条判据。
+            raise HTTPException(
+                status_code=400,
+                detail="enable_thinking 只能是 true / false / null（null = 不发这个字段）",
+            )
+        with write_lock:
+            save_llm_settings(
+                LLMSettings(base_url=base_url, model=model, enable_thinking=thinking),
+                llm_path(),
+            )
+        return {"base_url": base_url, "model": model, "enable_thinking": thinking}
 
     @app.get("/api/digests")
     def api_digests(limit: int = Query(30, ge=1, le=MAX_LIMIT)) -> dict:

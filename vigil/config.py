@@ -700,6 +700,21 @@ def save_llm_settings(
         那个值，就是读回来的那个值**（这条是 `load`/`save` 之间的契约）。
 
     拒绝用 `ConfigError`（与 `enable_thinking` 非布尔同一条判据：**不猜、不兜底**）。
+
+    ⚠️ **`enable_thinking` 也必须在写侧就挡非布尔**（M6 T3 deferred，T9 之前补）。
+    修复前的**实测**（本机跑过，原始输出在 T9 报告里）：
+
+        save_llm_settings(LLMSettings(base_url="https://x/v1", model="m",
+                                      enable_thinking='false'))
+        ⇒ 产物里是 `enable_thinking = true`，读回来 `True`
+
+    成因就是下面那行 `'true' if settings.enable_thinking else 'false'`：
+    **非空字符串是 truthy**，"关"于是被写成"开"——**静默反转**。
+    而读侧是严格的（`load_llm_settings` 里那段 `isinstance(raw_thinking, bool)`），
+    同一个文件里两侧待遇相反，且坏值要等下一次读才现形、现形的还是一句
+    "文件里的 enable_thinking 写错了"——方向完全不对。
+    ⚠️ 它不是理论问题：Web 配置界面走 JSON，`body.get("enable_thinking")`
+    拿到字符串是完全可能的。
     """
     target = path or DEFAULT_LLM_TOML
     for field, value in (("base_url", settings.base_url), ("model", settings.model)):
@@ -708,6 +723,20 @@ def save_llm_settings(
                 f"{field} 必须是非空字符串（空串/全空白会写出一份读回来"
                 f"变成内置默认的配置——round-trip 不保值），实际是 {value!r}"
             )
+    # ⚠️ `is not None` 与非 `bool` 是两个判据，顺序不能反：`None` 是**合法的**
+    # 第三态（= 不发这个字段），而它同样不是 `bool`。
+    # ⚠️ 挡 `0` / `1` 与挡 `'false'` 是同一件事的两半：前者是 **falsy 的非布尔**，
+    # 不挡的话会被静默写成 `false`——照样不是用户的意思。
+    if settings.enable_thinking is not None and not isinstance(
+        settings.enable_thinking, bool
+    ):
+        raise ConfigError(
+            "enable_thinking 只能是 true / false / 不传（不传 = 不发这个字段），"
+            f"实际是 {settings.enable_thinking!r}"
+            f"（{type(settings.enable_thinking).__name__}）——"
+            '字符串 "false" 是 truthy，会被写成 `enable_thinking = true`（静默反转），'
+            "所以这里不猜、不兜底。"
+        )
 
     lines = [_LLM_HEADER, "", "[llm]", ""]
     lines.append(f"base_url = {toml_str(settings.base_url.strip())}")
