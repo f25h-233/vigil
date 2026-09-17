@@ -22,6 +22,7 @@ import json
 import logging
 import pathlib
 import sqlite3
+import threading
 import time
 from collections.abc import Mapping, Sequence
 
@@ -87,8 +88,14 @@ CREATE TABLE IF NOT EXISTS kind_alias (
 # schema 前缀，而 `ALTER TABLE` 要多一层处理（`ALTER TABLE ov.x` 合法，但语句里
 # 还带 `IF NOT EXISTS` 之类就没法拼）——更重要的是**内存兜底库不需要它**
 # （`CREATE TABLE` 已经带上了那一列）。
-_MIGRATIONS = (
-    "ALTER TABLE config_snapshots ADD COLUMN aliases TEXT",
+#
+# ⚠️ 每条写成 `(表, 列, 语句)` 三元组：收尾要拿前两项去 `PRAGMA table_info` **核**。
+_MIGRATIONS: tuple[tuple[str, str, str], ...] = (
+    (
+        "config_snapshots",
+        "aliases",
+        "ALTER TABLE config_snapshots ADD COLUMN aliases TEXT",
+    ),
 )
 
 
@@ -155,17 +162,33 @@ def _attach_empty_overlay(conn: sqlite3.Connection) -> None:
 def ensure_tables(conn: sqlite3.Connection) -> None:
     """建表 + 补列。幂等。**不 commit**——调用方决定事务边界。"""
     conn.executescript(_TABLES_DDL)
-    for stmt in _MIGRATIONS:
+    for table, column, stmt in _MIGRATIONS:
         try:
             conn.execute(stmt)
-        except sqlite3.OperationalError:
+        except sqlite3.OperationalError as exc:
             # ⚠️ `duplicate column name: aliases` —— **正常路径，不是错误**：
-            # SQLite 没有 `ADD COLUMN IF NOT EXISTS`（Fix loop 2 / FIX 1），
-            # 升级已有的库只能"试着加，重复了就当没有"。
-            # ⚠️ 而**新库**走的是 `_TABLES_DDL` 里那句带 `aliases` 的 CREATE
-            # ⇒ 它们这里必然抛一次；把 `_TABLES_DDL` 改成"重建表"是错的
-            # （会丢 `config_snapshots` 里已有的数据）。
-            pass
+            # SQLite 没有 `ADD COLUMN IF NOT EXISTS`，升级已有的库只能
+            # "试着加，重复了就当没有"。
+            # ⚠️ **但只吞这一种**（Fix loop 3 / FIX 4）：从前是裸的
+            # `except sqlite3.OperationalError: pass` ⇒ `database is locked`、
+            # 磁盘满、表被改名……**统统被咽下去**，服务照常起来，
+            # 直到某次撤销才 500（那时已经离现场很远了）。
+            # ⇒ 其余的必须**响亮**。
+            if "duplicate column" not in str(exc).lower():
+                raise
+
+    # ⚠️ **收尾核验：列真的在**（Fix loop 3 / FIX 4 的第二道）。
+    # 上面那句 `raise` 只挡住"抛得出来"的失败；这一道挡的是
+    # **"ALTER 悄悄没生效"**（比如将来有人把语句改成一句无害的 no-op）。
+    # 判据是 `PRAGMA table_info`——SQLite 里唯一说得清"这一列在不在"的东西。
+    for table, column, _ in _MIGRATIONS:
+        cols = {str(r[1]) for r in conn.execute(f"PRAGMA table_info({table})")}
+        if column not in cols:
+            raise OverlayError(
+                f"补列没生效：{table}.{column} 不在表里。"
+                "这张表是 overlay 的，缺列会让撤销在**运行时**才 500——"
+                "宁可现在响亮地拒绝。"
+            )
 
 
 def ensure_schema(path: pathlib.Path | None = None) -> None:
@@ -624,8 +647,37 @@ def prune_kind_aliases(
 #
 # ⚠️ 做成**模块级**是因为对账挂在**每一次查询入口**上（`store._ensure_overlay`），
 # 而闸门必须跨调用、跨连接记住"这份文件我看过了"。
-# ⚠️ 并发下最坏情况只是**两个线程各对一次账**（剪枝幂等），不需要锁。
+#
+# ⚠️ **这里从前写的是「最坏只是两个线程各对一次账（剪枝幂等），不需要锁」——
+# 那是错的论证**（Fix loop 3 / FIX 2，reviewer 指出）。真正的问题不是"剪两次"，
+# 而是**剪的时机**：写端点是「先写别名、后写文件」，
+# 对账若在**那个窗口**里跑（它读的是**磁盘上那份还是旧的文件**），
+# 就会把刚写进去的那条别名当成"目标不存在"**剪掉** ⇒ 文件写完之后
+# 条目**永久悬空**（spec §4.2 ④）。⇒ 需要一把锁，见 `ALIAS_LOCK`。
 _LAST_RECONCILE: tuple[int, int] | None = None
+
+
+# ⚠️ **别名表 + `categories.toml` 的写侧互斥锁**（Fix loop 3 / FIX 2）。
+#
+# 放在 `overrides` 而不是 `api` 的理由：对账是 `store._ensure_overlay` 触发的，
+# 而 `refine` / `digest` 也会走到那条路（它们**不 import api**，也**不该**为了
+# 一把锁去 import）。锁必须在**两端都够得着**的地方。
+#
+# * **对账**（`reconcile_if_stale`）取它 ⇒ 不会在别人的写窗口里剪。
+# * **写端点**（`api_update_category` / `api_delete_category` / `api_category_undo`）
+#   取它，覆盖 `set_kind_alias → snapshot → 写文件` **整段**。
+#
+# ⚠️ **是 `RLock` 不是 `Lock`**：写端点自己也会经 `store.kind_counts(...)` 走到
+# 对账（同一条线程），可重入才不死锁。锁的取用顺序也只有一个方向
+# （`write_lock` → `ALIAS_LOCK`），对账那一侧**从不**去拿 `write_lock`。
+#
+# ⚠️ **范围（如实写，不编理由）**：这把锁是**进程内**的 ⇒ **服务进程内已闭合**。
+# 跨进程仍有一个**毫秒级窗口**：`refine` / `digest` 是**别的进程**，
+# 它们触发对账时可能正好落在服务的写窗口里——那时会剪掉那条还没生效的别名，
+# 条目回落到**原来那个仍现存的 slug**（不是永久悬空：下一次写/对账会把它纠正回来）。
+# **单用户工具下未处理**：真要闭合它得跨进程文件锁，
+# 而 `lock.SingleInstance` 保护的是 QQ 库与主库、语义不同，不能顺手挪用。
+ALIAS_LOCK = threading.RLock()
 
 
 def reconcile_if_stale() -> int:
@@ -648,6 +700,11 @@ def reconcile_if_stale() -> int:
     （或某些文件系统上粗糙的 mtime 粒度）会被漏掉；只记 size 的话，
     「`life` 换成 `life_v2` 又换回来」这种等长的改动会被漏掉。
 
+    ⚠️ **闸门只在成功之后置位**（Fix loop 3 / FIX 1，reviewer 实测）：从前是
+    **动手之前**就置 ⇒ 剪枝抛一次**瞬时**异常（`database is locked`、磁盘忙）
+    就**再也不会重试**，而调用方拿到的是 0（看起来"已经对过账了"）
+    ⇒ **不变量静默地一直破着**。现在失败不置位 ⇒ 下一次查询自然重试。
+
     ⚠️ 与 `_ensure_overlay` 的局部 import 同形，这里也**局部 import `categories`**：
     `overrides` 与 `categories` 谁先被 import 都不该出问题。
     ⚠️ 配置文件**不存在 / 读不出来**⇒ **什么都不做**：这是挂在**每一次查询**上的
@@ -659,27 +716,50 @@ def reconcile_if_stale() -> int:
     from . import categories as categories_mod
 
     path = categories_mod.DEFAULT_CATEGORIES
-    try:
-        st = path.stat()
-    except OSError:
-        # 文件不在（或读不到 stat）⇒ 没有配置可对账。
-        # ⚠️ 不设闸门：文件出现时（mtime/size 变了）下一次就轮到它了。
-        return 0
-    key = (st.st_mtime_ns, st.st_size)
-    if key == _LAST_RECONCILE:
-        return 0
-    # ⚠️ 先记闸门再动手：解析失败时也记，免得**每一句查询**都去解析一份坏文件
-    # （文件被修好时 mtime 会变，那时自然重来）。
-    _LAST_RECONCILE = key
-    try:
-        cats = categories_mod.load_categories(path)
-    except categories_mod.CategoryError:
-        return 0
-    conn = connect()
-    try:
-        return prune_kind_aliases(conn, live_slugs=[c.slug for c in cats])
-    finally:
-        conn.close()
+
+    # ⚠️ **锁必须罩住「读文件 + 判断 + 剪枝」整段，不能只罩剪枝那一句**
+    # （Fix loop 3，实测踩出来的）：只罩剪枝的话就是**经典 TOCTOU**——
+    # 读线程在写窗口里先把**旧**文件读进内存（那里面还有 `life`），
+    # 然后在锁上等到写者收工，再拿**手里那份过期的解析结果**去剪
+    # ⇒ 照样把刚写进去、已经生效的别名剪掉。
+    # **本条用例第一次就是这么红的**（我先写的版本只罩了剪枝那一句）。
+    with ALIAS_LOCK:
+        try:
+            st = path.stat()
+        except OSError:
+            # 文件不在（或读不到 stat）⇒ 没有配置可对账。
+            # ⚠️ 不设闸门：文件出现时（mtime/size 变了）下一次就轮到它了。
+            return 0
+        key = (st.st_mtime_ns, st.st_size)
+        if key == _LAST_RECONCILE:
+            return 0
+        try:
+            cats = categories_mod.load_categories(path)
+        except categories_mod.CategoryError:
+            # ⚠️ **这一支置闸门**：坏文件不必被**每一句查询**反复解析一遍
+            # （文件被修好时 mtime 会变，那时自然重来）。它**不是** FIX 1 说的那种
+            # 瞬时失败——它是"这份文件此刻就是这么坏"，重试读的还是同一份。
+            _LAST_RECONCILE = key
+            return 0
+        try:
+            conn = connect()
+            try:
+                pruned = prune_kind_aliases(conn, live_slugs=[c.slug for c in cats])
+            finally:
+                conn.close()
+        except sqlite3.Error as exc:
+            # ⚠️ **一次瞬时失败不许把读路径变成 500**（FIX 1 的另一半）：
+            # 对账挂在**每一次查询**上，而 overlay 上有别的写者（T7 的 job、
+            # 另一次干预、另一个进程）⇒ 偶发 `database is locked` 是**预期内**的。
+            # 判据与 `group_names_map` 的降级同族：**显示路径宁可降级，也不整页黑**。
+            # ⇒ 响亮地记一条日志（不是静默），并且**不置闸门** ⇒ 下一次查询重试。
+            _log.warning("overlay 对账失败（闸门没关，下一次查询会重试）：%s", exc)
+            return 0
+        # ⚠️ **成功之后才置闸门**（FIX 1）：从前的写法是**动手之前**就置
+        # ⇒ 一次瞬时失败（锁库、磁盘满）就**永不重试**，而调用方拿到的是 0
+        # （看起来"已经对过账了"）⇒ **不变量静默地一直破着**。
+        _LAST_RECONCILE = key
+        return pruned
 
 
 def _state_of(conn: sqlite3.Connection, item_id: int) -> tuple[str | None, int]:

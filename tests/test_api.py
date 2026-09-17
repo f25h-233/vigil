@@ -18,6 +18,9 @@ import time
 import pytest
 from fastapi.testclient import TestClient
 
+# ⚠️ 模块级别名（`_cats_mod`）：`_groups_root` 要在**造 app 之前**把它指向假根下那份
+# （Fix loop 3 / FIX 3），而夹具是模块级函数、拿不到函数内的局部 import。
+from vigil import categories as _cats_mod
 from vigil import groups_snapshot, store
 from vigil.api import create_app
 from vigil.config import Config, Group
@@ -1532,6 +1535,14 @@ def _groups_root(tmp_path, monkeypatch, *, snapshot):
     (root / "config" / "categories.toml").write_text(
         _CATEGORIES_TOML, encoding="utf-8"
     )
+    # ⚠️ **FIX 3（Fix loop 3）：让「对账读的那份」与「端点写的那份」是同一个文件。**
+    # 从前的夹具把 `categories.DEFAULT_CATEGORIES`（conftest 挪到的**另一个** tmp 根）
+    # 与这里的 `config/categories.toml` 分成了**两个文件** ⇒
+    # **「端点写文件 ⇒ 下一次读触发对账」这条生产路径，测试从未跑过**
+    # ——而那正是 I-2（手改把 slug 加回来之后别名没对平）一直没被抓到的原因。
+    monkeypatch.setattr(
+        _cats_mod, "DEFAULT_CATEGORIES", root / "config" / "categories.toml"
+    )
     _seed_items_db(data / "vigil.db")
     if snapshot is not None:
         groups_snapshot.write(snapshot, data / "groups-snapshot.json", now=1_700_000_999)
@@ -2542,4 +2553,108 @@ def test_api_a_failed_write_leaves_the_alias_table_alone(client_factory, monkeyp
 
     assert c.get(f"/api/items/{item_id}").json()["kind"] == "life", (
         "写失败却把别名剪掉了：文件里还留着旧状态，条目却已经开始悬空"
+    )
+
+
+# ── M6 T5 Fix loop 3：写窗口 vs 并发读（FIX 2）+ 生产路径（FIX 3）────
+
+
+def test_a_concurrent_read_cannot_prune_a_freshly_written_alias(client_factory, monkeypatch):
+    """⭐ FIX 2：写端点的窗口（**别名已写、文件还没写**）里插进一次**读**，
+    不许把那条刚写进去的别名剪掉。
+
+    ⚠️ 为什么那条别名会被剪：窗口里**磁盘上那份文件还是旧的**，而那条别名的
+    `new_kind`（`life_v2`）在旧文件里**不存在** ⇒ 对账按"目标不存在"删掉它 ⇒
+    文件写完之后配置里也没有 `life` 了 ⇒ 条目**永久悬空**（spec §4.2 ④）。
+
+    ⚠️ 判据在**条目那一侧**（不是"别名表里有几行"）：别名的职责就是让条目走在
+    合法的 slug 上。
+
+    ⚠️ 为什么必须用**真线程**：`ALIAS_LOCK` 是 `RLock`——同一条线程里嵌套调用
+    是**可重入**的（写端点自己也会经 `store.kind_counts` 走到对账，正是为此选的
+    RLock），只有**另一条线程**才会被挡住。
+
+    ⚠️ 测试先"手改"一次文件（内容等价、多一行注释）把闸门**打开**：对账是按
+    `(mtime_ns, size)` 判断"这份文件我看过没有"的，窗口里文件没变时它压根不会跑
+    ——reviewer 探针 P2 抓到的正是"闸门开着 + 窗口里来了一次读"。
+
+    变异反证：把 `reconcile_if_stale` 里的 `with ALIAS_LOCK:` 去掉 ⇒ 本条**必红**。
+    """
+    import threading
+
+    from vigil import categories as categories_mod
+    from vigil import overrides as ov_mod
+
+    c = client_factory()
+    item_id = client_factory.item_ids[1]          # 库里的 raw kind = life
+    assert c.post(f"/api/items/{item_id}/kind", json={"kind": "life"}).status_code == 200
+
+    # 外部手改一次 ⇒ 闸门开（`FIX 3` 之后那份文件与端点写的是同一个）
+    cfg = _cats_mod.DEFAULT_CATEGORIES
+    cfg.write_text(cfg.read_text(encoding="utf-8") + "# 手改\n", encoding="utf-8")
+
+    real_save = categories_mod.save_categories
+    read_done = threading.Event()
+    seen: list[str] = []
+
+    def reader() -> None:
+        # 这次读会走到 `store._ensure_overlay` ⇒ 对账 ⇒ 抢 ALIAS_LOCK
+        try:
+            seen.append(c.get(f"/api/items/{item_id}").json()["kind"])
+        finally:
+            read_done.set()
+
+    def slow_save(cats, path=None):
+        threading.Thread(target=reader, daemon=True).start()
+        # ⚠️ 带锁时它拿不到锁 ⇒ 一直停在这儿 ⇒ 这里超时（超时只影响**耗时**，
+        # 不影响结论：带锁时那次读**不可能**在窗口里剪枝）；
+        # 不带锁时它立刻跑完，并**在窗口里**把那条别名剪掉。
+        read_done.wait(0.8)
+        return real_save(cats, path)
+
+    monkeypatch.setattr(categories_mod, "save_categories", slow_save)
+    assert c.put("/api/categories/life", json={"slug": "life_v2"}).status_code == 200
+    assert read_done.wait(5), "读线程没回来（夹具写错了）"
+
+    assert c.get(f"/api/items/{item_id}").json()["kind"] == "life_v2", (
+        "并发的一次读把刚写进去的别名剪掉了：配置里已经没有 life ⇒ 条目悬空"
+    )
+    assert seen == ["life_v2"], f"窗口里那次读看到的是 {seen}（它不该看见旧状态）"
+    # 收尾：别名表此刻与文件一致（对账与写端点都没有留下破口）
+    w = ov_mod.connect()
+    try:
+        assert ov_mod.kind_aliases(w) == {"life": "life_v2"}
+    finally:
+        w.close()
+
+
+def test_a_hand_edit_of_the_endpoint_config_is_reconciled_on_the_next_read(client_factory):
+    """⭐ FIX 3：**生产路径**（端点写 `categories.toml` ⇒ 下一次读按 mtime 触发对账）
+    要真的被跑过一次。
+
+    ⚠️ 从前夹具里「对账读的那份」（conftest 挪到的那个 tmp 根）与
+    「端点写的那份」（`_groups_root` 的假根）是**两个文件**
+    ⇒ **这条路径测试从未跑过**——而那正是 I-2（手改把 slug 加回来之后别名没对平）
+    一直没被抓到的原因。
+
+    变异反证：把 `_groups_root` 里那句
+    `monkeypatch.setattr(_cats_mod, "DEFAULT_CATEGORIES", root / "config" / "categories.toml")`
+    删掉 ⇒ 本条**必红**（对账读的是另一个文件，永远看不到这次手改）。
+    """
+    c = client_factory()
+    item_id = client_factory.item_ids[1]          # 库里的 raw kind = life
+    assert c.post(f"/api/items/{item_id}/kind", json={"kind": "life"}).status_code == 200
+    assert c.put("/api/categories/life", json={"slug": "life_v2"}).status_code == 200
+    assert c.get(f"/api/items/{item_id}").json()["kind"] == "life_v2"
+
+    # **手改**那份文件（就是端点写的那份）：把 `life` 加回来
+    cfg = _cats_mod.DEFAULT_CATEGORIES
+    cfg.write_text(
+        cfg.read_text(encoding="utf-8")
+        + '\n[[categories]]\nslug = "life"\nlabel = "生活"\ndesc = "手改加回来的"\n',
+        encoding="utf-8",
+    )
+
+    assert c.get(f"/api/items/{item_id}").json()["kind"] == "life", (
+        "手改之后没对账：合法的手工类目 life 被旧别名顶成了 life_v2"
     )

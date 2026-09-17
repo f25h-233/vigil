@@ -789,36 +789,51 @@ def create_app(config: Config) -> FastAPI:
             candidate = tuple(merged if c.slug == slug else c for c in existing)
             validate_or_400(candidate)
 
-            # ⚠️ **快照必须拍在"别名表被改"之前**（Fix loop 2 / FIX 1，承重）。
-            # 快照存的是「文件原文 + 别名表」这一**对**，两者必须来自同一时刻；
-            # 拍在别名写之后的话，撤销会把「旧文件 + 新别名表」装回去
-            # ⇒ `old_kind` 又变成现存 slug ⇒ 不变量破、条目显示悬空 slug
-            # ——那正是这次要修的 C-1。
-            snapshot_categories()
+            # ⚠️ **整段取 `ALIAS_LOCK`**（Fix loop 3 / FIX 2）：这段里
+            # 「别名表」与「`categories.toml`」会被**先后**改到，中间是不一致的一瞬。
+            # 对账（`reconcile_if_stale`，由**任何一次读**触发）若插进这一瞬，
+            # 它读的是**磁盘上那份还是旧的文件** ⇒ 会把刚写进去、**还没生效**的
+            # 别名当成"目标不存在"剪掉 ⇒ 文件写完之后条目**永久悬空**。
+            # 顺序**不改**（先别名、后文件）：崩在中途时，别名指向一个还没生效的
+            # slug ⇒ 对账会把它剪掉 ⇒ 条目回落到**原来那个仍现存的 slug** ⇒ 自愈。
+            with overrides.ALIAS_LOCK:
+                # ⚠️ **快照必须拍在"别名表被改"之前**（Fix loop 2 / FIX 1，承重）。
+                # 快照存的是「文件原文 + 别名表」这一**对**，两者必须来自同一时刻；
+                # 拍在别名写之后的话，撤销会把「旧文件 + 新别名表」装回去
+                # ⇒ `old_kind` 又变成现存 slug ⇒ 不变量破、条目显示悬空 slug
+                # ——那正是这次要修的 C-1。
+                snapshot_categories()
 
-            # ⚠️ **顺序：先剪枝、再写别名**（Fix loop 1 / FIX 1c，承重）。
-            # 反过来的话「改回原名」（A→B 之后再把 B 改回 A）会因为表里还留着
-            # `A→B` 而跟成一个**环** ⇒ `set_kind_alias` 抛错 ⇒ 用户永远回不去。
-            # 剪枝用的 live 集**多含一个 `slug`**（那个马上要废的旧名）：
-            # 别名链 `X→slug` 必须活到下面那次扁平 UPDATE 跑完，否则 X 的条目
-            # 会退化成裸 slug。完整的 live 集语义见 `live_slugs_of`。
-            if new_slug != slug:
-                prune_aliases(candidate, keep=slug)
-                ov = overrides.connect()
-                try:
+                # ⚠️ **顺序：先剪枝、再写别名**（Fix loop 1 / FIX 1c，承重）。
+                # 反过来的话「改回原名」（A→B 之后再把 B 改回 A）会因为表里还留着
+                # `A→B` 而跟成一个**环** ⇒ `set_kind_alias` 抛错 ⇒ 用户永远回不去。
+                # 剪枝用的 live 集**多含一个 `slug`**（那个马上要废的旧名）：
+                # 别名链 `X→slug` 必须活到下面那次扁平 UPDATE 跑完，否则 X 的条目
+                # 会退化成裸 slug。完整的 live 集语义见 `live_slugs_of`。
+                if new_slug != slug:
+                    prune_aliases(candidate, keep=slug)
+                    ov = overrides.connect()
                     try:
-                        overrides.set_kind_alias(ov, old_kind=slug, new_kind=new_slug)
-                    except overrides.OverlayError as exc:
-                        # 剪枝之后这里**理论上**不可达（环要靠"老行"才能形成，
-                        # 而它刚被剪掉）——但兜底必须响亮且**方向正确**：
-                        # 500 会让排障指向"服务坏了"，而真相是「当前别名表与这次
-                        # 改名冲突」，用户有自救路径（再撤一次 / 换个名字）。
-                        raise HTTPException(
-                            status_code=409, detail=f"改不了名：{exc}"
-                        )
-                finally:
-                    ov.close()
-            commit_categories(candidate)
+                        try:
+                            overrides.set_kind_alias(
+                                ov, old_kind=slug, new_kind=new_slug
+                            )
+                        except overrides.OverlayError as exc:
+                            # 剪枝之后这里**理论上**不可达（环要靠"老行"才能形成，
+                            # 而它刚被剪掉）——但兜底必须响亮且**方向正确**：
+                            # 500 会让排障指向"服务坏了"，而真相是「当前别名表与这次
+                            # 改名冲突」，用户有自救路径（再撤一次 / 换个名字）。
+                            # ⚠️ 走到这里时**快照已经拍过了**，而这次改名没落盘
+                            # ⇒ 撤销栈里多了一格"与当前状态相同"的快照
+                            # （用户点一次撤销会觉得"没反应"）。**知情接受**
+                            # （Fix loop 3 / FIX 5）：纯 UX，且这一支在剪枝之后
+                            # 理论上不可达；为一个不可达分支去回滚快照不值。
+                            raise HTTPException(
+                                status_code=409, detail=f"改不了名：{exc}"
+                            )
+                    finally:
+                        ov.close()
+                commit_categories(candidate)
         return {"slug": merged.slug, "label": merged.label}
 
     @app.delete("/api/categories/{slug}", status_code=204)
@@ -865,25 +880,29 @@ def create_app(config: Config) -> FastAPI:
                     status_code=400, detail=f"迁移目标 {migrate_to!r} 不是一个现存类目"
                 )
 
-            # ⚠️ **快照拍在"别名表被改"之前**（同 `api_update_category`，FIX 1）。
-            snapshot_categories()
+            # ⚠️ **整段取 `ALIAS_LOCK`**（同 `api_update_category`，Fix loop 3 / FIX 2）。
+            with overrides.ALIAS_LOCK:
+                # ⚠️ **快照拍在"别名表被改"之前**（同 `api_update_category`，FIX 1）。
+                snapshot_categories()
 
-            if migrate_to:
-                # ⚠️ 先剪枝、再写别名（同 `api_update_category`，Fix loop 1 / FIX 1c），
-                # live 集同样多含那个马上要废的 `slug`（别名链 `X→slug` 要活到
-                # 扁平 UPDATE 跑完）。
-                prune_aliases(candidate, keep=slug)
-                ov = overrides.connect()
-                try:
+                if migrate_to:
+                    # ⚠️ 先剪枝、再写别名（同 `api_update_category`，Fix loop 1 / FIX 1c），
+                    # live 集同样多含那个马上要废的 `slug`（别名链 `X→slug` 要活到
+                    # 扁平 UPDATE 跑完）。
+                    prune_aliases(candidate, keep=slug)
+                    ov = overrides.connect()
                     try:
-                        overrides.set_kind_alias(ov, old_kind=slug, new_kind=migrate_to)
-                    except overrides.OverlayError as exc:
-                        raise HTTPException(
-                            status_code=409, detail=f"迁移不了：{exc}"
-                        )
-                finally:
-                    ov.close()
-            commit_categories(candidate)
+                        try:
+                            overrides.set_kind_alias(
+                                ov, old_kind=slug, new_kind=migrate_to
+                            )
+                        except overrides.OverlayError as exc:
+                            raise HTTPException(
+                                status_code=409, detail=f"迁移不了：{exc}"
+                            )
+                    finally:
+                        ov.close()
+                commit_categories(candidate)
         return None
 
     @app.post("/api/categories/undo")
@@ -932,26 +951,29 @@ def create_app(config: Config) -> FastAPI:
                 overrides.pop_config_snapshot(ov)
             finally:
                 ov.close()
-            # ⚠️ **先写文件、后换别名表**（Fix loop 2 / FIX 3 的同一条理由）：
-            # 写失败时别名表一动不动 = **保守**；反过来的话失败会留下
-            # 「文件是旧的、表是新的」——正是要维持的不变量被破，
-            # 而 `reconcile_if_stale` 只会在**下一次**读时才把它对平。
-            atomic_write_text(categories_path(), body)
-            if aliases is None:
-                # ⚠️ **旧格式快照（M6 T5 之前存的）没有别名表**：这时**不许**
-                # 当成空表去清（那会让所有改过名的条目一起退化成裸 slug）。
-                # 保持现状 + 说一句：这是**知情接受**的降级，不是静默。
-                logs.emit(
-                    "[警告] 这份配置快照没有别名表（M6 T5 之前的旧格式）："
-                    "本次撤销**只回滚了配置文件**，kind_alias 保持现状。"
-                    "若条目显示的类目与配置对不上，再撤一次或重启服务即可对平。"
-                )
-            else:
-                ov = overrides.connect()
-                try:
-                    overrides.replace_kind_aliases(ov, aliases)
-                finally:
-                    ov.close()
+            # ⚠️ **整段取 `ALIAS_LOCK`**（Fix loop 3 / FIX 2）：这里同样是
+            # 「文件」与「别名表」先后改到，中间的瞬间不一致。
+            with overrides.ALIAS_LOCK:
+                # ⚠️ **先写文件、后换别名表**（Fix loop 2 / FIX 3 的同一条理由）：
+                # 写失败时别名表一动不动 = **保守**；反过来的话失败会留下
+                # 「文件是旧的、表是新的」——正是要维持的不变量被破，
+                # 而 `reconcile_if_stale` 只会在**下一次**读时才把它对平。
+                atomic_write_text(categories_path(), body)
+                if aliases is None:
+                    # ⚠️ **旧格式快照（M6 T5 之前存的）没有别名表**：这时**不许**
+                    # 当成空表去清（那会让所有改过名的条目一起退化成裸 slug）。
+                    # 保持现状 + 说一句：这是**知情接受**的降级，不是静默。
+                    logs.emit(
+                        "[警告] 这份配置快照没有别名表（M6 T5 之前的旧格式）："
+                        "本次撤销**只回滚了配置文件**，kind_alias 保持现状。"
+                        "若条目显示的类目与配置对不上，再撤一次或重启服务即可对平。"
+                    )
+                else:
+                    ov = overrides.connect()
+                    try:
+                        overrides.replace_kind_aliases(ov, aliases)
+                    finally:
+                        ov.close()
         return {"undone": True}
 
     @app.get("/api/items")

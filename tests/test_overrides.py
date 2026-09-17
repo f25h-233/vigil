@@ -960,3 +960,119 @@ def test_reconcile_does_nothing_when_the_config_is_missing(tmp_path, monkeypatch
     monkeypatch.setattr(categories_mod, "DEFAULT_CATEGORIES", tmp_path / "没有这个文件.toml")
     monkeypatch.setattr(overrides, "_LAST_RECONCILE", None)
     assert overrides.reconcile_if_stale() == 0
+
+
+# ── M6 T5 Fix loop 3：闸门时机（FIX 1）+ 补列不许静默（FIX 4）────────
+
+
+def test_a_transient_prune_failure_is_retried(tmp_path, monkeypatch):
+    """⭐ FIX 1：剪枝抛**瞬时**异常 ⇒ 闸门**不置位**，下一次调用必须**重试**。
+
+    ⚠️ 从前的写法是**动手之前**就置闸门 ⇒ 一次 `database is locked` 就
+    **永不重试**，而调用方拿到的是 0（看起来"已经对过账了"）
+    ⇒ **不变量静默地一直破着**（reviewer 探针实测）。
+
+    ⚠️ 同时钉住另一半：**瞬时失败不许变成读路径的 500**（对账挂在每一次查询上）。
+
+    变异反证：把 `_LAST_RECONCILE = key` 挪回剪枝**之前** ⇒ 本条**必红**
+    （第二次调用返回 0、那一行还在）。
+    """
+    from vigil import categories as categories_mod
+
+    path = tmp_path / "categories.toml"
+    path.write_text(_cats_toml(("live", "ghost")), encoding="utf-8")
+    monkeypatch.setattr(categories_mod, "DEFAULT_CATEGORIES", path)
+    monkeypatch.setattr(overrides, "_LAST_RECONCILE", None)
+    overrides.ensure_schema()
+    w = overrides.connect()
+    try:
+        overrides.set_kind_alias(w, old_kind="ghost", new_kind="live", now=1)   # 该剪
+    finally:
+        w.close()
+
+    real_prune = overrides.prune_kind_aliases
+    calls: list[int] = []
+
+    def flaky(conn, *, live_slugs):
+        calls.append(1)
+        if len(calls) == 1:
+            raise sqlite3.OperationalError("database is locked")
+        return real_prune(conn, live_slugs=live_slugs)
+
+    monkeypatch.setattr(overrides, "prune_kind_aliases", flaky)
+
+    # ① 第一次：瞬时失败 ⇒ 返回 0（不是抛出去炸掉读路径）
+    assert overrides.reconcile_if_stale() == 0
+    # ② **关键**：闸门没关 ⇒ 下一次必须重试，并且这次真的剪掉
+    assert overrides.reconcile_if_stale() == 1, (
+        "瞬时失败之后闸门被关上了：再也不重试，不变量静默地一直破着"
+    )
+    w = overrides.connect()
+    try:
+        assert overrides.kind_aliases(w) == {}
+    finally:
+        w.close()
+
+
+def test_migration_adds_the_column_to_an_old_database():
+    """⚠️ FIX 4 的阳性面：**旧格式**的表要能被补上那一列。
+
+    ⚠️ SQLite 没有 `ADD COLUMN IF NOT EXISTS` ⇒ 升级路径只能"试着加"。
+    """
+    conn = sqlite3.connect(":memory:")
+    try:
+        conn.execute(
+            "CREATE TABLE config_snapshots (snapshot_id INTEGER PRIMARY KEY,"
+            " saved_at INTEGER NOT NULL, body TEXT NOT NULL)"
+        )
+        overrides.ensure_tables(conn)
+        cols = {str(r[1]) for r in conn.execute("PRAGMA table_info(config_snapshots)")}
+        assert "aliases" in cols
+    finally:
+        conn.close()
+
+
+def test_a_failed_migration_is_loud(monkeypatch):
+    """⭐ FIX 4：补列失败**必须响亮**——只吞"列已存在"那一种。
+
+    ⚠️ 从前是裸的 `except sqlite3.OperationalError: pass` ⇒ `database is locked`、
+    磁盘满、表被改名……**统统被咽下去**，服务照常起来，
+    直到某次撤销才 500（那时离现场已经很远了）。
+
+    变异反证：把那个 `except` 改回裸 `pass` ⇒ 本条**必红**。
+    """
+    conn = sqlite3.connect(":memory:")
+    try:
+        monkeypatch.setattr(
+            overrides, "_MIGRATIONS",
+            (("config_snapshots", "aliases",
+              "ALTER TABLE 根本没有这张表 ADD COLUMN aliases TEXT"),),
+        )
+        with pytest.raises(sqlite3.OperationalError, match="no such table"):
+            overrides.ensure_tables(conn)
+    finally:
+        conn.close()
+
+
+def test_a_silent_migration_is_caught_by_the_column_check(monkeypatch):
+    """⭐ FIX 4 的第二道：`ALTER` **悄悄没生效**也要响亮（收尾核列）。
+
+    变异反证：把收尾那段 `PRAGMA table_info` 的核验删掉 ⇒ 本条**必红**
+    （`ensure_tables` 会若无其事地返回）。
+    """
+    conn = sqlite3.connect(":memory:")
+    try:
+        # 旧格式的表（没有 aliases 列）
+        conn.execute(
+            "CREATE TABLE config_snapshots (snapshot_id INTEGER PRIMARY KEY,"
+            " saved_at INTEGER NOT NULL, body TEXT NOT NULL)"
+        )
+        # 一句"跑得通但什么都不做"的迁移
+        monkeypatch.setattr(
+            overrides, "_MIGRATIONS",
+            (("config_snapshots", "aliases", "SELECT 1"),),
+        )
+        with pytest.raises(overrides.OverlayError, match="补列没生效"):
+            overrides.ensure_tables(conn)
+    finally:
+        conn.close()
