@@ -171,3 +171,47 @@ def test_toml_str_is_total(tmp_path):
     p = tmp_path / "persons.toml"
     config.save_persons(people, p)
     assert config.load_persons(p) == people
+
+
+# --- M5 终审修复轮：拼错的段落不许静默吞掉（Minor-4）----------------
+
+
+def test_load_persons_rejects_a_misspelled_section_name(tmp_path):
+    """⭐ M5 终审 Minor-4：`[[person]]`（少个 s）**必须响亮**，不许静默读成空名单。
+
+    实测的伤害链：`raw.get("persons", [])` 键名拼错时返回 `()`；而
+    `save_persons` 是**整体覆盖**写（「删掉一个人」只能这么做）⇒
+    下一次在界面上「加一个人」时 load → append → save，
+    **手工加的人无声消失**，全程零报错。
+
+    而文件头**自己邀请手工编辑**（「或手工往下面追加一段 `[[persons]]`」），
+    也就是说这条路径一定会被走到——与「越早暴露越好」的模块立场相反。
+
+    变异「把 `load_persons` 里的 `_check_persons_shape(...)` 那行去掉」⇒ 本条红。
+    """
+    p = _write(tmp_path, '[[person]]\nuin = 2874448217\nlabel = "辅导员"\n')
+    with pytest.raises(config.ConfigError, match="persons"):
+        config.load_persons(p)
+    # 反向：改正之后就正常（不许把整类文件都拒掉）
+    p.write_text('[[persons]]\nuin = 2874448217\nlabel = "辅导员"\n', encoding="utf-8")
+    assert config.load_persons(p) == (
+        config.Person(uin=2874448217, label="辅导员", note=""),
+    )
+
+
+def test_load_persons_rejects_a_wrong_bracket_shape(tmp_path):
+    """`[persons]`（一层方括号）也要响亮：那是一张**表**，不是一串人。
+
+    不拦的话 `for entry in raw["persons"]` 会去迭代字典的**键**（字符串），
+    后面 `entry.get("uin")` 以一个看不懂的 `AttributeError` 收场——
+    而"看不懂的异常"正是"这个文件写错了"最不该有的表现。
+    """
+    p = _write(tmp_path, '[persons]\nuin = 2874448217\nlabel = "辅导员"\n')
+    with pytest.raises(config.ConfigError, match="数组表"):
+        config.load_persons(p)
+
+
+def test_load_persons_empty_file_is_still_legal(tmp_path):
+    """阳性对照：**空文件**是合法的（一个人都没监视），不许被上面两条顺带拒掉。"""
+    assert config.load_persons(_write(tmp_path, "")) == ()
+    assert config.load_persons(_write(tmp_path, "# 只有注释\n")) == ()
