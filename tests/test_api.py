@@ -1001,7 +1001,8 @@ def test_delete_item_without_sources_still_works(client, db_path):
         ov.close()
 
 
-# ── M5 终审修复轮：非尾部 undo / kind 控制字符 / edit_id 严格转整 ──────────
+# ── M5 终审修复轮：非尾部 undo / kind 控制字符 / edit_id 严格转整 / types.ts
+#    机械守卫 ─────────────────────────────────────────────────────────────
 
 
 def _add_item(db_path, item_id: int, msg_id: int) -> None:
@@ -1269,3 +1270,47 @@ def test_undo_rejects_a_non_integer_edit_id(client, bad):
     assert client.post("/api/undo", json={"edit_id": e1}).json()["undone"] is True
 
 
+# ── 两份手抄清单之间的**机械联系**（终审 Minor-2 / T10 的 M5 变异）─────
+
+
+_TS_TYPES = pathlib.Path(__file__).resolve().parent.parent / "web" / "src" / "types.ts"
+
+
+def _ts_type_fields(name: str) -> set[str]:
+    """从 `web/src/types.ts` 的 `export type <name> = { … }` 里抠出字段名。
+
+    ⚠️ 注释里也有冒号（`// slug，如 "academic"`、`/** … */`），所以先剥注释
+    再扫 `名字:`。**剥注释这一半必须自己先验一遍**：正则抠源码时，
+    「先剥再扫」与「先扫再剥」在这个文件上结果不同（`ItemDetail = Item & {…}`
+    也不能被 `export type Item = {…}` 的正则吃掉——它前面不是 ` = {`）。
+    """
+    text = _TS_TYPES.read_text(encoding="utf-8")
+    m = re.search(rf"^export type {name} = \{{(.*?)^\}}", text, re.S | re.M)
+    assert m, f"types.ts 里找不到 `export type {name} = {{…}}`——契约的一份被删了"
+    body = re.sub(r"/\*.*?\*/", "", m.group(1), flags=re.S)
+    body = re.sub(r"//[^\n]*", "", body)
+    out = {
+        g.group(1)
+        for g in re.finditer(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\??\s*:", body, re.M)
+    }
+    assert out, f"types.ts 的 {name} 里一个字段都没抠出来——正则与文件形状脱节了"
+    return out
+
+
+def test_types_ts_item_fields_match_the_frozen_api_contract():
+    """⭐ M5 终审 Minor-2：`types.ts` ↔ `_ITEM_FIELDS` 之间**没有任何机械联系**。
+
+    三侧（`types.ts` / 这里的 `_ITEM_FIELDS` / `api.item_out()`）在本提交已经对齐，
+    但 `grep -rn actor_uin web/src/` 只命中 `types.ts` 那一行**声明**——
+    没有任何 TS 代码读它 ⇒ T10 的变异「删掉 `actor_uin`」`npx tsc -b --force`
+    **exit 0**（实测属实）⇒ `tsc` 不是守卫。而两份手抄清单漂移的方向是
+    「页面静默少一栏」，没有任何编译错误。
+
+    判据：把 `types.ts` 里的 `actor_uin` 删掉 ⇒ **本条必须变红**
+    （实测：删掉后 `Item` 抠出 15 个字段，与 `_ITEM_FIELDS` 差一个）。
+    """
+    assert _TS_TYPES.is_file(), f"前端类型文件不见了：{_TS_TYPES}"
+    assert _ts_type_fields("Item") == _ITEM_FIELDS
+    assert _ts_type_fields("Source") == {
+        "msg_id", "ts", "sender", "group_name", "content",
+    }
