@@ -82,7 +82,9 @@ def load_config(path: pathlib.Path | None = None) -> Config:
     return validate_config_raw(raw, path)
 
 
-def validate_config_raw(raw: dict, path: pathlib.Path) -> Config:
+def validate_config_raw(
+    raw: dict, path: pathlib.Path, *, require_paths_exist: bool = True
+) -> Config:
     """把**已解析**的 TOML 校验成 `Config`。
 
     ⚠️ **读路径与写路径共用这一个函数**（M6 T2）。写路径若另写一套校验，
@@ -90,14 +92,21 @@ def validate_config_raw(raw: dict, path: pathlib.Path) -> Config:
     `load_config` 拒绝的文件 ⇒ 一份配置永久落盘（原子写、无回滚）
     ⇒ **整个程序起不来**（`config.py` 是所有入口的硬依赖）。
 
-    ⚠️ 它**不是**段序的兜底（⚠️ 实测修正 M6 T2）：tomllib 下 `[settings]`
-    写在 `[[groups]]` 之后仍落在顶层，本函数看不出顺序。它抓得住的是
-    **结果**——「顶层根本没有 `settings`」（`raw.get("settings")` 得到 `None`
-    ⇒ 报「缺少 [settings] 段」）。写路径因此在落盘前仍能挡住
+    ⚠️ `require_paths_exist`（M6 T2 复审 FIX 3，controller 裁决）：
+    **读路径 True、写路径 False**。`qq_db_dir` 的**外部存在性**是**环境事实**
+    而不是配置属性——可移动盘没挂载、换机器、目录临时改名，都不该让
+    「网页上保存一个群」整页失败；而 `load_config` 马上要用那个目录，
+    不存在就该当场报错。⚠️ False 时**仍然解析路径**（该 `Path(...)` 的照做、
+    `output_db` 该拼 `REPO_ROOT` 的照拼），**只跳过 `.is_dir()` 那一句**。
+
+    ⚠️ 它**不是**段序的兜底（⚠️ 实测修正 M6 T2，见计划勘误 E4）：tomllib 下
+    `[settings]` 写在 `[[groups]]` 之后仍落在顶层，本函数看不出顺序。
+    它抓得住的是**结果**——「顶层根本没有 `settings`」（`raw.get("settings")`
+    得到 `None` ⇒ 报「缺少 [settings] 段」）。写路径因此在落盘前仍能挡住
     「上游把 settings 整个弄没了」那类缺陷。
     """
     # ↓↓↓ 以下为原 `load_config` 从 `settings = raw.get("settings")`
-    #     到 `return Config(...)` 的**逐字搬移**，一行不改 ↓↓↓
+    #     到 `return Config(...)` 的逐字搬移（FIX 2 / FIX 3 两处除外，均标明）↓↓↓
     settings = raw.get("settings")
     if not isinstance(settings, dict):
         raise ConfigError(f"{path}: 缺少 [settings] 段")
@@ -107,15 +116,33 @@ def validate_config_raw(raw: dict, path: pathlib.Path) -> Config:
             raise ConfigError(f"{path}: [settings] 缺少 {field}")
 
     qq_db_dir = pathlib.Path(settings["qq_db_dir"])
-    if not qq_db_dir.is_dir():
+    if require_paths_exist and not qq_db_dir.is_dir():  # FIX 3：写路径不查外部
         raise ConfigError(f"QQ 数据库目录不存在: {qq_db_dir}")
 
     output_db = pathlib.Path(settings["output_db"])
     if not output_db.is_absolute():
         output_db = REPO_ROOT / output_db
 
+    # ⚠️ 三个分支不能合并（M6 T2 复审 FIX 2 / Important-2）。`[groups]`（**单层**
+    # 方括号）与 `[[groups]]` 在 TOML 里只差一层括号，是极常见的笔误，
+    # 但解析结果一个是 dict（**一张表**）、一个是 list（数组表）。
+    # 不挡的话 `for entry in entries` 会去迭代 dict 的**键**（字符串），
+    # 下一行 `entry.get("id")` 抛 `AttributeError`——**绕过本模块只捕
+    # `ConfigError` 的契约**（`cli._load_config_only`），用户看到的是原始
+    # traceback。实测（M6 T2 复审）：`AttributeError: 'str' object has no attribute 'get'`。
+    # ⚠️ 顺序也不能反：先判 None 再判类型。反过来的话「根本没写」会被归到
+    # 「类型不对」，把「段为空」的专用报错变成不可达代码。
+    entries = raw.get("groups")
+    if entries is None:
+        raise ConfigError(f"{path}: [[groups]] 段为空（根本没写）")
+    if not isinstance(entries, list):
+        raise ConfigError(
+            f"{path}: 需要 [[groups]] 数组段（注意是双层方括号），"
+            f"实际是 {type(entries).__name__}"
+        )
+
     groups: list[Group] = []
-    for entry in raw.get("groups", []):
+    for entry in entries:
         gid = entry.get("id")
         if not isinstance(gid, int) or gid <= 0:
             raise ConfigError(f"{path}: 群号必须为正整数，实际是 {gid!r}")
@@ -236,8 +263,13 @@ def toml_int(value: object, field: str) -> int:
     return value
 
 
-def _toml_path(value: pathlib.Path) -> str:
+def toml_path(value: pathlib.Path) -> str:
     """把路径写成 TOML 字符串：**能在仓库内相对表达就相对**，否则写绝对。
+
+    ⚠️ 原名为 `_toml_path`，M6 T2 复审（FIX 4）去掉下划线：计划的 T7
+    `configpack.build` 要**跨模块**调它，而跨模块 import 一个下划线名字
+    是在制造「这是私有的、但谁都在用」的假象——与 `toml_str`（原
+    `_toml_str`）完全同一条判据。
 
     ⚠️ 不统一成绝对、也不统一成相对——两个方向各有一个具体的坏法：
 
@@ -361,19 +393,19 @@ def save_config(config: Config, path: pathlib.Path | None = None) -> None:
     ⚠️ 是**整体替换**不是追加：追加语义下「删掉一个群」永远做不到
     （与 `save_persons` 同一条理由）。
 
-    ⚠️ **`[settings]` 必须写在 `[[groups]]` 之前**。⚠️ 实测修正（M6 T2）：
-    原稿给的理由是「否则会被解析成最后一个数组元素下的子表
-    （`groups[-1].settings`）⇒ `raw.get("settings")` 变成 `None` ⇒ 程序起不来」
-    ——**这条实测不成立**：tomllib（TOML 1.0）里 `[settings]` 是**根相对**路径，
-    写在 `[[groups]]` 之后**仍落在顶层**（实测 `raw.get("settings")` 拿到的正是
-    那张表）；只有 `[groups.settings]` 这种**穿过数组**的写法才会嵌套。
-    所以段序**只有这一处在保证**：代码里这个顺序 +
+    ⚠️ `[settings]` 写在 `[[groups]]` **之前**——这是**约定，不是不变量**
+    （⚠️ 实测修正 M6 T2，已入计划勘误 E4）。理由只有一条，就是**与现有手写
+    文件的形状一致、便于人读与 diff**。原稿说「`[table]` 掉到
+    `[[array_of_tables]]` 后面会被解析成最后一个数组元素下的子表 ⇒
+    `raw.get("settings")` 变成 `None` ⇒ 程序起不来」——**实测不成立**：
+    tomllib 里 `[settings]` 是**根相对**路径，写在 `[[groups]]` 之后仍落在顶层；
+    只有 `[groups.settings]` 那种**穿过数组**的写法才嵌套，而
+    `validate_config_raw` 也**分辨不出**顺序（它查的是「顶层有没有 settings」）。
+    这条约定靠本函数的书写顺序 +
     `tests/test_config.py::test_save_config_writes_settings_before_groups`
-    的行锚定断言（把它挪到 `[[groups]]` 之后 ⇒ 那条测试实测变红）。
-    末尾那次落盘前自校验能挡住的是「最终文本里顶层根本没有 `settings`」
-    （⇒「缺少 [settings] 段」），**挡不住段序本身**——tomllib 认为那是合法的。
+    （那条是**约定锁**，不是不变量——它没有变异反证，见它的 docstring）钉着。
 
-    ⚠️ 路径走 `_toml_path`（仓库内相对、仓库外绝对），不要图省事写绝对。
+    ⚠️ 路径走 `toml_path`（仓库内相对、仓库外绝对），不要图省事写绝对。
     """
     target = path or DEFAULT_CONFIG
 
@@ -393,8 +425,8 @@ def save_config(config: Config, path: pathlib.Path | None = None) -> None:
         _GROUPS_HEADER,
         "",
         "[settings]",
-        f"qq_db_dir = {_toml_path(config.qq_db_dir)}",
-        f"output_db = {_toml_path(config.output_db)}",
+        f"qq_db_dir = {toml_path(config.qq_db_dir)}",
+        f"output_db = {toml_path(config.output_db)}",
         "",
     ]
     for g in config.groups:
@@ -411,12 +443,15 @@ def save_config(config: Config, path: pathlib.Path | None = None) -> None:
     # 配置已经落盘了才发现不对——而 `atomic_write_text` 是原子写，
     # **没有任何自动回滚**，那份坏配置会一直躺在那里直到有人手动修。
     # ⚠️ 校验的是**最终文本**（而不是内存里的 `Config`）：只有这样才能抓到
-    # 序列化本身的缺陷（漏转义的引号、写反的段序），而不只是数据的问题。
+    # 序列化本身的缺陷（漏转义的引号），而不只是数据的问题。
+    # ⚠️ 它**抓不到段序**——tomllib 认为两种顺序都合法（见上方约定那一段）。
     try:
         raw = tomllib.loads(text)
     except tomllib.TOMLDecodeError as exc:
         raise ConfigError(f"内部错误：为 {target} 生成的 TOML 解析不了——{exc}") from exc
-    validate_config_raw(raw, target)
+    # ⚠️ `require_paths_exist=False`（M6 T2 复审 FIX 3）：写路径**不查** `qq_db_dir`
+    # 的外部存在性——那是环境事实（可移动盘没挂载也要能保存），不是配置属性。
+    validate_config_raw(raw, target, require_paths_exist=False)
 
     atomic_write_text(target, text)
 

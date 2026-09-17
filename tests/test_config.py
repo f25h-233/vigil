@@ -243,20 +243,20 @@ def test_save_config_roundtrips(tmp_path):
 
 
 def test_save_config_writes_settings_before_groups(tmp_path):
-    """⭐ `[settings]` 必须在 `[[groups]]` **之前**（布局约定，见下）。
+    """⭐ `[settings]` 必须在 `[[groups]]` **之前**——**约定锁，不是不变量**。
 
-    ⚠️ 实测修正（M6 T2）：原稿给的理由是「`[table]` 出现在
-    `[[array_of_tables]]` 之后会被解析成最后一个数组元素下的子表
-    （`groups[-1].settings`）⇒ `raw.get("settings")` 变成 `None` ⇒
-    下一次 `load_config` 报「缺少 [settings] 段」，整个程序起不来」。
-    这条**实测不成立**：tomllib 里 `[settings]` 是**根相对**路径，写在
-    `[[groups]]` 之后**仍落在顶层**（`raw.get("settings")` 拿到的正是那张表）；
-    只有 `[groups.settings]` 这种**穿过数组**的写法才嵌套。
-    所以段序**不是**靠 load 报错兜住的——就靠下面这条断言钉着。
+    ⚠️ 如实标注（M6 T2 复审，计划勘误 E4）：这只是**输出形状的约定**，理由只有
+    一条——**与现有手写文件的形状一致、便于人读与 diff**。它**不是**不变量：
+    原稿说它防「`[table]` 掉到 `[[array_of_tables]]` 之后会被解析成最后一个
+    数组元素下的子表」——**实测不成立**（tomllib 里 `[settings]` 是**根相对**
+    路径，两种顺序都落在顶层，`validate_config_raw` 也分辨不出顺序）。
 
-    ⚠️ 变异反证：把 `save_config` 里的 `lines = [HEADER, "", "[settings]"]`
-    挪到 `for g in config.groups` 之后 ⇒ 本条**必红**（实测 `assert 28 < 0`：
-    红的原因就是行锚定断言，**不是** `load_config` 抛 `ConfigError`）。
+    ⚠️ **它没有变异反证，如实说。** 把 `save_config` 里的 settings 块挪到
+    groups 之后当然会让下面那条断言变红（实测 `assert 28 < 0`），但那只是
+    「断言正在断言它自己说的那件事」——**空转**，不证明任何**行为**上的不变量。
+    要给它真牙齿，得上 golden 产物（固定一份期望输出、逐字节比），那是以后的事。
+
+    ⚠️ 为什么不删（复审裁定）：删了之后**再没有任何东西钉输出形状**。
 
     ⚠️ 实施修正（M6 T2）：原稿用的是 `text.index("[[groups]]")`，而
     `_GROUPS_HEADER` 的**正文里**有一句「按下面格式加一段 `[[groups]]`」
@@ -301,7 +301,7 @@ def test_save_config_refuses_zero_groups(tmp_path):
 
 
 def test_save_config_keeps_repo_relative_paths_relative(tmp_path):
-    """仓库内的路径写**相对**、仓库外的写**绝对**（`_toml_path` 的契约）。
+    """仓库内的路径写**相对**、仓库外的写**绝对**（`toml_path` 的契约）。
 
     两个方向各有一个具体的坏法：
       · 全写绝对 ⇒ 配置搬到别的目录时仍指回原仓库（T8 的导入导出就废了）；
@@ -394,3 +394,58 @@ def test_toml_str_is_reachable_under_its_public_name():
     """
     assert hasattr(config, "toml_str")
     assert not hasattr(config, "_toml_str"), "别留兼容别名"
+
+
+# ── Fix loop 1（T2 独立审查：Important-2 / FIX 2、FIX 3）──────────────
+
+
+def test_load_config_rejects_a_wrong_bracket_shape(tmp_path):
+    """⭐ `[groups]`（**单层**方括号）必须响亮——T2 复审 Important-2。
+
+    ⚠️ 不挡的话：单层括号解析出来的是**一张表**（dict），而代码按**数组**用它
+    （`for entry in ...` 去迭代 dict 的**键**，下一行 `entry.get("id")` 抛
+    `AttributeError`）⇒ 绕过只捕 `ConfigError` 的契约（`cli._load_config_only`），
+    用户看到的是**裸 traceback** 而不是一行可读的配置错误。
+
+    ⚠️ 与 `categories.py` 对 `[[categories]]` 的守卫**同形**：只差一层括号，
+    是极常见的笔误——但两处理由各自写清（`categories.py` 那处不为本节负责）。
+
+    ⚠️ 变异反证：把 `validate_config_raw` 里那两个 `groups` 形状分支删回
+    `raw.get("groups", [])` ⇒ 本条**必红**（抛的是 `AttributeError`）。
+    """
+    p = tmp_path / "groups.toml"
+    p.write_text(
+        f'[settings]\nqq_db_dir = "{tmp_path.as_posix()}"\noutput_db = "data/vigil.db"\n\n'
+        "[groups]\nid = 111\nname = \"甲群\"\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(config.ConfigError, match="数组段"):
+        config.load_config(p)
+
+
+def test_save_config_tolerates_a_missing_qq_db_dir(tmp_path):
+    """⭐ 写路径**不查外部路径存不存在**——T2 复审 FIX 3（controller 裁决）。
+
+    ⚠️ `qq_db_dir` 的**外部存在性**是**环境事实**，不是配置属性：可移动盘没挂载、
+    换了机器、目录临时改名，都不该让「网页上保存一个群」整页失败
+    （而 `save_config` 的落盘前自校会调 `validate_config_raw`，所以写路径必须是
+    `require_paths_exist=False` 那一侧）。
+
+    ⚠️ 反过来，**读路径仍然要查**（默认 `True`）：`load_config` 马上要用那个目录，
+    不存在就该当场报错。这条用例把两侧一起钉住。
+
+    ⚠️ 变异反证：把 `require_paths_exist` 参数去掉、恢复无条件 `.is_dir()`
+    ⇒ 本条**必红**（`save_config` 抛 `ConfigError`）。
+    """
+    p = tmp_path / "groups.toml"
+    missing = tmp_path / "not_mounted_yet"  # ⚠️ 故意**不建**这个目录
+    cfg = config.Config(
+        qq_db_dir=missing,
+        output_db=config.REPO_ROOT / "data" / "vigil.db",
+        groups=(config.Group(id=111, name="甲群"),),
+    )
+    config.save_config(cfg, p)  # 不许抛
+    assert not missing.exists(), "用例自己不许把这个目录建出来"
+    # 读路径这一半：仍然响亮（默认 require_paths_exist=True）
+    with pytest.raises(config.ConfigError, match="不存在"):
+        config.load_config(p)
