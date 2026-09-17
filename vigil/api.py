@@ -264,23 +264,37 @@ def create_app(config: Config) -> FastAPI:
         # 而用户以为自己只撤了后一次。时间戳**留着**是给人看的（日志里能对时刻）。
         actor = f"reorder:{int(time.time())}:{uuid.uuid4().hex[:8]}"
 
-        def on_progress(msg: str) -> None:
-            """把 `plan_reorder` 的进度接到 job 上（复审 ⚠️W-2）。
-
-            ⚠️ 不接线的话 `total`/`done`/`message` 在整轮重排里**恒为 0/空**，
-            而 `_job_out` 把它们暴露给了前端——spec §4.2 ④ 要的「进度」在接口层缺席，
-            用户看到的只有一个转圈。
-            """
-            job.message = msg
-            m = _PROGRESS_BATCHES.search(msg)
-            if m:
-                job.done, job.total = int(m.group(1)), int(m.group(2))
-                return
-            m = _PROGRESS_TOTAL.search(msg)
-            if m:
-                job.total = int(m.group(1))
-
         def work(job: jobs.Job) -> str:
+            def on_progress(msg: str) -> None:
+                """把 `plan_reorder` 的进度接到 job 上（复审 ⚠️W-2）。
+
+                ⚠️ 不接线的话 `total`/`done`/`message` 在整轮重排里**恒为 0/空**，
+                而 `_job_out` 把它们暴露给了前端——spec §4.2 ④ 要的「进度」在接口层缺席，
+                用户看到的只有一个转圈。
+
+                ⚠️⭐ **必须定义在 `work()` 里面**（复审 FIX 2，真 bug）：定义在
+                `api_reorder` 里、闭包引用 `api_reorder` 的局部 `job` 的话，那个
+                名字要等 `jobs.registry.submit(...)` **返回**才绑定，而 worker
+                线程在那之前就起来了 ⇒ 它抢先把第一次 `on_progress` 跑到就是
+                `NameError: cannot access free variable 'job'`，**第一批都发不出去**。
+                ⚠️ 实测（T6 fix loop 2）：把窗口拉宽到 0.2s，本条**必现**
+                （`error` 里就是那句 NameError）——真实复现率很低（复审 60 次
+                0 复现），但那正说明它是**竞态**：机器一忙就会现形。
+                放进 `work()` 里，`job` 就是它的参数——没有窗口。
+
+                ⚠️ `job.done` 记的是「**最后一条成功批次**的序号」，不是"已完成批次数"
+                （复审 ⚠️FIX 4：第 1 批抛异常时界面会看到 `0/N → 2/N → 3/N`，
+                像"全成了"）。**纯显示、无守卫**，本轮不动，入延迟清单。
+                """
+                job.message = msg
+                m = _PROGRESS_BATCHES.search(msg)
+                if m:
+                    job.done, job.total = int(m.group(1)), int(m.group(2))
+                    return
+                m = _PROGRESS_TOTAL.search(msg)
+                if m:
+                    job.total = int(m.group(1))
+
             conn = sqlite3.connect(db_uri, uri=True)
             try:
                 plan, stats = reorder.plan_reorder(

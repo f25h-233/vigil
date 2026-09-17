@@ -2123,8 +2123,16 @@ def test_api_undo_refuses_a_corrupt_snapshot_without_consuming_it(client_factory
 # 假模型判出的类目：与夹具库里前两条（`academic` / `life`）都不同 ⇒ 一定产生变更。
 _NEW_KIND = "notice"
 
-# 假模型的响应：**三条消息各一条**（第三批——222 群那条——也要有产出，
-# 否则"两批"里有一批永远什么都不产出，进度与取消两条用例的"中途"就没意义了）。
+# 假模型的响应：**三条消息各一条**（与种子一一对应）。
+#
+# ⚠️ 第三条**不是承重的**——这里原先写着一个错的理由（"不加它有一批永远什么都不
+# 产出、进度与取消就没意义了"），**实测不成立**：删掉第三条，`-k "reorder or
+# cancel or progress or bulk or revive"` 仍然 **18 passed**（`_scan_payload` 把
+# 匹配不上的条目只记进 `dropped_unmatched`，不抛异常）。
+# ⇒ 真正承重的是**第 3 条种子条目在 222 群**（`_seed_items_db`），它给出"两批"。
+# 留着第三条的理由只剩"与种子一一对应、读的人不用猜为什么少一条"。
+# （复审 FIX 3：删掉一句已知错的论证与修一个 bug 同样是交付。）
+#
 # ⚠️ `quote` 必须**逐字**出现在正文里（`refine._match_source` 按摘录定位）。
 _REORDER_PAYLOAD = {
     "items": [
@@ -2177,7 +2185,15 @@ def slow_llm(monkeypatch):
     monkeypatch.setattr(_reorder, "chat_json", fake)
     monkeypatch.setattr(_api, "load_llm_key", lambda *a, **k: "k-llm")
     yield gate
-    gate.set()
+    # ⚠️ 同样要**等终态**（FIX 1）。这个假模型放行后是**抛异常**（每一批都失败
+    # ⇒ `plan.changes` 是空的 ⇒ `apply_reorder` 一条都不写），所以今天它写不出
+    # 东西；但"今天恰好不写"不是保证——哪天有人给它换一个会产出条目的响应，
+    # 这条路径立刻变成和 `gated_llm` 一样的地雷。等待的成本是 0（job 已经结束）。
+    if not _release_and_wait(gate):
+        raise RuntimeError(
+            "slow_llm 放行后仍有 job 没结束（10s）——**不许就这么退出**："
+            "worker 之后的 `overrides.connect()` 会落到隔离之外的库上"
+        )
 
 
 def test_api_reorder_starts_a_job_and_the_poll_says_it_finished(client_factory, fake_llm):
@@ -2275,6 +2291,41 @@ def _main_db_fingerprint(db: pathlib.Path) -> dict[str, str]:
     return out
 
 
+def _drain_jobs(*, timeout: float = 10.0) -> bool:
+    """等所有 job 到终态（**不负责放行**）。返回 True = 已经清空。
+
+    ⚠️ 判据用 `is_busy()`（有没有 running 的 job）而不是"睡一会儿"：
+    `jobs.registry` 是**进程级**的（`api.py` 用它），worker 提交的正是它。
+    """
+    from vigil import jobs as _jobs
+
+    deadline = time.monotonic() + timeout
+    while _jobs.registry.is_busy() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    return not _jobs.registry.is_busy()
+
+
+def _release_and_wait(gate: threading.Event, *, timeout: float = 10.0) -> bool:
+    """放行被卡住的假模型，**并等所有 job 到终态**再返回（T6 fix loop 2 / FIX 1）。
+
+    ⚠️⭐ **为什么必须等**：夹具 teardown 里只 `gate.set()` 就返回的话，worker
+    会在**后面几个夹具（含 monkeypatch）已经还原之后**才跑到
+    `overrides.connect()` ⇒ 那批 `set_kind` 落进**真实的 `data/overrides.db`**
+    （复审在沙箱里真的复现过：2 条事件、actor `reorder:…:e41af3fe`、item 1/2）。
+    本项目第一条规矩就是「测试不碰真实资产」，而这条路径上的违反
+    **不会让任何用例变红**——只能事后翻 `data/` 才发现，是最坏的形态。
+
+    ⚠️ 判据用 `is_busy()`（有没有 running 的 job）而不是"睡一会儿"：
+    `jobs.registry` 是**进程级**的（`api.py` 用它），worker 提交的正是它。
+
+    返回 True 表示已经清空（没有 running 的 job）。
+    """
+    from vigil import jobs as _jobs
+
+    gate.set()
+    return _drain_jobs(timeout=timeout)
+
+
 class _GatedLLM:
     """假模型：**第 1 次**调用卡住等测试放行，之后各次立刻返回。
 
@@ -2284,10 +2335,16 @@ class _GatedLLM:
 
     ⚠️ 只卡第一次：第二次立刻返回，这样「取消之后第二批还发不发」是可数的
     （`calls`）——那正是 `should_stop` 那条接线的机械判据。
+
+    ⚠️ `tail_delay`（第 2 批起每次多睡一会儿）是给
+    `test_the_release_helper_drains_before_the_isolation_is_undone` 用的：
+    它把"放行之后、写 overlay 之前"的那段时间拉宽，好让那条判据**确定**地
+    落在"worker 还没写"的窗口里，而不是看调度器脸色。
     """
 
-    def __init__(self, payload: dict) -> None:
+    def __init__(self, payload: dict, *, tail_delay: float = 0.0) -> None:
         self.payload = payload
+        self.tail_delay = tail_delay
         self.entered = threading.Event()   # 第 1 次调用已进入（确认"真的在飞"）
         self.gate = threading.Event()      # 测试放行
         self.calls = 0
@@ -2299,6 +2356,8 @@ class _GatedLLM:
         if self.calls == 1:
             self.entered.set()
             self.gate.wait(30)
+        elif self.tail_delay:
+            time.sleep(self.tail_delay)
         return LLMResult(payload=self.payload, input_tokens=1, output_tokens=1)
 
 
@@ -2312,7 +2371,14 @@ def gated_llm(monkeypatch):
     monkeypatch.setattr(_reorder, "chat_json", llm)
     monkeypatch.setattr(_api, "load_llm_key", lambda *a, **k: "k-llm")
     yield llm
-    llm.gate.set()   # 收尾放行：别让工作线程一直挂在 chat_json 里
+    # ⚠️ 放行 + **等 job 到终态**（FIX 1）：只 `gate.set()` 就返回的话，
+    # worker 会在 monkeypatch 还原**之后**才写 overlay —— 那批 `set_kind`
+    # 就落进真实的 `data/overrides.db` 了（理由见 `_release_and_wait`）。
+    if not _release_and_wait(llm.gate):
+        raise RuntimeError(
+            "gated_llm 放行后仍有 job 没结束（10s）——**不许就这么退出**："
+            "worker 之后的 `overrides.connect()` 会落到隔离之外的库上"
+        )
 
 
 def test_api_cancel_stops_the_job_and_writes_nothing(client_factory, gated_llm):
@@ -2734,3 +2800,114 @@ def test_api_import_pack_returns_400_not_500_for_a_shape_error(client_factory, t
     r = c.post("/api/config/pack", json={"toml": broken, "apply": True})
     assert r.status_code == 400, r.text
     assert "键值表" in r.json()["detail"]
+
+
+# ── M6 T6 fix loop 2：teardown 不许写进隔离之外的库 / worker 抢跑 ────
+
+
+def _overlay_state(db: pathlib.Path) -> tuple[int, int]:
+    """`(item_edits 行数, 最大 edit_id)`；库不存在 ⇒ `(0, 0)`。
+
+    ⚠️ 只读打开（`mode=ro`）且**不建库**：这是给"隔离之外那个库"量体用的，
+    量它的时候去写它就是这条判据要防的事本身。
+    """
+    if not db.is_file():
+        return (0, 0)
+    con = sqlite3.connect(f"file:{db.as_posix()}?mode=ro", uri=True)
+    try:
+        row = con.execute(
+            "SELECT COUNT(*), IFNULL(MAX(edit_id), 0) FROM item_edits"
+        ).fetchone()
+        return (int(row[0]), int(row[1]))
+    finally:
+        con.close()
+
+
+def test_the_release_helper_drains_before_the_isolation_is_undone(
+    client_factory, tmp_path, monkeypatch
+):
+    """⭐⭐ FIX 1 的判据：夹具 teardown 那条路径**必须先等 job 到终态**。
+
+    ⚠️ 它守的是什么（复审真的复现过）：用例失败 ⇒ teardown `gate.set()` 后
+    **立刻返回** ⇒ monkeypatch 先被还原 ⇒ worker 这时才跑到
+    `overrides.connect()` ⇒ 那批 `set_kind` 落进**真实的 `data/overrides.db`**
+    （2 条事件、actor `reorder:…`、item 1/2）。**没有任何用例会因此变红**
+    ——只能事后翻 `data/` 才发现。
+
+    ⚠️ 这里用一个 **tmp 文件当"隔离之外那个库"的替身**，**绝不去碰真实的
+    `data/`**（碰它就等于亲手犯下这条判据要防的事，而且会改掉用户的真实数据）。
+    把 `overrides.OVERRIDES_DB` 重新指向它，语义上就是"monkeypatch 已经被还原"。
+
+    ⚠️ 本用例**显式**调 `_release_and_wait`（而不是靠夹具 teardown），因为
+    "放行"与"隔离失效"的**先后**正是被测的东西——交给 teardown 就没法在中间插桩。
+
+    ⚠️ 假模型带 `tail_delay`：它让第 2 批在放行之后还要睡 0.3s，于是
+    "worker 还没写到 `apply_reorder`"这件事是**确定**的（否则这条判据会
+    变成"看调度器脸色"的 flaky 守卫，而 flaky 的守卫最后都会被人注释掉）。
+    """
+    from vigil import api as _api
+    from vigil import overrides as _ov
+    from vigil import reorder as _reorder
+
+    stand_in = tmp_path / "un-isolated.db"
+    _ov.ensure_schema(stand_in)
+    before = _overlay_state(stand_in)
+
+    llm = _GatedLLM(_REORDER_PAYLOAD, tail_delay=0.3)
+    monkeypatch.setattr(_reorder, "chat_json", llm)
+    monkeypatch.setattr(_api, "load_llm_key", lambda *a, **k: "k-llm")
+
+    c = client_factory()
+    assert c.post("/api/reorder").status_code == 202
+    assert llm.entered.wait(5), "假模型没被调到——后面全是空断言"
+
+    # ① 夹具 teardown 做的那一步：放行 + **等 job 到终态**
+    assert _release_and_wait(llm.gate), "放行之后 job 没有在超时内结束"
+    # ② 现在才模拟"隔离已失效"（teardown 之后 monkeypatch 被还原的那一刻）
+    monkeypatch.setattr(_ov, "OVERRIDES_DB", stand_in)
+    # ③ ⚠️ 必须**等 worker 真的结束**再断言：伤害是**异步**发生的（worker 还活着，
+    #    它跑完 `apply_reorder` 才写），不等的话这条判据就成了"看谁先跑"
+    #    ——实测过：第一版少了这一等，变异体（去掉 drain）**照样绿**。
+    _drain_jobs()
+    assert _overlay_state(stand_in) == before, (
+        "worker 在隔离撤销**之后**才写 overlay —— 真实场景里那就是 "
+        "`data/overrides.db`（隔离之外的那个库）"
+    )
+
+
+def test_api_reorder_survives_a_worker_that_starts_before_submit_returns(
+    client_factory, fake_llm, monkeypatch
+):
+    """⭐ FIX 2：`on_progress` **不许**引用一个还没绑定的 `job`（真 bug，不是理论问题）。
+
+    ⚠️ 形状：`on_progress` 定义在 `api_reorder` 里、闭包引用它的局部 `job`，
+    而那个名字要等 `jobs.registry.submit(...)` **返回**才绑定；worker 线程在
+    `submit` **返回之前**就起来了 ⇒ 它抢先把第一次 `on_progress` 跑到就是
+    `NameError: cannot access free variable 'job'`，**第一批都发不出去**。
+
+    ⚠️ 真实复现率很低（复审实测 60 次 0 复现），所以这里把窗口**拉宽到必现**：
+    用一个 `submit` 在返回前先睡 0.2 秒的 registry。修好之后（`on_progress` 在
+    `work()` 里、`job` 是它的参数）worker 随便抢跑都无所谓。
+
+    ⚠️ 变异反证：把 `on_progress` 挪回 `api_reorder` 里（闭包引用局部 `job`）
+    ⇒ 本条**必红**（job 立刻 failed，`error` 里是 `NameError`）。
+    """
+    from vigil import jobs as _jobs
+
+    class SlowSubmit(_jobs.JobRegistry):
+        """`submit` 在**返回之前**拖 0.2 秒——把 FIX 2 那个交错窗口拉宽到必现。"""
+
+        def submit(self, kind, work, *, actor=""):
+            job = super().submit(kind, work, actor=actor)   # 线程已经起来了
+            time.sleep(0.2)                                  # ← 窗口
+            return job
+
+    monkeypatch.setattr(_jobs, "registry", SlowSubmit())
+
+    c = client_factory()
+    body = _wait_for_job(c, c.post("/api/reorder").json()["job_id"])
+    assert body["state"] == "done", (
+        f"worker 抢跑时 job 失败了：{body['error']!r}"
+        "（`on_progress` 引用了还没绑定的 `job`）"
+    )
+    assert body["total"] == 2, "进度也没接上（on_progress 没跑成）"
