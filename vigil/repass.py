@@ -248,6 +248,64 @@ def _plan_downgrades(
     return out
 
 
+# 字段降级的两个字段名（`--fields` 与 `plan_field_downgrades` 共用；写成常量
+# 而不是各写一遍字符串字面量，否则 CLI 的选项与判据会各漂各的）。
+DOWNGRADE_FIELDS = ("place", "deadline")
+
+
+def plan_field_downgrades(
+    conn: sqlite3.Connection,
+    item_ids: Iterable[int],
+    *,
+    fields: Iterable[str] = DOWNGRADE_FIELDS,
+) -> list[tuple[int, str | None, int | None]]:
+    """给定条目里，`place` / `deadline_ts` **不再过当前闸门**的那些（要降级的）。
+
+    `updates` 的形状与 `store.downgrade_item_fields` 的入参一致：
+    ``(item_id, place, deadline_ts)`` 三元组（没被降级的那个字段原样带回）。
+
+    ⚠️ **判据只有一处定义**：`place_supported`（源文里要有 2 字子串的依据）与
+    `deadline_sane`（截止日不早于消息当天），与 `_to_item`（写入路径）和
+    `_plan_downgrades`（LLM 重判路径）调的是**同一对函数**。这里不重写判据、
+    也不自己写 `UPDATE`——写路径是 `store.downgrade_item_fields`（唯一一份）。
+
+    ⚠️ 与 `_plan_downgrades`（LLM 路径）的两点区别都**不是判据**，是取材：
+      · **不调模型**：`place_supported` 的 haystack 用条目**已登记的全部源消息**
+        （`store.item_sources_text`，与 `deadline-audit` 同一来源），而那条路径用
+        `ExtractedItem.src_msg_ids[0]`（模型这一轮重新摘出来的那条）；
+      · **覆盖全部给定条目**，而那条路径只覆盖 `plan.to_keep`（重判后仍保留的）。
+
+    ⚠️ **只降级、不升级**（与 `_plan_downgrades` 同一条裁定）：新判据下"该有值"
+    而旧条目没有的，一律不动——那属于"抽取质量"，不是这一步要修的问题。
+    """
+    ids = [int(i) for i in item_ids]
+    if not ids:
+        return []
+    wanted = set(fields)
+    marks = ",".join("?" * len(ids))
+    rows = conn.execute(
+        "SELECT item_id, place, deadline_ts, event_ts FROM items"
+        f" WHERE item_id IN ({marks})",
+        ids,
+    ).fetchall()
+    sources = store.item_sources_text(conn, ids)
+
+    out: list[tuple[int, str | None, int | None]] = []
+    for item_id, place, deadline_ts, event_ts in rows:
+        # 没有来源行的条目按「无依据」处理——与 `unverified_item_ids` /
+        # `digest.verified_deadlines` 同一口径：**证不出来就是没有**。
+        text = sources.get(int(item_id), "")
+        new_place = place
+        if "place" in wanted and not place_supported(place, text):
+            new_place = None
+        new_dl = deadline_ts
+        if "deadline" in wanted and not deadline_sane(deadline_ts, event_ts):
+            new_dl = None
+        if (new_place, new_dl) != (place, deadline_ts):
+            out.append((int(item_id), new_place, new_dl))
+    return out
+
+
 def _source_msg_ids(conn: sqlite3.Connection, item_id: int) -> list[int]:
     """这条 item 的**每一条**源消息 id（按 `(ts, msg_id)` 升序）。"""
     return [int(r.msg_id) for r in store.source_messages(conn, item_id)]

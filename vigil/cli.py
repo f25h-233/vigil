@@ -721,6 +721,124 @@ def cmd_deadline_audit(args) -> int:
         conn.close()
 
 
+def cmd_downgrade(args) -> int:
+    """字段降级：把**不再过当前闸门**的 `place` / `deadline_ts` 置 NULL。
+
+    ⚠️ 存在的理由（M5 终审 Important-3）：`store.downgrade_item_fields` 全仓**零
+    调用方**，于是 M5 出口判据 3（「不再存在 `deadline_ts < event_ts` 的条目」）
+    没有任何所有者——真库 item 83 一直是「event 2026-08-05 / deadline 2026-05-06」，
+    `ItemCard` 在 8 月的条目上渲染「⏰ 05-06 截止」。这条命令就是它的调用方。
+
+    ⚠️ **为什么是独立子命令、不是 `repass --downgrade-only`**：`repass` 是**LLM 重判**
+    （要 api key、烧 token，覆盖范围是「重判后仍保留下来的条目」`plan.to_keep`），
+    而字段降级**不需要模型**——判据是纯机械的（`place_supported` / `deadline_sane`），
+    范围是全部条目。并成一个命令会让两份「降级清单」看起来是同一份，
+    而它们不是（那份只覆盖 `to_keep`）——那正是本项目最忌的「看起来像同一个数」。
+
+    ⚠️ 默认**只出清单、不写库**（`--apply` 才写），与 `repass` / `deadline-audit`
+    一字不差的同一条惯例：不可逆操作事前可见。
+
+    ⚠️ 写库必须持锁（rc=2 = 已有实例在跑，等着就行）；只读清单不上锁——
+    给只读检查上锁会凭空造出一个**假拒绝**（与 `deadline-audit` 同）。
+    """
+    config = _load_config_only()
+    db = _require_export_db(config)
+
+    # `--fields both|place|deadline` ⇒ 字段名集合。写成映射而不是把字符串
+    # 直接传下去：`'/'.join("place")` 会拼成 `p/l/a/c/e`，而把字符串当
+    # 集合用时 `"place" in wanted` 恰好也能对上——两种写法里只有一种是对的，
+    # 所以这里显式列出。
+    fields = {
+        "both": repass_mod.DOWNGRADE_FIELDS,
+        "place": ("place",),
+        "deadline": ("deadline",),
+    }[args.fields]
+
+    # ⚠️ `uri=True`：本命令要问 overlay（跳过软删条目），而查询层入口会
+    # `ATTACH 'file:...?mode=ro'`——URI 形式只在连接带 SQLITE_OPEN_URI 时被解析（裁决 R4）。
+    conn = sqlite3.connect(str(db), uri=True)
+    try:
+        all_ids = [
+            int(r[0]) for r in conn.execute("SELECT item_id FROM items ORDER BY item_id")
+        ]
+        # ⚠️ 软删的条目**不碰**（`_plan_downgrades` 的同一条裁定）：那是用户自己
+        # 隐藏的行，替他改字段同样是"替他改了他已经决定过的东西"。
+        soft = store.soft_deleted_item_ids(conn, all_ids)
+        scope = [i for i in all_ids if i not in soft]
+        updates = repass_mod.plan_field_downgrades(conn, scope, fields=fields)
+        # ⚠️ 被跳过的那批也要单独算一遍并报出来：出口判据的 SQL
+        # （`SELECT count(*) FROM items WHERE deadline_ts < event_ts`）数的是
+        # **全部** items，含软删——不报的话，「复核：剩 N 条」会与判据对不上，
+        # 而读的人只会看到两个互相矛盾的数字（R13 同族）。
+        skipped = repass_mod.plan_field_downgrades(conn, sorted(soft), fields=fields)
+
+        print(
+            f"[downgrade] 扫描 {len(all_ids)} 条（其中被软删、跳过 {len(soft)} 条）；"
+            f"降级字段：{'/'.join(fields)}"
+        )
+        if skipped:
+            print(
+                f"  ⚠️ 另有 {len(skipped)} 条**被软删**的条目也过不了闸门，"
+                "本轮不动（用户自己隐藏的行，不替他改）："
+            )
+            for item_id, _, _ in skipped:
+                print(f"    - item {item_id}")
+            print(
+                "  ⚠️ 上面这句与判据 SQL 的口径不同：判据数的是全部 items（含软删）。"
+                "要让那个数归零，得先撤销软删，或显式裁决「软删条目要不要一起降级」。"
+            )
+        if not updates:
+            print("无需改动。")
+            return 0
+
+        rows = {
+            int(r[0]): r
+            for r in conn.execute(
+                "SELECT item_id, place, deadline_ts, event_ts, title FROM items WHERE item_id IN"
+                f" ({','.join('?' * len(updates))})",
+                [u[0] for u in updates],
+            )
+        }
+        print(f"将降级 {len(updates)} 条：")
+        for item_id, new_place, new_dl in updates:
+            _, place, deadline_ts, event_ts, title = rows[item_id]
+            head = f"    - item {item_id} 「{title[:20]}」"
+            if new_dl != deadline_ts:
+                reason = (
+                    "倒挂：早于 event 那天"
+                    if deadline_ts is not None and event_ts is not None
+                    else "无依据"
+                )
+                when = (
+                    dt.datetime.fromtimestamp(deadline_ts).strftime("%Y-%m-%d")
+                    if deadline_ts
+                    else "NULL"
+                )
+                print(f"{head} deadline_ts {when} → NULL（{reason}）")
+            if new_place != place:
+                print(f"{head} place {place!r} → NULL（源文里找不到依据）")
+        if not args.apply:
+            print("\n（--dry-run：未写库。确认无误后加 --apply）")
+            return 0
+
+        try:
+            with lock.SingleInstance():
+                with store.transaction(conn):
+                    n = store.downgrade_item_fields(conn, updates)
+        except lock.AlreadyRunning as exc:
+            logs.emit(f"[跳过] {exc}")
+            return 2
+        print(f"\n已降级 {n} 条（只改 place/deadline_ts 两列，其余字段未动）。")
+        left = conn.execute(
+            "SELECT COUNT(*) FROM items"
+            " WHERE deadline_ts IS NOT NULL AND deadline_ts < event_ts"
+        ).fetchone()[0]
+        print(f"复核：deadline_ts < event_ts 的条目剩 {left} 条。")
+        return 0
+    finally:
+        conn.close()
+
+
 def cmd_serve(args) -> int:
     """起本地只读 Web 服务。手机访问见 spec §4.7（tailscale serve 代理本端口）。"""
     import uvicorn  # 延迟导入：不跑服务的人不该为它付启动成本
@@ -842,6 +960,18 @@ def main(argv: list[str] | None = None) -> int:
     )
     p_dl.add_argument("--apply", action="store_true", help="真的写库（默认只报告）")
     p_dl.set_defaults(func=cmd_deadline_audit)
+
+    p_dg = sub.add_parser(
+        "downgrade",
+        help="字段降级：把不再过当前闸门的 place/deadline_ts 置 NULL（默认只出清单）",
+    )
+    p_dg.add_argument("--apply", action="store_true", help="真的写库（默认只出清单）")
+    p_dg.add_argument(
+        "--fields", choices=("both", "place", "deadline"), default="both",
+        help="降级哪些字段（默认 both）。判据是数据层的两道闸门："
+        "place 要在源文里找得到依据；deadline 不早于 event 那天",
+    )
+    p_dg.set_defaults(func=cmd_downgrade)
 
     p_serve = sub.add_parser("serve", help="起本地 Web 服务（只读库）")
     p_serve.add_argument("--host", default="127.0.0.1", help="监听地址")
