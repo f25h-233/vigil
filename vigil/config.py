@@ -9,13 +9,16 @@ from __future__ import annotations
 import os
 import pathlib
 import tomllib
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+
+from . import llm
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 DEFAULT_CONFIG = REPO_ROOT / "config" / "groups.toml"
 DEFAULT_ENV = REPO_ROOT / ".env"
 DEFAULT_PERSONS = REPO_ROOT / "config" / "persons.toml"
+DEFAULT_LLM_TOML = REPO_ROOT / "config" / "llm.toml"
 
 
 class ConfigError(RuntimeError):
@@ -487,6 +490,143 @@ def save_persons(persons: Sequence[Person], path: pathlib.Path | None = None) ->
             lines.append(f"note = {toml_str(p.note)}")
         lines.append("")
     atomic_write_text(target, "\n".join(lines))
+
+
+@dataclass(frozen=True)
+class LLMSettings:
+    """LLM 端点配置（`config/llm.toml`）。**这里没有密钥，也不许加**（spec §3.2）。
+
+    ⚠️ `enable_thinking` 是**三态**，不是布尔：
+
+    | 值 | 报文里 | 什么时候用它 |
+    |---|---|---|
+    | `None` | **不发这个键** | 通用 OpenAI 端点（SiliconFlow/Qwen 的扩展字段它们不认，会 400） |
+    | `False` | 发 `false` | Qwen3/Qwen3.5 这类混合思考模型（不发会慢 **40 倍**，实测） |
+    | `True` | 发 `true` | 显式要思考 |
+
+    ⚠️ **默认是 `None` 而不是 `False`**——这与 `llm.LLMConfig` 的默认一致
+    （那里有完整论证：「留 None 而不是 False 做默认：老模型不一定认这个字段，
+    不发才是对它们最安全的形状」）。而"出厂路线上会不会变慢"由
+    **`config/llm.toml` 里显式写着 `enable_thinking = false`** 保证，
+    不由这个 dataclass 的默认值保证。
+    """
+
+    base_url: str = llm.DEFAULT_BASE
+    model: str = llm.DEFAULT_MODEL
+    enable_thinking: bool | None = None
+
+
+def load_llm_settings(
+    path: pathlib.Path | None = None,
+    *,
+    on_warn: Callable[[str], None] | None = None,
+) -> LLMSettings:
+    """读 LLM 端点配置。
+
+    ⚠️ **文件不存在返回内置默认**（与 `load_persons` 同形，与 `load_config`
+    的快速失败不同）：没写这份文件是**合法的**——内置默认就是硅基流动那一套。
+
+    ⚠️ **但这一支必须出声**（`on_warn`）。默认里 `enable_thinking=None`
+    ⇒ **不发该字段**，而实测那会让 Qwen3.5-35B-A3B 单批从 2.8s 涨到
+    **111.5s**。「删掉一个配置文件换来 40 倍慢、且没有任何提示」正是本项目
+    反复禁止的静默退化。传 `on_warn=logs.emit` 就把这句话说出来；
+    测试里不传就是安静的。
+
+    ⚠️ `enable_thinking` 的缺省判定**必须是 `not in` 而不是 falsy 检查**：
+    `section.get("enable_thinking")` 对「键不存在」（`None`）与「值是
+    `false`」（`False`）返回**不同的东西**，而 `if value:` 会把后者静默吞成
+    "没写" ⇒ 切到自建端点后行为悄悄变了。
+    """
+    target = path or DEFAULT_LLM_TOML
+    if not target.is_file():
+        if on_warn is not None:
+            on_warn(
+                f"[注意] 没有 {target}，用内置默认端点（{llm.DEFAULT_BASE}）。"
+                "⚠️ 该默认**不发 enable_thinking 字段**，而混合思考模型"
+                "（Qwen3/Qwen3.5）不收到它时会**慢 40 倍**（实测 111.5s vs 2.8s/批）。"
+                "要恢复原速，请建这个文件并写 `enable_thinking = false`。"
+            )
+        return LLMSettings()
+
+    try:
+        with open(target, "rb") as f:
+            raw = tomllib.load(f)
+    except tomllib.TOMLDecodeError as exc:
+        raise ConfigError(f"{target}: TOML 语法错误——{exc}") from exc
+
+    section = raw.get("llm")
+    if section is None:
+        raise ConfigError(
+            f"{target}: 缺少 [llm] 段（注意是**单层**方括号；`[[llm]]` 会读成一个数组）"
+        )
+    if not isinstance(section, dict):
+        raise ConfigError(
+            f"{target}: `llm` 必须是**一张表**（`[llm]`），"
+            f"实际是 {type(section).__name__}——写成 `[[llm]]`（双层方括号）时"
+            "读出来的是一串表。"
+        )
+
+    base_url = str(section.get("base_url", "")).strip() or llm.DEFAULT_BASE
+    model = str(section.get("model", "")).strip() or llm.DEFAULT_MODEL
+
+    if "enable_thinking" not in section:
+        thinking: bool | None = None
+    else:
+        raw_thinking = section["enable_thinking"]
+        if not isinstance(raw_thinking, bool):
+            raise ConfigError(
+                f"{target}: enable_thinking 只能是 true / false，或**整行删掉**"
+                f"（删掉 = 不发这个字段）。实际是 {raw_thinking!r}"
+                f"（{type(raw_thinking).__name__}）——"
+                '写成 `"false"`（带引号）是字符串，不是布尔。'
+            )
+        thinking = raw_thinking
+
+    return LLMSettings(base_url=base_url, model=model, enable_thinking=thinking)
+
+
+_LLM_HEADER = """\
+# VIGIL 的 LLM 端点配置
+#
+# ⚠️ **本文件里永远不放密钥。** 密钥走仓库根的 `.env`（`SILICONFLOW_API_KEY`），
+#    因为 `config/*.toml` 是**要进 git** 的（spec §3.2 / D11）。
+#
+# ⚠️ **本文件由程序整体重写**（网页「配置」页保存时会覆盖它）：
+#    手工改也行，但**手工加的注释会在下一次网页保存时消失**。
+#
+# 改完不需要重启服务：`vigil refine` / `vigil digest` 每次运行都会重新读它。
+"""
+
+
+def save_llm_settings(
+    settings: LLMSettings, path: pathlib.Path | None = None
+) -> None:
+    """整体替换写出 LLM 配置（原子）。
+
+    ⚠️ `enable_thinking is None` 时**整行不写**——那是"不发这个字段"的
+    唯一表达方式。写成 `enable_thinking = null` 的话，读回来是 Python 的
+    `None` 但通过的是 **TOML 里不存在的 null 语法**（TOML 根本没有 null），
+    文件直接解析不了。
+    """
+    target = path or DEFAULT_LLM_TOML
+    lines = [_LLM_HEADER, "", "[llm]", ""]
+    lines.append(f"base_url = {toml_str(settings.base_url)}")
+    lines.append(f"model = {toml_str(settings.model)}")
+    if settings.enable_thinking is not None:
+        lines.append(
+            f"enable_thinking = {'true' if settings.enable_thinking else 'false'}"
+        )
+    lines.append("")
+
+    text = "\n".join(lines)
+    try:
+        raw = tomllib.loads(text)
+    except tomllib.TOMLDecodeError as exc:
+        raise ConfigError(f"内部错误：为 {target} 生成的 TOML 解析不了——{exc}") from exc
+    if not isinstance(raw.get("llm"), dict):
+        raise ConfigError(f"内部错误：为 {target} 生成的 TOML 里没有 [llm] 表")
+
+    atomic_write_text(target, text)
 
 
 # TOML 基本字符串里**必须转义**的字符。实测坏字符集是

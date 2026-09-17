@@ -1,0 +1,34 @@
+# VIGIL 的 LLM 端点配置
+#
+# ⚠️ **本文件里永远不放密钥。** 密钥走仓库根的 `.env`（`SILICONFLOW_API_KEY`），
+#    因为 `config/*.toml` 是**要进 git** 的（spec §3.2 / D11）。
+#
+# ⚠️ **本文件由程序整体重写**（网页「配置」页保存时会覆盖它）：
+#    手工改也行，但**手工加的注释会在下一次网页保存时消失**。
+#
+# 改完不需要重启服务：`vigil refine` / `vigil digest` 每次运行都会重新读它。
+
+[llm]
+
+# OpenAI 兼容的 chat completions 端点（**要写到 /chat/completions 为止**）。
+base_url = "https://api.siliconflow.cn/v1/chat/completions"
+
+# 模型名。换模型前先读 `docs/M1-模型评估.md`：
+# 2026-09-14 六模型对照实测，Qwen/Qwen3.5-35B-A3B 总延迟 64s，
+# 其余模型 179–259s，快 3–4 倍，且引用匹配率并列最好。
+model = "Qwen/Qwen3.5-35B-A3B"
+
+# ── enable_thinking：三态，**别删这一行** ──────────────────────────
+#
+#   不写这一行        → **不发这个字段**（通用 OpenAI 端点最安全的形状）
+#   = false           → 发 false  ← 出厂值，硅基流动 / Qwen 用这个
+#   = true            → 发 true
+#
+# ⚠️ 它是 **SiliconFlow / Qwen 的扩展字段**：通用 OpenAI 端点不认它，
+#    会直接 400（spec §6 R12）。所以换到自建端点时把它**删掉**，
+#    而不是改成别的值。
+#
+# ⚠️ 反过来，用 Qwen3/Qwen3.5 这类**混合思考模型**时**必须**保持 false：
+#    实测 Qwen3.5-35B-A3B 不传该字段要 111.5s / 11,124 输出 token，
+#    传 false 只要 2.8s / 220 token —— **40 倍差距**。
+enable_thinking = false

@@ -153,6 +153,16 @@ def run(
       与 `test_emit_failure_inside_a_stage_...` 各钉住一条。
     """
     emit = on_progress or logs.emit
+    # ⚠️ 无人值守这条路**必须自己读** `config/llm.toml`（没有命令行可接）。
+    # ⚠️ `on_warn=emit`：文件缺失时那句「会慢 40 倍」必须进日志——
+    # 任务计划不保存 stdout，而 `LAST-ERROR.txt` 只在**阶段失败**时才写。
+    from .config import load_llm_settings
+
+    llm_settings = load_llm_settings(on_warn=emit)
+    emit(
+        f"[daily] LLM 端点：{llm_settings.base_url} · 模型 {llm_settings.model} · "
+        f"思考={'不发该字段' if llm_settings.enable_thinking is None else llm_settings.enable_thinking}"
+    )
     day = day or digest_mod.yesterday()
     since, until = digest_mod.day_window(day)
 
@@ -190,7 +200,9 @@ def run(
             api_key=llm_key,
             db_path=config.output_db,
             prompt_ver=refine_mod.PROMPT_VERSION,
-            model=refine_mod.DEFAULT_MODEL,
+            model=llm_settings.model,
+            base_url=llm_settings.base_url,
+            enable_thinking=llm_settings.enable_thinking,
             # ⚠️ **必须传**：不传就是 None，而 `refine()` 的预算护栏只在
             # `budget_tokens is not None` 时生效 ⇒ 无人值守这条路**一点上限都没有**
             # （M4 终审 I-3）。取值依据见 `DAILY_BUDGET_TOKENS` 上面那段。
@@ -242,7 +254,9 @@ def run(
                 since=since,
                 until=until,
                 day_label=day,
-                model=digest_mod.DEFAULT_MODEL,
+                model=llm_settings.model,
+                base_url=llm_settings.base_url,
+                enable_thinking=llm_settings.enable_thinking,
                 on_progress=emit,
             )
             if dst.errors:

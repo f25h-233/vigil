@@ -551,3 +551,54 @@ def test_unattended_refine_gets_a_token_budget(monkeypatch):
         f"预算 {budget:,} 离「最吵的一天」{busiest_recorded_day:,} token 太近——"
         f"宁可宽松也不要卡死日常（依据见 daily.DAILY_BUDGET_TOKENS 的注释）"
     )
+
+
+def test_daily_passes_the_configured_llm_endpoint(monkeypatch, tmp_path):
+    """⭐ `daily` 必须把 `config/llm.toml` 里的端点**真的传下去**。
+
+    ⚠️ 这条挡的是一个具体的形状：`daily` 是**无人值守**路径，没有命令行
+    可接，很容易在改造时被漏掉——而它漏掉的后果是"网页上改了端点、
+    日报却还在打老地址"，且**只有等到有人看日志才发现**。
+
+    ⚠️ 变异反证：把 `daily.run` 里 refine 调用那三行换回
+    `model=refine_mod.DEFAULT_MODEL` ⇒ 本条**必红**。
+    """
+    from vigil import config
+
+    monkeypatch.setattr(
+        config, "DEFAULT_LLM_TOML",
+        tmp_path / "llm.toml",
+    )
+    (tmp_path / "llm.toml").write_text(
+        '[llm]\nbase_url = "https://my-host/v1/chat/completions"\n'
+        'model = "my-model"\nenable_thinking = false\n',
+        encoding="utf-8",
+    )
+
+    seen: dict[str, object] = {}
+
+    def fake_export(config, key, *, on_progress=print):
+        return daily.export_mod.ExportStats(per_group=[(1, "群", 0)])
+
+    def fake_refine(cfg, **kw):
+        seen["refine"] = kw
+        return daily.refine_mod.RefineStats()
+
+    def fake_digest(cfg, **kw):
+        seen["digest"] = kw
+        return daily.digest_mod.DigestStats()
+
+    monkeypatch.setattr(daily.export_mod, "export", fake_export)
+    monkeypatch.setattr(daily.refine_mod, "refine", fake_refine)
+    monkeypatch.setattr(daily.digest_mod, "digest", fake_digest)
+    monkeypatch.setattr(daily.digest_mod, "day_window", lambda day: (0, 1))
+
+    daily.run(
+        config=_FakeConfig(), key="k", llm_key="lk",
+        day="2026-09-16", on_progress=lambda _: None,
+    )
+
+    assert seen["refine"]["base_url"] == "https://my-host/v1/chat/completions"
+    assert seen["refine"]["model"] == "my-model"
+    assert seen["refine"]["enable_thinking"] is False
+    assert seen["digest"]["base_url"] == "https://my-host/v1/chat/completions"

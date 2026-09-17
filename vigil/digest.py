@@ -28,7 +28,14 @@ from pathlib import Path
 from . import prefilter, store
 from .categories import load_categories
 from .config import Config, REPO_ROOT
-from .llm import DEFAULT_MODEL, LLMConfig, LLMError, chat_json, sanitize_for_llm
+from .llm import (
+    DEFAULT_BASE,
+    DEFAULT_MODEL,
+    LLMConfig,
+    LLMError,
+    chat_json,
+    sanitize_for_llm,
+)
 from .redact import Redactor
 
 # 日报有自己的提示词版本，与 refine.PROMPT_VERSION 各记各的。
@@ -551,6 +558,7 @@ def digest(
     until: int,
     day_label: str,
     model: str = DEFAULT_MODEL,
+    base_url: str = DEFAULT_BASE,
     enable_thinking: bool | None = False,
     output_dir: Path | None = None,
     write_file: bool = True,
@@ -660,7 +668,7 @@ def digest(
         try:
             result = chat_json(
                 LLMConfig(
-                    api_key=api_key, model=model,
+                    api_key=api_key, model=model, base_url=base_url,
                     enable_thinking=enable_thinking, max_tokens=MAX_TOKENS,
                 ),
                 system=build_system_prompt(),

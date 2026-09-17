@@ -266,7 +266,7 @@ def cmd_refine(args) -> int:
     try:
         with lock.SingleInstance():
             from . import refine as refine_mod
-            from .config import load_llm_key
+            from .config import load_llm_key, load_llm_settings
 
             config = _load_config_only()
             db = _require_export_db(config)
@@ -278,6 +278,10 @@ def cmd_refine(args) -> int:
                     "  请在仓库根目录的 .env 里写入：SILICONFLOW_API_KEY=sk-...\n"
                     "  （--dry-run 不需要密钥）"
                 )
+
+            # ⚠️ 设置的**解析顺序**固定是：命令行 > config/llm.toml > 内置默认。
+            # 命令行优先是为了让排障能"先试一下别的端点"而不用改文件。
+            llm_settings = load_llm_settings(on_warn=logs.emit)
 
             try:
                 since_ts = reader._to_epoch(args.since)
@@ -299,9 +303,13 @@ def cmd_refine(args) -> int:
                     batch_size=args.batch,
                     context=args.context,
                     budget_tokens=args.budget,
-                    # --model 不给时是 None，而 None 会绕过 refine() 的默认值，所以这里兜底
-                    model=args.model or refine_mod.DEFAULT_MODEL,
-                    enable_thinking=args.think,
+                    # --model/--base-url 不给时是 None，而 None 会绕过 refine() 的默认值，
+                    # 所以这里按「命令行 > 文件 > 内置默认」兜底
+                    model=args.model or llm_settings.model,
+                    base_url=args.base_url or llm_settings.base_url,
+                    enable_thinking=(
+                        True if args.think else llm_settings.enable_thinking
+                    ),
                     prompt_ver=args.prompt_ver,
                     dry_run=args.dry_run,
                     on_progress=logs.emit,
@@ -374,7 +382,7 @@ def cmd_repass(args) -> int:
     取得判定**（勘误 E5），于是清单是**不完整**的——这件事需要人来看，
     不许报成功（M4 的教训：无人值守下退出码是唯一还活着的信号）。
     """
-    from .config import load_llm_key
+    from .config import load_llm_key, load_llm_settings
 
     config = _load_config_only()
     db = _require_export_db(config)
@@ -387,6 +395,10 @@ def cmd_repass(args) -> int:
         )
         return 1
 
+    # ⚠️ 设置的**解析顺序**固定是：命令行 > config/llm.toml > 内置默认。
+    # 命令行优先是为了让排障能"先试一下别的端点"而不用改文件。
+    llm_settings = load_llm_settings(on_warn=logs.emit)
+
     # ⚠️ **每次跑都落一份 audit**（诊断结论）：上一轮干跑没留 payload，174 条删除
     # 事后一条都复核不了。不可逆操作的事前可见（清单）与事后可复核（payload）
     # 是同一个需求的两半——不给 `--audit` 也照样写，只是路径带时间戳。
@@ -395,7 +407,8 @@ def cmd_repass(args) -> int:
         stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
         audit = str(REPO_ROOT / "data" / f"repass-audit-{stamp}.jsonl")
 
-    # --model 不给时是 None，而 None 会绕过 repass() 的默认值，所以这里兜底
+    # --model/--base-url 不给时是 None，而 None 会绕过 repass() 的默认值，
+    # 所以这里按「命令行 > 文件 > 内置默认」兜底
     common = dict(
         api_key=api_key,
         db_path=db,
@@ -403,8 +416,9 @@ def cmd_repass(args) -> int:
         context=args.context,
         budget_tokens=args.budget,
         subset=args.subset,
-        model=args.model or refine_mod.DEFAULT_MODEL,
-        enable_thinking=args.think,
+        model=args.model or llm_settings.model,
+        base_url=args.base_url or llm_settings.base_url,
+        enable_thinking=(True if args.think else llm_settings.enable_thinking),
         audit_path=audit,
         on_progress=logs.emit,
     )
@@ -520,7 +534,7 @@ def cmd_digest(args) -> int:
     try:
         with lock.SingleInstance():
             from . import digest as digest_mod
-            from .config import load_llm_key
+            from .config import load_llm_key, load_llm_settings
 
             config = _load_config_only()
             db = _require_export_db(config)
@@ -532,6 +546,10 @@ def cmd_digest(args) -> int:
                     "  请在仓库根目录的 .env 里写入：SILICONFLOW_API_KEY=sk-...\n"
                     "  （--dry-run 不需要密钥）"
                 )
+
+            # ⚠️ 设置的**解析顺序**固定是：命令行 > config/llm.toml > 内置默认。
+            # 命令行优先是为了让排障能"先试一下别的端点"而不用改文件。
+            llm_settings = load_llm_settings(on_warn=logs.emit)
 
             day = args.date or digest_mod.yesterday()
             try:
@@ -546,9 +564,11 @@ def cmd_digest(args) -> int:
                 since=since,
                 until=until,
                 day_label=day,
-                # --model 不给时是 None，而 None 会绕过 digest() 的默认值，所以这里兜底
-                model=args.model or digest_mod.DEFAULT_MODEL,
-                enable_thinking=args.think,
+                # --model/--base-url 不给时是 None，而 None 会绕过 digest() 的默认值，
+                # 所以这里按「命令行 > 文件 > 内置默认」兜底
+                model=args.model or llm_settings.model,
+                base_url=args.base_url or llm_settings.base_url,
+                enable_thinking=(True if args.think else llm_settings.enable_thinking),
                 write_file=not args.no_write,
                 dry_run=args.dry_run,
                 on_progress=logs.emit,
@@ -950,6 +970,9 @@ def main(argv: list[str] | None = None) -> int:
     p_refine.add_argument("--budget", type=int, help="token 预算上限")
     p_refine.add_argument("--model", default=None, help="覆盖默认模型")
     p_refine.add_argument(
+        "--base-url", default=None, help="覆盖 LLM 端点（默认读 config/llm.toml）"
+    )
+    p_refine.add_argument(
         "--think",
         action="store_true",
         help="打开模型的思考模式（默认关闭：实测 Qwen3.5-35B-A3B 开思考时"
@@ -988,6 +1011,9 @@ def main(argv: list[str] | None = None) -> int:
         "（默认 data/repass-audit-<时间戳>.jsonl）——不可逆操作要事后可复核",
     )
     p_repass.add_argument("--model", default=None, help="覆盖默认模型")
+    p_repass.add_argument(
+        "--base-url", default=None, help="覆盖 LLM 端点（默认读 config/llm.toml）"
+    )
     p_repass.add_argument("--think", action="store_true", help="打开模型思考模式")
     p_repass.set_defaults(func=cmd_repass)
 
@@ -1019,6 +1045,9 @@ def main(argv: list[str] | None = None) -> int:
     p_digest = sub.add_parser("digest", help="日报：把 items 合成一天一页 Markdown")
     p_digest.add_argument("--date", help="日报日期 YYYY-MM-DD（默认昨天）")
     p_digest.add_argument("--model", default=None, help="覆盖默认模型")
+    p_digest.add_argument(
+        "--base-url", default=None, help="覆盖 LLM 端点（默认读 config/llm.toml）"
+    )
     p_digest.add_argument(
         "--think",
         action="store_true",

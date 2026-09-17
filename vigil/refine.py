@@ -23,7 +23,14 @@ from . import prefilter, store
 from .categories import Category, prompt_block
 from .config import Config
 from .deadline import deadline_sane, deadline_supported, place_supported
-from .llm import DEFAULT_MODEL, LLMConfig, LLMError, chat_json, sanitize_for_llm
+from .llm import (
+    DEFAULT_BASE,
+    DEFAULT_MODEL,
+    LLMConfig,
+    LLMError,
+    chat_json,
+    sanitize_for_llm,
+)
 from .redact import Redactor
 from .store import PendingMessage
 
@@ -389,6 +396,7 @@ def refine(
     context: int = 2,
     budget_tokens: int | None = None,
     model: str = DEFAULT_MODEL,
+    base_url: str = DEFAULT_BASE,
     enable_thinking: bool | None = False,
     prompt_ver: str = PROMPT_VERSION,
     dry_run: bool = False,
@@ -521,7 +529,8 @@ def refine(
         system = build_system_prompt(cats)
         today = dt.date.today().isoformat()
         llm_cfg = LLMConfig(
-            api_key=api_key, model=model, enable_thinking=enable_thinking
+            api_key=api_key, model=model, base_url=base_url,
+            enable_thinking=enable_thinking,
         )
 
         for index, batch in enumerate(batches, start=1):

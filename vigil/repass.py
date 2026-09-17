@@ -52,7 +52,7 @@ from . import prefilter, store
 from .categories import load_categories
 from .config import Config
 from .deadline import deadline_sane, place_supported
-from .llm import DEFAULT_MODEL, LLMConfig, chat_json
+from .llm import DEFAULT_BASE, DEFAULT_MODEL, LLMConfig, chat_json
 from .redact import Redactor
 from .refine import _match_source, _to_item, build_system_prompt, build_user_prompt
 
@@ -589,6 +589,7 @@ def repass(
     context: int = 2,
     budget_tokens: int | None = None,
     model: str = DEFAULT_MODEL,
+    base_url: str = DEFAULT_BASE,
     enable_thinking: bool | None = False,
     apply: bool = False,
     subset: str | None = None,
@@ -646,7 +647,8 @@ def repass(
             return RepassPlan(), stats
 
         llm_cfg = LLMConfig(
-            api_key=api_key, model=model, enable_thinking=enable_thinking
+            api_key=api_key, model=model, base_url=base_url,
+            enable_thinking=enable_thinking,
         )
 
         verdicts: dict[int, int] = {}

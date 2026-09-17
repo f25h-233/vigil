@@ -26,6 +26,10 @@ from vigil import lock  # noqa: E402
 # 碰真实的 `data/`。
 from vigil import overrides  # noqa: E402
 
+# 同理安全：`vigil.config` 模块级只算路径常量（`REPO_ROOT` / `DEFAULT_*`），
+# 读文件全在函数里（`load_llm_settings` / `load_config` 都是被调用时才 open）。
+from vigil import config  # noqa: E402
+
 
 @pytest.fixture(autouse=True)
 def _isolate_overrides_path(tmp_path_factory, monkeypatch):
@@ -75,6 +79,39 @@ def _isolate_lock_path(tmp_path, monkeypatch):
     ——只在"恰好有实例在跑"时出现，最难查。
     """
     monkeypatch.setattr(lock, "LOCK_PATH", tmp_path / "vigil.lock")
+
+
+@pytest.fixture(autouse=True)
+def _isolate_llm_toml_path(tmp_path_factory, monkeypatch):
+    """把 LLM 端点配置的默认路径挪出仓库（M6 T3，勘误 E6）。
+
+    ⚠️ **不隔离的后果是"环境相关的绿"，不是"写脏仓库"**——与上两条夹具的
+    形态不同，值得单独说清楚：`load_llm_settings` 是**读**，不会写 `config/`。
+    真正的问题是**测试的行为取决于仓库里那份文件的当前内容**：
+
+      `cmd_refine` / `cmd_digest` / `cmd_repass` / `daily.run()` 都读它
+      （T3 之后），于是 `test_daily.py::test_stage_arguments_are_wired_from_
+      the_day_window` 与 `test_refine.py::test_cli_refine_model_falls_back_to_
+      default` 这两条**与 LLM 配置无关**的用例，会因为「有人在网页上换了
+      模型」而变红——**而那正是 M6 邀请用户做的事**。
+
+    ⚠️ **实测过**（2026-09-17，T3）：把 `config/llm.toml` 的 `model` 改成一个
+    别的值 ⇒ 上面两条**同时变红**（`2 failed, 636 passed`）；改回来 ⇒ 全绿。
+    它们今天绿**只是因为出厂文件恰好等于内置默认**——这叫假绿。
+
+    ⚠️ **指向一个不存在的路径**，不是 `tmp_path` 下的空文件：
+    `load_llm_settings` 对「文件不存在」返回内置默认（+ `on_warn`），
+    那正是这些用例期望的基线；而**空文件**会抛「缺少 [llm] 段」⇒ 全部变红。
+
+    ⚠️ 用 `mktemp` 而不是 `tmp_path`（理由与 `_isolate_overrides_path` 一字不差）：
+    有些用例把 `tmp_path` 当**产品目录**用并按**文件集合**断言
+    （`tests/test_digest.py` 就是 `sorted(p.name for p in tmp_path.iterdir())`）。
+
+    ⚠️ 用 autouse：漏掉一个测试文件，那个文件里的用例就退回"看仓库文件脸色"。
+    """
+    monkeypatch.setattr(
+        config, "DEFAULT_LLM_TOML", tmp_path_factory.mktemp("llm") / "llm.toml"
+    )
 
 
 @pytest.fixture
