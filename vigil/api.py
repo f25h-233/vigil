@@ -1194,6 +1194,79 @@ def create_app(config: Config) -> FastAPI:
         save_persons(people, path)
         return None
 
+    # ── 配置包：三份配置 ⇄ 单个 TOML（M6 T7 / spec §4.2 ①）──────────────
+
+    @app.get("/api/config/pack")
+    def api_export_pack() -> dict:
+        """把三份配置渲染成一个配置包文本（**不含密钥**）。"""
+        from . import configpack
+
+        cfg = current_config()
+        cats = load_categories(categories_path())
+        people = load_persons(persons_path())
+        ov = overrides.connect()
+        try:
+            aliases = overrides.kind_aliases(ov)
+        finally:
+            ov.close()
+        return {
+            "toml": configpack.build(
+                config=cfg, cats=cats, persons=people, aliases=aliases
+            ),
+            "schema": configpack.PACK_SCHEMA,
+        }
+
+    @app.post("/api/config/pack")
+    def api_import_pack(body: dict = Body(...)) -> dict:
+        """导入一个配置包。
+
+        ⚠️ 收的是 **JSON body 里的字符串**，不是 multipart 文件上传——
+        本项目依赖表只有 sqlcipher3，而 multipart 要 `python-multipart`。
+        为一处上传引一个依赖不划算，前端把文件读成文本再 POST 即可
+        （`FileReader.readAsText`，浏览器原生）。
+        """
+        from . import configpack
+
+        text = body.get("toml")
+        if not isinstance(text, str) or not text.strip():
+            raise HTTPException(status_code=400, detail="toml 字段必须是配置包文本")
+        apply_ = bool(body.get("apply", False))
+        keep_settings = bool(body.get("keep_settings", False))
+
+        try:
+            pack = configpack.parse(text, pathlib.Path("<上传的配置包>"))
+        except ConfigError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+
+        if not apply_:
+            return {
+                "applied": False,
+                "groups": len(pack.config.groups) if pack.config else 0,
+                "categories": len(pack.categories),
+                "persons": len(pack.persons),
+                "aliases": len(pack.aliases),
+            }
+
+        with write_lock:
+            report = configpack.import_pack(
+                pack,
+                keep_settings=keep_settings,
+                paths=configpack.Paths(
+                    groups=config_path(),
+                    categories=categories_path(),
+                    persons=persons_path(),
+                ),
+                on_progress=lambda _: None,
+            )
+        return {
+            "applied": True,
+            "groups": report.groups,
+            "categories": report.categories,
+            "persons": report.persons,
+            "aliases": report.aliases,
+            "settings_skipped": report.settings_skipped,
+        }
+
     # ── 群：清单走只读快照（M6 T4 / spec §1.6），增删改走 groups.toml ──────
 
     @app.get("/api/groups")

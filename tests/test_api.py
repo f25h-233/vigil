@@ -1446,6 +1446,17 @@ label = "生活"
 desc = "隔离用类目：生活"
 """
 
+# 这个隔离根里的人物名单（M6 T7）。⚠️ **它必须在夹具里先存在**：
+# `/api/config/pack` 的导出把三份配置合进一个包，而 `load_persons` 对
+# **不存在**的文件返回空名单 ⇒ 包里连 `[[persons]]` 段头都不会有，
+# 而那正是 `test_api_export_pack_returns_toml_text` 要断言的形状
+# （「文件不存在返回空名单」是 `load_persons` 刻意的语义，不是缺陷）。
+_PERSONS_TOML = """\
+[[persons]]
+uin = 100000001
+label = "某辅导员"
+"""
+
 
 def _seed_items_db(db: pathlib.Path) -> None:
     """造一个最小主库：两条条目（`academic` / `life`）+ 各自的源消息。
@@ -1535,6 +1546,9 @@ def _groups_root(tmp_path, monkeypatch, *, snapshot):
     (root / "config" / "categories.toml").write_text(
         _CATEGORIES_TOML, encoding="utf-8"
     )
+    # ⚠️ M6 T7 起再加一份 `persons.toml`：配置包的导出要它（见 `_PERSONS_TOML`），
+    # 它同时是导入的落点（`persons_path()` 与 `config_path()` 同一个根）。
+    (root / "config" / "persons.toml").write_text(_PERSONS_TOML, encoding="utf-8")
     # ⚠️ **FIX 3（Fix loop 3）：让「对账读的那份」与「端点写的那份」是同一个文件。**
     # 从前的夹具把 `categories.DEFAULT_CATEGORIES`（conftest 挪到的**另一个** tmp 根）
     # 与这里的 `config/categories.toml` 分成了**两个文件** ⇒
@@ -2658,3 +2672,65 @@ def test_a_hand_edit_of_the_endpoint_config_is_reconciled_on_the_next_read(clien
     assert c.get(f"/api/items/{item_id}").json()["kind"] == "life", (
         "手改之后没对账：合法的手工类目 life 被旧别名顶成了 life_v2"
     )
+
+
+# ── M6 T7：配置包端点 ───────────────────────────────────────────────
+
+
+def test_api_export_pack_returns_toml_text(client_factory):
+    body = client_factory().get("/api/config/pack").json()
+    assert "[[categories]]" in body["toml"]
+    assert "[[persons]]" in body["toml"]
+
+
+def test_api_import_pack_rejects_a_bad_document(client_factory):
+    c = client_factory()
+    r = c.post("/api/config/pack", json={"toml": "[settings\n", "apply": True})
+    assert r.status_code == 400
+
+
+def test_api_import_pack_applies(client_factory):
+    c = client_factory()
+    text = c.get("/api/config/pack").json()["toml"]
+    r = c.post("/api/config/pack", json={"toml": text, "apply": True})
+    assert r.status_code == 200
+    assert r.json()["categories"] >= 1
+
+
+def test_api_import_pack_returns_400_not_500_for_a_shape_error(client_factory, tmp_path):
+    """⭐ C6 在**端点层**的形态：形状错的**外部**包必须是 400，不是 500。
+
+    ⚠️ 这正是 C6（T2 的 deferred）挡着 T7 的理由：`configpack.parse` 消费
+    `validate_config_raw`，而它接的是**用户拷来拷去的文件**。修前
+    `groups = [1, 2]` 抛 `AttributeError` ⇒ FastAPI 兜成 **500**——排障方向
+    完全错（去查服务端，而真相是包写错了）。
+
+    ⚠️ `groups = [1, 2]` 写在 `[settings]` **之前**，且 `qq_db_dir` 指向一个
+    **真实存在**的目录：`validate_config_raw` 先查 `[settings]`（含 `.is_dir()`）
+    再进群循环——不这么写，这个包会死在「QQ 数据库目录不存在」那条更早的分支上，
+    C6 的守卫**根本不在执行路径上**（勘误 E7 的形态 5）。
+
+    ⚠️ `raise_server_exceptions=False` 是**承重的**：默认 True 时那个异常会在
+    测试里重新抛出，「响应到底是不是 400」根本断言不到——那是一条
+    "看起来在守、实际只能证明它抛了"的空守卫（T4 的 FIX 里记过这一条）。
+
+    ⚠️ 变异反证：把 `config.validate_config_raw` 里那句 `isinstance(entry, dict)`
+    删掉 ⇒ 本条**必红**（500 + `AttributeError`）。
+    """
+    c = client_factory(raise_server_exceptions=False)
+    broken = (
+        "schema = 1\n"
+        "groups = [1, 2]\n"
+        "\n"
+        "[settings]\n"
+        f'qq_db_dir = "{tmp_path.as_posix()}"\n'
+        f'output_db = "{(tmp_path / "vigil.db").as_posix()}"\n'
+        "\n"
+        "[[categories]]\n"
+        'slug = "notice"\n'
+        'label = "通知"\n'
+        'desc = "正式通知"\n'
+    )
+    r = c.post("/api/config/pack", json={"toml": broken, "apply": True})
+    assert r.status_code == 400, r.text
+    assert "键值表" in r.json()["detail"]

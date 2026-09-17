@@ -8,17 +8,29 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import pathlib
 import sqlite3
 import sys
 
+from . import categories as categories_mod
+from . import config as config_mod
 from . import export as export_mod
 from . import groups_snapshot
 from . import lock, logs
+from . import overrides
 from . import qqdb, reader
 from . import refine as refine_mod
 from . import repass as repass_mod
 from . import store
-from .config import REPO_ROOT, ConfigError, load_config, load_key, load_llm_key
+from .categories import load_categories
+from .config import (
+    REPO_ROOT,
+    ConfigError,
+    load_config,
+    load_key,
+    load_llm_key,
+    load_persons,
+)
 
 
 def _load_config_only():
@@ -967,6 +979,118 @@ def cmd_serve(args) -> int:
     return 0
 
 
+def _config_pack_paths() -> "configpack.Paths":
+    """配置包的三个落点。**每次现读模块属性**，不在 import 期冻住。
+
+    ⚠️ 三个名字各有一个具体的坏法（都与 `api.persons_path()` 那条判据同族）：
+      · `config.DEFAULT_PERSONS` —— 若在这里写成 `from .config import
+        DEFAULT_PERSONS`，它在 import 期就绑死了，测试里
+        `monkeypatch.setattr(config, "DEFAULT_PERSONS", ...)` 够不着
+        ⇒ `vigil config import` 会**整体覆盖真实的 `config/persons.toml`**
+        （用户的真实名单，不在 `data/` 里、没有备份），而测试全绿。
+      · `categories.DEFAULT_CATEGORIES` —— 同族，`tests/conftest.py` 的
+        autouse 夹具正是靠 `setattr` 挪它的。
+      · `REPO_ROOT` —— 它是**本模块**的一个全局名字（import 期绑定），
+        测试挪它要 `monkeypatch.setattr(cli, "REPO_ROOT", ...)`；这里照旧读它。
+    """
+    from . import configpack
+
+    return configpack.Paths(
+        groups=REPO_ROOT / "config" / "groups.toml",
+        categories=categories_mod.DEFAULT_CATEGORIES,
+        persons=config_mod.DEFAULT_PERSONS,
+    )
+
+
+def _read_kind_aliases() -> dict[str, str]:
+    """读 slug 改名表。**库文件不在 ⇒ 空表**；表不在/读不出来 ⇒ 补表或响亮。
+
+    ⚠️ 三种形状都**实测过**（M6 T7 冒烟，真机上踩到的是第二种）：
+      · **库文件不在** ⇒ 返回空表。与 `overrides.attach_readonly` 同一条判据：
+        库不存在时「没有任何干预」是一个**确定的语义**，不是猜测。
+      · **文件在、表不在** —— ⚠️ 真机上就是这个形状：`data/overrides.db` 是 M5
+        建的，里面只有 `item_edits` / `item_state`，而 `kind_alias` 是 T5 新增的、
+        要等某次 `ensure_schema()` 跑过才在。直接 `SELECT … FROM kind_alias`
+        会抛 `no such table`，**而 `vigil config export` 的本职与 overlay 毫无关系**
+        ⇒ 一条只读导出命令以裸 traceback 收场（冒烟实测）。
+        ⇒ 补一句幂等的 `ensure_schema()`（`attach_readonly` 建库那一支做的正是
+        同一件事：overlay 本来就在可写范围内，D11 管的是 `data/vigil.db`）。
+      · **其他 sqlite 故障一律不吞**（库坏了 / 盘满了）：`ensure_schema` 或 SELECT
+        照实抛。**绝不降级成空表**——那会导出一个**缺了改名映射**的包，
+        而导入方的条目会全部悬空（spec §4.2 ④），是一句"导出成功了"的假话。
+        （与 `attach_readonly` 的立场一致：文件**存在**时挂不上就报错，不降级。）
+    """
+    target = overrides.OVERRIDES_DB
+    if not target.is_file():
+        return {}
+    overrides.ensure_schema(target)
+    conn = overrides.connect(target)
+    try:
+        return overrides.kind_aliases(conn)
+    finally:
+        conn.close()
+
+
+def cmd_config_export(args) -> int:
+    """导出一个自包含的配置包（**不含密钥**，spec §4.2 ①）。"""
+    from . import configpack
+
+    config = _load_config_only()
+    cats = load_categories()
+    persons = load_persons()
+    aliases = _read_kind_aliases()
+
+    out = pathlib.Path(args.out) if args.out else (
+        config.output_db.parent / f"vigil-config-{dt.date.today().isoformat()}.toml"
+    )
+    configpack.write_pack(out, config=config, cats=cats, persons=persons, aliases=aliases)
+    logs.emit(f"已导出配置包：{out}")
+    logs.emit(
+        f"  群 {len(config.groups)} / 类目 {len(cats)}"
+        f" / 人物 {len(persons)} / 改名 {len(aliases)}"
+    )
+    logs.emit("  ⛔ 不含密钥，不含人工干预数据")
+    return 0
+
+
+def cmd_config_import(args) -> int:
+    """导入配置包。⚠️ 默认**真的写**（`--dry-run` 只校验）。"""
+    from . import configpack
+
+    path = pathlib.Path(args.file)
+    if not path.is_file():
+        sys.exit(f"[参数错误] 找不到配置包：{path}")
+
+    # ⚠️ 解码失败也要给一行可读的报错：选错文件（一份 .docx、一张图）是个
+    # 极常见的操作，而 `read_text` 抛的 `UnicodeDecodeError` 继承自 **ValueError**，
+    # 它既不进下面的 `except ConfigError`，用户看到的就是裸 traceback
+    # ——与 `load_config` 把 `TOMLDecodeError` 包成 `ConfigError` 是同一条理由。
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        sys.exit(f"[参数错误] 读不了 {path}：{exc}")
+
+    try:
+        pack = configpack.parse(text, path)
+    except ConfigError as exc:
+        sys.exit(f"[配置错误] {exc}")
+
+    if args.dry_run:
+        logs.emit(
+            f"[dry-run] 包校验通过：群 {len(pack.config.groups) if pack.config else 0} / "
+            f"类目 {len(pack.categories)} / 人物 {len(pack.persons)} / 改名 {len(pack.aliases)}"
+        )
+        return 0
+
+    report = configpack.import_pack(
+        pack,
+        keep_settings=args.keep_settings,
+        paths=_config_pack_paths(),
+        on_progress=logs.emit,
+    )
+    return 0 if (report.groups or report.categories) else 1
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="vigil", description="VIGIL 守夜人")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -1105,6 +1229,24 @@ def main(argv: list[str] | None = None) -> int:
     )
     p_daily.add_argument("--date", help="日报日期 YYYY-MM-DD（默认昨天）")
     p_daily.set_defaults(func=cmd_daily)
+
+    p_cfg = sub.add_parser("config", help="配置包：导入 / 导出")
+    cfg_sub = p_cfg.add_subparsers(dest="config_action", required=True)
+
+    p_cfg_x = cfg_sub.add_parser("export", help="把三份配置导出成一个 TOML 包")
+    p_cfg_x.add_argument(
+        "--out", default=None, help="输出路径（默认 data/vigil-config-<日期>.toml）"
+    )
+    p_cfg_x.set_defaults(func=cmd_config_export)
+
+    p_cfg_i = cfg_sub.add_parser("import", help="从 TOML 包导入配置")
+    p_cfg_i.add_argument("file", help="配置包路径")
+    p_cfg_i.add_argument(
+        "--keep-settings", action="store_true",
+        help="保留本机的 qq_db_dir / output_db（导入别人的包时几乎总要加）",
+    )
+    p_cfg_i.add_argument("--dry-run", action="store_true", help="只校验，不写")
+    p_cfg_i.set_defaults(func=cmd_config_import)
 
     args = parser.parse_args(argv)
     return args.func(args)

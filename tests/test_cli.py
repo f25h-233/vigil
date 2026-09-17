@@ -1410,3 +1410,198 @@ def test_groups_survives_a_snapshot_failure_that_is_not_an_oserror(
     assert "[警告] 群清单快照写不出去" in captured.err, (
         "失败必须说出来——静默降级等于把「快照没写成」藏起来"
     )
+
+
+# ── M6 T7：`vigil config export / import` ───────────────────────────
+
+
+@pytest.fixture
+def pack_env(monkeypatch, tmp_path):
+    """把 `vigil config export/import` 的三个落点全挪进 tmp 根。
+
+    ⚠️ **三个都要挪，一个都不能省**（`cmd_config_import` 会**写**它们）：
+      · `cli.REPO_ROOT` —— groups.toml 的落点（`cli.py` 里是 import 期绑定的名字）；
+      · `categories.DEFAULT_CATEGORIES` —— `conftest.py` 的 autouse 夹具已经挪过，
+        这里**显式再挪一次**是为了不依赖"另一个文件里的夹具恰好还在"；
+      · `config.DEFAULT_PERSONS` —— ⛔ 不做这一步，`config import` 会**整体覆盖
+        真实的 `config/persons.toml`**（用户真实名单，`data/` 之外，没有备份）。
+        `load_persons()` / `save_persons(x, path)` 都是**调用时**查这个模块全局，
+        所以 `monkeypatch.setattr(config, "DEFAULT_PERSONS", ...)` 够得着。
+    """
+    from vigil import categories as cats_mod, config as config_mod
+
+    root = tmp_path / "repo"
+    (root / "config").mkdir(parents=True)
+    (root / "data").mkdir()
+    qq = tmp_path / "qq"
+    qq.mkdir()
+    cats = root / "config" / "categories.toml"
+    cats.write_text(
+        '[[categories]]\nslug = "notice"\nlabel = "通知"\ndesc = "正式通知"\n',
+        encoding="utf-8",
+    )
+    persons = root / "config" / "persons.toml"
+    monkeypatch.setattr(cli, "REPO_ROOT", root)
+    monkeypatch.setattr(cats_mod, "DEFAULT_CATEGORIES", cats)
+    monkeypatch.setattr(config_mod, "DEFAULT_PERSONS", persons)
+    cfg = config_mod.Config(
+        qq_db_dir=qq,
+        output_db=root / "data" / "vigil.db",
+        groups=(config_mod.Group(id=111, name="甲群"),),
+    )
+    monkeypatch.setattr(cli, "_load_config_only", lambda: cfg)
+    return root
+
+
+def _pack_with(cats, persons=(), aliases=()):
+    """用 `pack_env` 那份本机配置渲一个包文本（导出侧的另一半：手写一个包）。"""
+    from vigil import configpack
+
+    return configpack.build(
+        config=cli._load_config_only(),
+        cats=cats,
+        persons=persons,
+        aliases=aliases,
+    )
+
+
+def test_config_export_writes_a_pack_that_parses(pack_env):
+    """⭐ 导出的是一个**能被自己读回来**的包（三份配置 + 别名）。
+
+    ⚠️ 断言「读回来」，不是「文件存在」：`export` 走的是 `write_pack` →
+    `build` → `atomic_write_text`，只断言存在的话，**把 `build` 换成空串也全绿**。
+    """
+    import pathlib
+
+    from vigil import configpack
+
+    out = pack_env / "pack.toml"
+    assert cli.main(["config", "export", "--out", str(out)]) == 0
+
+    pack = configpack.parse(out.read_text(encoding="utf-8"), pathlib.Path("pack.toml"))
+    assert [g.id for g in pack.config.groups] == [111]
+    assert [c.slug for c in pack.categories] == ["notice"]
+    assert pack.aliases == ()
+
+
+def test_config_export_defaults_the_output_next_to_the_db(pack_env):
+    """不给 `--out` 时落在 `output_db.parent` 下（数据目录，不污染仓库）。"""
+    import datetime as dt
+    import pathlib
+
+    assert cli.main(["config", "export"]) == 0
+    expect = pack_env / "data" / f"vigil-config-{dt.date.today().isoformat()}.toml"
+    assert pathlib.Path(expect).is_file()
+
+
+def test_config_import_dry_run_writes_nothing(pack_env):
+    """`--dry-run` 只校验，一个文件都不许动（与 `repass` 的默认态同一条判据）。
+
+    ⚠️ 判据是**内容没变**，不是「文件不存在」：`pack_env` 里那份
+    `categories.toml` 本来就存在，而 `--dry-run` 的坏法恰恰是**整体覆盖**它。
+    """
+    from vigil import configpack
+
+    src = pack_env / "pack.toml"
+    src.write_text(
+        _pack_with((configpack.Category(slug="life", label="生活", desc="生活"),)),
+        encoding="utf-8",
+    )
+    before = (pack_env / "config" / "categories.toml").read_text(encoding="utf-8")
+
+    assert cli.main(["config", "import", str(src), "--dry-run"]) == 0
+    assert (pack_env / "config" / "categories.toml").read_text(encoding="utf-8") == before
+    assert not (pack_env / "config" / "persons.toml").exists()
+
+
+def test_config_import_writes_the_pack(pack_env):
+    """真的导入：类目 / 人物都落到 `pack_env` 那个根上（不经 `--out` 那条路）。"""
+    from vigil import categories as cats_mod
+    from vigil import config as config_mod
+    from vigil import configpack
+
+    src = pack_env / "pack.toml"
+    src.write_text(
+        _pack_with(
+            (configpack.Category(slug="life", label="生活", desc="生活"),),
+            persons=(config_mod.Person(uin=5, label="甲"),),
+        ),
+        encoding="utf-8",
+    )
+    assert cli.main(["config", "import", str(src)]) == 0
+
+    assert [c.slug for c in cats_mod.load_categories(cats_mod.DEFAULT_CATEGORIES)] == ["life"]
+    assert [p.uin for p in config_mod.load_persons(config_mod.DEFAULT_PERSONS)] == [5]
+
+
+def test_config_import_refuses_a_broken_pack_without_touching_anything(pack_env):
+    """⭐ CLI 侧的「全有或全无」：包里群号形状不对 ⇒ 退出码非零、**一个文件都不写**。"""
+    src = pack_env / "pack.toml"
+    src.write_text(
+        "schema = 1\n"
+        "groups = [111, 222]\n"
+        "\n"
+        "[settings]\n"
+        f'qq_db_dir = "{(pack_env / "qq").as_posix()}"\n'
+        f'output_db = "{(pack_env / "data" / "vigil.db").as_posix()}"\n'
+        "\n"
+        "[[categories]]\n"
+        'slug = "life"\n'
+        'label = "生活"\n'
+        'desc = "生活"\n',
+        encoding="utf-8",
+    )
+    before = (pack_env / "config" / "categories.toml").read_text(encoding="utf-8")
+
+    # ⚠️ 判据写 `!= 0` 而不是 `== 1`：`cmd_config_import` 的报错走
+    # `sys.exit("...")`（字符串退出码），`_exit_code_of` 会把它原样返回。
+    assert _exit_code_of(["config", "import", str(src)]) != 0
+    assert (pack_env / "config" / "categories.toml").read_text(encoding="utf-8") == before
+    assert not (pack_env / "config" / "persons.toml").exists()
+
+
+def test_config_export_survives_an_overlay_db_that_predates_the_alias_table(
+    pack_env, monkeypatch
+):
+    """⭐ 冒烟实测的形状：`data/overrides.db` **在**、但 `kind_alias` 表**不在**。
+
+    ⚠️ 真机上就是这个形状（2026-09-18 冒烟，修前）：
+    `data/overrides.db` 是 M5 建的，里面只有 `item_edits` / `item_state`，
+    而 `kind_alias` 是 T5 新增的表，要等某次 `overrides.ensure_schema()` 跑过才在。
+    于是一条**只读**的 `vigil config export` 以 `no such table: kind_alias`
+    的裸 traceback 收场——而它的本职与 overlay 毫无关系。
+
+    ⚠️ 判据两条一起，缺一条就是空守卫：
+      · **读到的是空表**（库里确实一条别名都没有 ⇒ 不是靠"抛了但被吞"蒙混）；
+      · **补完之后表是齐的**（`ensure_schema` 幂等地把新表建起来），
+        否则下一次调用还会踩同一颗雷。
+
+    ⚠️ 变异反证：把 `_read_kind_aliases` 里的 `overrides.ensure_schema(target)`
+    删掉 ⇒ 本条**必红**（`no such table: kind_alias`）。
+    """
+    import sqlite3
+
+    from vigil import overrides
+
+    # 造一个 M5 形状的 overlay 库：**先按真实 DDL 建齐、再把 T5 新增的两张表删掉**。
+    # ⚠️ 不手抄那两张老表的列定义——抄一份会与 `_TABLES_DDL` 漂移，
+    # 而漂移的方向恰好是「测试里的旧库 ≠ 真的旧库」（手抄版第一稿就是
+    # `item_edits (edit_id INTEGER PRIMARY KEY)`，缺了 `item_id`，
+    # 于是 `ensure_tables` 死在 `CREATE INDEX … ON item_edits(item_id)` 上
+    # ——那是一次**假红**：红的是我抄错了表，不是被测的那件事）。
+    vintage = pack_env / "data" / "overrides.db"
+    overrides.ensure_schema(vintage)
+    conn = sqlite3.connect(str(vintage))
+    conn.executescript("DROP TABLE config_snapshots; DROP TABLE kind_alias;")
+    conn.commit()
+    tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    conn.close()
+    assert tables == {"item_edits", "item_state"}, f"M5 形状没造对：{sorted(tables)}"
+    monkeypatch.setattr(overrides, "OVERRIDES_DB", vintage)
+
+    assert cli._read_kind_aliases() == {}, "库里没有别名 ⇒ 空表，不是异常"
+
+    conn = sqlite3.connect(str(vintage))
+    tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    conn.close()
+    assert "kind_alias" in tables, "补表没生效——下一次导出还会踩同一颗雷"
