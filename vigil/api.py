@@ -76,7 +76,7 @@ def _clip_error(text: str, limit: int = _ERROR_CLIP) -> str:
     return text if len(text) <= limit else text[: limit - 1] + "…"
 
 
-def _batch_problem(plan: reorder.ReorderPlan, stats: reorder.ReorderStats) -> str:
+def _batch_problem(stats: reorder.ReorderStats) -> str:
     """收尾文案里「有几批没取得判定」那半句；**没有失败时是空串**。
 
     ⚠️⭐ 冒烟 Bug A-2：`work()` 从前把 `stats` 收下就**再也没读过**——
@@ -86,9 +86,17 @@ def _batch_problem(plan: reorder.ReorderPlan, stats: reorder.ReorderStats) -> st
     （`[reorder]第 142 批失败: 重试 3 次仍失败: …`）只在跑的过程中一闪而过，
     用户唯一读到的那句话把它盖掉了。
 
-    ⚠️ 失败批次数**单独说**，不从 `plan.unjudged` 推：两者可以不等——失败那批
+    ⚠️ 失败批次数**单独说**，不从 `unjudged` 推：两者可以不等——失败那批
     的条目可能已经全被用户软删掉（`unjudged` 是 0，而确确实实有 N 批没跑成）。
     合成一个数就会在那种边界上再产出一句假话。
+
+    ⚠️⭐ **所以这个函数拿不到 `plan`**（终审 re-review 的 Minor：从前有一个
+    `plan: ReorderPlan` 参数，**从头到尾没被读过**）。删而不是留：留着的死参数
+    是**诱饵**——下一个想把这半句写得更"全"的人会顺手去读 `plan.unjudged`，
+    而上面那条推论正是"两者可以不等"。签名里没有它，这条不变量就是**结构性的**，
+    不靠注释拦人。（判据：没有单测钉这个签名，删除本身不会有任何红——它挡的
+    是未来那种"多读一个数、多说一句假话"的改动，那种改动由
+    `test_api_reorder_summary_admits_a_failed_batch` 那几条文案用例罩着。）
     """
     if not stats.failed_batches:
         return ""
@@ -344,7 +352,7 @@ def create_app(config: Config) -> FastAPI:
                 # 有批次失败了"——503 那半句照报（`_batch_problem`）。
                 # ⚠️ 这里**不报** `plan.unjudged`：取消是用户自己按的，没跑到的
                 # 批次在他预期之内；而失败不在预期之内，所以只有它必须说出来。
-                return "已取消（一条都没改）" + _batch_problem(plan, stats)
+                return "已取消（一条都没改）" + _batch_problem(stats)
             ov = overrides.connect()
             try:
                 n = reorder.apply_reorder(ov, plan, actor=actor)
@@ -357,7 +365,7 @@ def create_app(config: Config) -> FastAPI:
             #      是"收了不读"，于是用户对"有几批没判成"没有任何办法。
             return (
                 f"{n} 条改了类目，{len(plan.unjudged)} 条没判成（它们没被动）"
-                + _batch_problem(plan, stats)
+                + _batch_problem(stats)
             )
 
         try:

@@ -2406,6 +2406,61 @@ def test_api_reorder_never_says_zero_unjudged_when_every_batch_failed(
     assert msg.endswith("…"), f"截断了却没有留下「…」——读的人会以为那就是完整报错：{msg!r}"
 
 
+@pytest.fixture
+def no_batch_at_all(client_factory, monkeypatch):
+    """**一条含源消息的上下文批次都拼不出来**的前置（终审 re-review 的 Important）。
+
+    与 `tests/test_reorder.py::test_no_batch_at_all_leaves_every_item_unjudged`
+    同一个手法：把三条源消息的正文改成「收到」——预筛的 `BARE_ACK` **硬丢弃**
+    它（丢弃规则先于保留规则）⇒ 一条候选都没有 ⇒ `expand_context` 为空 ⇒ 0 批。
+    ⚠️ 只改这一件事就够：`items` / `item_sources` 一行都不动 ⇒ 三个条目仍在 scope。
+    ⚠️ 改的是**夹具自己那个 tmp 主库**（`client_factory.db_path`），不是真库。
+
+    ⚠️ `chat_json` 换成**必炸**的替身：真发出批次 = 前置蒸发了，必须响亮地红，
+    而不是拿着假 key 发一次真实网络请求（Global Constraint 9）。
+    """
+    from vigil import api as _api
+    from vigil import reorder as _reorder
+
+    conn = sqlite3.connect(str(client_factory.db_path))
+    try:
+        conn.execute("UPDATE messages SET content = '收到'")
+        conn.commit()
+    finally:
+        conn.close()
+
+    def boom(cfg, *, system, user, **kw):  # noqa: ANN001, ANN003
+        raise AssertionError("chat_json 不该被调用——「0 批」这个前置蒸发了")
+
+    monkeypatch.setattr(_reorder, "chat_json", boom)
+    monkeypatch.setattr(_api, "load_llm_key", lambda *a, **k: "k-llm")
+
+
+def test_api_reorder_says_every_item_is_unjudged_when_no_batch_goes_out(
+    client_factory, no_batch_at_all
+):
+    """⭐⭐ **第三条早退路径**上，用户唯一读到的那句话要说实话（终审 re-review）。
+
+    「一条含源消息的上下文批次都没有」⇒ 一条判定都没取得 ⇒ 三个条目必须都被
+    说成「没判成」。修前这里是 `ReorderPlan()`（`unjudged` 是空集）⇒ 用户读到
+    **「0 条改了类目，0 条没判成（它们没被动）」**——事实是一条都没判过。
+
+    ⚠️ 断言用**整句相等**而不是子串：两个数都要对，而且**不许**长出
+    「N 批没有取得判定」那半句（`stats.failed_batches` 是 0——一批都没**发出去**，
+    不是"发出去了但失败"）。子串断言挡不住「前置蒸发 ⇒ 两批都失败 ⇒ 恰好也是
+    3 条没判成」那种错法。
+    """
+    c = client_factory()
+    job_id = c.post("/api/reorder").json()["job_id"]
+    body = _wait_for_job(c, job_id)
+
+    assert body["state"] == "done"
+    assert body["message"] == "0 条改了类目，3 条没判成（它们没被动）", (
+        f"「0 批」时收尾那句话不对：{body['message']!r}——"
+        "修前的「0 条没判成」正是这一格要挡掉的假话"
+    )
+
+
 def test_api_reorder_refuses_a_second_job_while_one_runs(client_factory, slow_llm):
     c = client_factory()
     assert c.post("/api/reorder").status_code == 202

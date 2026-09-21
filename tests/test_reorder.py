@@ -480,6 +480,52 @@ def test_budget_stop_leaves_the_untouched_batches_unjudged(db_with_items, fake_l
     assert plan.unjudged == (3,), "撞预算之后没跑的那批没被报成「没判成」"
 
 
+def test_no_batch_at_all_leaves_every_item_unjudged(db_with_items, monkeypatch):
+    """⭐⭐ **第三条早退路径**：一条「含源消息的上下文批次」都没有（`if not batches:`）。
+
+    ⚠️ 这一格是终审 re-review 点出来的：失败 / 取消 / 预算 / 整批返回空四条路径
+    都有用例，**独缺这一条**——把它改回 `ReorderPlan()` 时全量 **0 红**，
+    于是用户又会读到那句「**0 条没判成**」（而这几个条目一条都没判过）。
+
+    ⚠️⭐ 前置**真的上场**（格 8），不是替身喂出来的：把三条源消息的正文改成
+    「收到」——预筛的 `BARE_ACK` **硬丢弃**它（`_drop_reason` 的丢弃规则
+    **先于**保留规则，所以 tier=high 也留不住它）⇒ `screen` 一条候选都收不上来
+    ⇒ `expand_context` 为空 ⇒ `make_batches([])` 回 0 批。
+    ⚠️ 下面第一句**机械地**确认这件事：前置一旦蒸发（预筛的规则表改了），
+    它当场红，而不是让后面那条断言红在**与它无关**的原因上。
+
+    ⚠️ `chat_json` 换成**必炸**的替身：真拼出批次就说明前置蒸发了——那必须是
+    **响亮**的失败，而不是拿一个假 key 去发一次真实网络请求（Global Constraint 9）。
+
+    ⚠️ 变异反证：这一行改回 `ReorderPlan()` ⇒ 本条**必红**。
+    """
+    db_with_items.conn.execute("UPDATE messages SET content = '收到'")
+    db_with_items.conn.commit()
+
+    def boom(cfg, *, system, user, **kw):  # noqa: ANN001, ANN003
+        raise AssertionError("chat_json 不该被调用——「0 批」这个前置蒸发了")
+
+    monkeypatch.setattr(reorder, "chat_json", boom)
+
+    # 与 `plan_reorder` 调的是同一个函数、同一组默认值（默认值真被改了的话，
+    # 这条前置断言会先红，而不是让下面的断言红在一个无关的原因上）
+    batches, _ = reorder.context_batches(db_with_items.conn, config=db_with_items.config)
+    assert batches == [], (
+        "前置没上场：这批源消息仍然拼得出批次，下面那条断言与「0 批」这条早退路径无关"
+    )
+
+    plan, stats = reorder.plan_reorder(
+        db_with_items.conn, config=db_with_items.config, api_key="k",
+        on_progress=lambda _: None,
+    )
+    assert stats.sent_batches == 0, "真发出批次了——「0 批」这个前置蒸发了"
+    assert plan.changes == (), "「0 批」时一条改动都不许有"
+    assert plan.unjudged == (1, 2, 3), (
+        "一条批次都没有 = 一条判定都没取得，而条目 1/2/3 都还在库里 ⇒ 它们必须"
+        "全部被报成「没判成」；回空集的话收尾那句对用户说的是「0 条没判成」"
+    )
+
+
 def test_a_hallucinated_slug_never_reaches_the_plan(db_with_items, llm_returning_unknown_kind):
     """模型呕出一个类目表里没有的 slug ⇒ **不许进计划**。
 
