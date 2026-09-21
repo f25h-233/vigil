@@ -30,6 +30,18 @@ cd /d "%REPO%"
 uv run vigil daily
 set "RC=%ERRORLEVEL%"
 
+REM Backfill chain: only after a fully successful daily (rc 0). rc 2 means the
+REM lock is held by another instance and rc 1 means the pipeline itself failed
+REM -- backfilling on top of either would be wrong or pointless. The backfill
+REM fills digest windows that earlier missed runs never produced: Task
+REM Scheduler catches up only the LATEST missed trigger, so a multi-day
+REM shutdown silently loses the days in between (2026-09-19 was lost that
+REM way). See scripts\digest_backfill.py for the full story.
+if "%RC%"=="0" (
+  uv run python scripts\digest_backfill.py
+  if errorlevel 1 set "RC=1"
+)
+
 REM Exit code 2 is NOT a failure. It is the frozen meaning of "another instance
 REM already holds the lock, this run exited early" (plan section 3.4; the same
 REM table is in the ops setup doc). Treating it as a failure would write a

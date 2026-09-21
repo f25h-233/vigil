@@ -117,8 +117,8 @@ T6 refine 读墓碑｜T7 persons.toml｜T8 API 多值筛选 + 写端点｜T9 `vi
 ## 七、怎么跑 / 怎么重启
 
 ```bash
-cd D:/github/VIGIL && uv run vigil serve --host 127.0.0.1 --port 8787   # 后端 + 前端静态托管
-tailscale serve --bg 8787                                               # 手机 HTTPS 入口
+cd D:/github/VIGIL && uv run vigil serve --host 127.0.0.1 --port 8787   # ⚠️ 已有任务计划自启，别手工起（见下面 2026-09-21 侧记）
+tailscale serve --bg 8787                                               # 手机 HTTPS 入口（配置持久，通常不用重跑）
 
 uv run vigil daily          # 手动跑一次完整管线（任务计划跑的是 scripts/vigil-daily.cmd）
 uv run vigil downgrade      # 字段降级（默认 --fields deadline；**加 --apply 才写**）
@@ -132,6 +132,17 @@ cd web && npm run build     # ⚠️ 前端改完**必须构建**，serve 托管
 **⚠️ 任务计划的两个坑**：① `schtasks /change … /st` 会弹密码提示并挂死；
 用 `Set-ScheduledTask -Trigger` 且 **`StartBoundary` 必须设未来时间**。
 ② **含中文的 `.ps1` 必须 UTF-8 BOM**（无 BOM 时任务名被**静默**注册成乱码）。
+
+**⭐ 2026-09-21 侧记：网页服务自启/自愈 + 漏天补跑（动 serve 之前读一下）**
+- 新任务计划 **`VIGIL网页服务`**（登录时起）：`vigil-serve.cmd` → `serve_supervisor.py` → `uv run vigil serve`。
+  **别手工起 serve**（端口被占会 bind 10048）；**别用 `schtasks /end` 当重启**（实测会留孤儿占端口）。
+  重启姿势：`netstat -ano | findstr :8787` 拿 PID → `taskkill /F /PID` → 监督器约 1 分钟自动拉起（实测）。
+- 手机/浏览器 **502 的语义 = Tailscale 转发活着、后端没起**（当日真因）。监督器：崩溃 60 秒后重启、
+  连续 5 次放弃、单实例锁 `data/logs/vigil-serve.lock`（**别删**：删了单实例保护会失效）。
+  任务计划自带的 RestartOnFailure **实测不干活**，注册脚本已把它清掉。文档 §十一。
+- 漏天补跑 `scripts\digest_backfill.py`（daily 成功后补最近 7 天缺的日报）：上线首跑补出 **09-14、09-19** 两天
+  （任务计划补跑**只补最近一次错过的**）。文档 §十二。
+- 实测 **QQ 会回灌离线历史**：9/20 的 52 条在机器重开、QQ 跑起来后进库，该日空壳日报被重跑重成真日报。
 
 ---
 

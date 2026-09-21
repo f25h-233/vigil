@@ -173,7 +173,8 @@ Get-Content data/logs/vigil-*.log -Tail 40
 先看 `data/logs/LAST-ERROR.txt`：**第一行是失败摘要，后面附日志尾部**。
 再看 `data/logs/vigil-*.log` 的尾部。
 
-> ⚠️ **`LAST-ERROR.txt` 只由 `vigil daily` 维护**（开跑前删、失败时写，两处都在 `cmd_daily` 里）。
+> ⚠️ **`LAST-ERROR.txt` 由 `vigil daily` 这条链维护**（开跑前删、失败时写，两处都在 `cmd_daily` 里）；
+> 每天链尾的**漏天补跑**（`scripts\digest_backfill.py`，见 §十二）失败时也写——两者共享同一次运行的语义。
 > 所以**人工单跑** `vigil export` / `refine` / `digest` / `deadline-audit` 拿到非 0 时，
 > **不要去读它**：它要么没被更新、里面是**上一次 daily 留下的旧错误**，要么压根不存在。
 > 人工命令看 stdout 与退出码（`echo $?` / `%ERRORLEVEL%`）就够了——这是有意的取舍
@@ -229,6 +230,12 @@ schtasks /delete /tn "VIGIL每日管线" /f
 `LAST-ERROR.txt` 不参与轮转：它一次运行只可能被写一次，且下次运行开头就被删掉。
 手工清理也完全可以：`data/logs/` 里没有任何东西是别的模块依赖的。
 
+⚠️ 网页服务的两个文件（`vigil-serve.log`、`vigil-serve.lock`，见 §十一）**不在轮转范围**——
+轮转只认 `vigil-YYYY-MM-DD.log` 这个形状，而且是刻意的（理由见 `vigil/logs.py` 的 `prune_old_logs`）。
+`vigil-serve.log` 是常驻追加文件，正常时每天只多几行（只有启动/崩溃才有内容），体积增长极慢；
+真要清就直接删（服务不依赖它的历史）。`vigil-serve.lock` **不要删**：删掉后新监督器会建新的锁文件，
+而老的那个还握着已删除文件的锁 ⇒ 单实例保护失效。
+
 ---
 
 ## 十、两个设计选择（免得当成疏漏）
@@ -240,3 +247,104 @@ schtasks /delete /tn "VIGIL每日管线" /f
    中文注释在 GBK 机器上会变乱码字节，而 `echo` 到文件的内容会**带着真实字节**落盘，
    括号/管道符混在中文里还可能被解析成命令分隔符。所以人类可读的中文全部交给 Python 写，
    `.cmd` 里只留 ASCII。（实测：在 `chcp 936` 下跑同一个 `.cmd`，正文照样正确。）
+
+---
+
+## 十一、网页服务（手机入口）的自启
+
+**它是什么**：任务计划里的第二条任务，名字固定 **`VIGIL网页服务`**，触发方式是
+**你登录时**（不是 08:00）。链是：`scripts\vigil-serve.cmd` → `scripts\serve_supervisor.py`
+（监督器）→ `uv run vigil serve`（127.0.0.1:8787），挂在 Tailscale 的 `tailscale serve`
+转发后面——手机打开 `https://<tailnet>.ts.net` 看到的就是它。
+
+**为什么会有它（实测原话，2026-09-21）**：用户打开网页端看到 **HTTP 502**。
+502 来自 Tailscale 那层**还活着**的转发（所以他能打到它、它还回一个 HTTP 错误），
+它背后的 127.0.0.1:8787 上什么都没在听——`vigil serve` 在上次关机时停掉后就再没人起过。
+每日管线一直有任务计划照看，网页服务一直没有；这条补上的就是它。
+
+**安装（幂等，重跑即覆盖）**：
+
+```powershell
+cd D:\github\VIGIL
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/register-serve-task.ps1
+```
+
+预期输出 `[1/3] 注册任务` → `[2/3] 清点设置…`（回读任务定义，应看到
+`Logon Mode: Interactive only`、`Stop Task If Runs X Hours and X Mins: Disabled`）→
+`电源 / 不限时 / 引擎重启已清…，已确认` → `[3/3] 完成`。
+
+> ⚠️ 创建走 PowerShell cmdlet（`Register-ScheduledTask -AtLogOn -User <自己>`）而不是
+> `schtasks /create /sc ONLOGON`：**实测**后者在本机免提权下必然 `ERROR: Access is denied.`
+> （不带 `/ru` 时它建的是「任何用户登录」的机器级触发器，补 `/ru` 也一样）。cmdlet 建的是
+> 用户级任务，免提权可用，产出仍是 Task version 1.2（与每日管线同一引擎，无漂移）。
+
+**监督器（`scripts/serve_supervisor.py`）的行为**（全部实测过）：
+
+| 情形 | 行为 |
+|---|---|
+| serve 进程被杀/崩溃 | 记一行日志，**60 秒后重启**；实测约 40~70 秒服务回来 |
+| 端口被别的进程占着 | 同样等 60 秒重试（实测：孤儿占端口 → 60 秒后重试成功绑定） |
+| 连续 5 次崩溃（期间没有一次活过 5 分钟） | **放弃**，退出码 1，任务记为失败——反复崩溃是给人看的信号 |
+| 已有监督器在跑 | 靠 `data/logs/vigil-serve.lock`（Windows 字节范围锁，进程死亡**自动释放**）立刻退出 0 |
+
+> ⚠️ 任务定义里**没有** RestartOnFailure，这是实测后的决定：它不干活——杀掉进程后任务
+> 如实记了失败（结果 1），过了重启间隔的 2.5 倍时间也没有任何重启（旧引擎的重启只覆盖
+> 「任务起不来」，不覆盖「action 退出非零」）。注册脚本还会把旧定义里这个无效设置**清掉**：
+> 一个读起来像兜底、实际不兜底的设置比没有更糟。
+
+**手工操作**：
+
+```powershell
+schtasks /run /tn "VIGIL网页服务"                                  # 起（不等登录）
+
+# 重启的推荐姿势：杀掉 8787 的 PID，监督器约 1 分钟内自己拉起
+netstat -ano | findstr :8787                                       # 最后一列是 PID
+taskkill /F /PID <PID>
+
+# 验证
+curl.exe -s -o NUL -w "%{http_code}" http://127.0.0.1:8787/        # 期望 200
+```
+
+> ⚠️ **不要用 `schtasks /end` 当「重启」**：实测它可能杀不干净深层子进程
+> （cmd → uv → python → uv → serve 这条链），留下**孤儿 serve 占着 8787**——新监督器起不来
+> （端口冲突），而旧服务还活着，看起来"没坏"。真留下孤儿就按上面的姿势杀干净。
+> （登录/注销不受影响：注销时整个会话的进程都会收走。）
+
+> ℹ️ `tailscale serve --bg 8787` 的转发配置**由 tailscaled 持久保存**（实测跨过一次重启还在），
+> 登录自启里不需要重跑它；只有 Tailscale 重新登录/重装后才需要再执行一次
+> （首次执行会静默等证书 ~90 秒，属正常）。
+
+> ℹ️ 前提：`web/dist` 已构建（前端改完必须 `cd web && npm run build`，serve 托管的是 dist）。
+> 缺了不会静默：serve 会启动但页面显示一行"没构建"的提示。
+
+**日志**：`data/logs/vigil-serve.log`（常驻追加、不进轮转，见 §九）。
+
+---
+
+## 十二、漏天补跑（missing-day backfill）
+
+**为什么需要**（实测）：任务计划的补跑（`StartWhenAvailable`）**只补最近一次错过的触发**。
+机器连关几天再开，中间的窗口直接跳过——2026-09-19 的日报就是这么永久缺掉的
+（digests 表从 09-18 跳到 09-20），而它那天的 125 条消息一直躺在库里。
+**本机制上线后的首跑又抓到一个更早的洞：09-14**（M4 自动化上线前漏跑的一天）。
+
+**怎么工作**：`scripts\vigil-daily.cmd` 在 `vigil daily` 成功（rc=0）之后，接着跑
+`uv run python scripts\digest_backfill.py`：
+
+- 看**昨天往前 7 天**（`LOOKBACK_DAYS`；今天不做——窗口还没走完，归明天的 daily）；
+- 「缺」= `docs/digests/<日期>.md` 不存在 → 跑 `vigil digest --date <日期>` 补出来
+  （export/refine 刚在同一条链里跑过，数据已就位；空白日不调模型，约 0 成本）；
+- 幂等：已有日报的天永远跳过；补过的天再跑一遍什么都不会发生；
+- 前一个阶段 rc=2（锁被占）或 rc≠0（管线失败）时**不跑**补漏——那两种情形下补漏非错即空；
+- 补漏失败 → 任务退出码 1，且**写 `LAST-ERROR.txt`**（第一行写明是补漏失败）。
+
+**手工补某一天**：
+
+```powershell
+uv run vigil digest --date 2026-09-19   # 只补日报
+uv run vigil daily  --date 2026-09-19   # 连 export/refine 一起补（更全）
+```
+
+> ℹ️ 一个相关实测（2026-09-21）：**QQ 会把离线期间的历史回灌进本地库**——机器重开、QQ
+> 跑起来之后，9/20 的 52 条消息进了库；当天早些时候生成的"无消息"空壳日报，被下一次
+> 重跑该窗口的 `vigil daily`（窗口=昨天）重成了真日报。
