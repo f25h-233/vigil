@@ -650,7 +650,15 @@ function ReorderSection() {
         .fetchJob(job.job_id)
         .then((j) => {
           setJob(j)
-          if (j.state !== 'running') window.localStorage.removeItem(REORDER_JOB_KEY)
+          // ⚠️ **终态之后刻意不删键**（Fix loop 1 / M-3）：删了的话，"在配置页看着
+          // 它跑完"之后一刷新/切 tab，「撤销这次重排」这个入口就没了——而**撤正是
+          // 重排之后最可能想做的事**（出口判据 7 的界面路径因此有一个时间窗）。
+          // 键只在两个时刻消失：用户点了「撤销」、或点了「清除」。
+          //
+          // ⚠️ 保留的键**不会**让刷新后"恢复出一个不存在的 running job"：键里存的
+          // 只是一个 `job_id`，**界面上显示的 state 永远来自服务端那一次 GET**
+          // （不是键里的快照）。服务端重启或这个 job 被挤掉时 GET 会 404，
+          // 那一刻挂载路径才把键清掉（见上面那个 effect 的 `.catch`）。
         })
         .catch((e: unknown) => setErr(e instanceof Error ? e.message : String(e)))
     }, 1000)
@@ -708,11 +716,24 @@ function ReorderSection() {
           : '这一批没有可撤销的改动（可能已经撤过了，或它一条都没改）。',
       )
       setUndoable(false)
+      // 撤过之后键就可以放掉了：那一批已经没有可撤的东西（再点也只会得到同一句
+      // "没有可撤销的改动"），而**留着它反而会让刷新后看到一次已经撤掉的改动**。
+      window.localStorage.removeItem(REORDER_JOB_KEY)
     } catch (e: unknown) {
       // 409 = 它还在跑（先取消再撤销）；404 = job 早没了；500 = overlay 锁住。
       // 三句都是不同的话，`sendJSON` 已经把后端的 detail 抛上来了，原样显示。
       setErr(e instanceof Error ? e.message : String(e))
     }
+  }
+
+  function clear() {
+    // ⚠️ 终态之后的**出口**（Fix loop 1 / M-3）：不放这个按钮的话，用户每次刷新
+    // 都会看到上一次重排的遗迹，而那块面板已经没有任何可做的事了
+    // （撤销入口在撤过之后也消失了）。「清除」只收拾界面与那把键，一个字节都不写库。
+    setJob(null)
+    setMsg(null)
+    setErr(null)
+    window.localStorage.removeItem(REORDER_JOB_KEY)
   }
 
   return (
@@ -744,6 +765,14 @@ function ReorderSection() {
             className="rounded-lg bg-white/5 px-3 py-1.5 text-sm text-white/60"
           >
             ↶ 撤销这次重排
+          </button>
+        )}
+        {job !== null && job.state !== 'running' && (
+          <button
+            onClick={clear}
+            className="rounded-lg bg-white/5 px-3 py-1.5 text-sm text-white/40"
+          >
+            清除
           </button>
         )}
       </div>
