@@ -1,4 +1,4 @@
-import { render, screen, waitFor } from '@testing-library/react'
+import { render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { afterEach, expect, test, vi } from 'vitest'
 import App from '../App.tsx'
@@ -95,6 +95,11 @@ function installFetch(f: Fake) {
       if (url.startsWith('/api/groups')) {
         return ok(f.groups ?? { available: true, reason: '', generated_at: 0, groups: [] })
       }
+      if (url.startsWith('/api/categories') && method !== 'GET') {
+        // POST（新增）/ PUT（编辑）/ DELETE（删除）都走这一支：本文件里
+        // 这三条只需要一个成功的响应，**真正被断言的是发出去的 URL 与请求体**。
+        return ok({ slug: 'ok' }, 201)
+      }
       if (url.startsWith('/api/categories')) {
         return ok(f.categories ?? { categories: [], aliases: {} })
       }
@@ -106,9 +111,30 @@ function installFetch(f: Fake) {
   return { calls, release: () => release?.() }
 }
 
+// ⚠️ **`URL.createObjectURL` / `revokeObjectURL` 必须自己还**（Fix loop 2 / Minor-1）：
+// jsdom 没有实现这两个方法，而"下载"那条用例要把替身**直接赋在全局 `URL` 上**
+// ——`vi.restoreAllMocks()` 与 `vi.unstubAllGlobals()` **都管不着直接赋值**
+// （前者只还原 `vi.spyOn` 造的 mock，后者只还原 `stubGlobal` 造的）。
+// reviewer 实测：那条用例跑完之后它**仍然是一个 vitest mock**，
+// 而同一条用例里 `vi.spyOn` 出来的 `document.createElement` 已经还原成真的
+// ——**同一个 `afterEach` 里两件事的待遇不同**，只因为一处是 spy、一处是赋值。
+// 今天零红；将来会以"找不到元素 / 返回 undefined"的怪样现形（它是个 mock 函数，
+// 默认返回 `undefined`，而调用方拿到的是一个**看起来像 URL 的假值**）。
+//
+// ⚠️ 存下原值再写回（而不是 `delete`）：将来 jsdom 真实现了它们，这条也照原样还。
+const ORIG_URL_METHODS = {
+  createObjectURL: (URL as unknown as { createObjectURL?: unknown }).createObjectURL,
+  revokeObjectURL: (URL as unknown as { revokeObjectURL?: unknown }).revokeObjectURL,
+}
+
 afterEach(() => {
   vi.unstubAllGlobals()
   vi.restoreAllMocks()
+  const u = URL as unknown as Record<string, unknown>
+  for (const [name, orig] of Object.entries(ORIG_URL_METHODS)) {
+    if (orig === undefined) delete u[name]
+    else u[name] = orig
+  }
 })
 
 const AVAILABLE: GroupsResponse = {
@@ -499,6 +525,116 @@ test('「下载 .toml」必须造出 Blob 链接、挂对文件名、用完 revo
   expect(anchors[0].href).toContain('blob:')
   expect(clickSpy).toHaveBeenCalledTimes(1)
   expect(revokeUrl).toHaveBeenCalledTimes(1)
+})
+
+test('上一条不许把替身留在全局（URL.createObjectURL 必须被还原）', () => {
+  /**
+   * ⭐ Fix loop 2 / Minor-1 的**泄漏探测器**。
+   *
+   * ⚠️ 判据是 `vi.isMockFunction(URL.createObjectURL) === false`
+   * ——不用"它是不是 undefined"来判，因为那取决于 jsdom 版本有没有实现它；
+   * **"它是不是一个 mock"才是"上一条用例有没有把它留在全局"的直接判据**。
+   *
+   * ⚠️ 这条**依赖执行顺序**（vitest 在同一文件内按声明序串行跑），
+   * 而位置就是它的语义：**紧跟在唯一会挂替身的那条用例之后**。
+   * 变异反证：把 `afterEach` 里那段还原删掉（= 回到"直接赋值、没人还"的旧写法）
+   * ⇒ 本条**必红**（`expected true to be false`）。
+   *
+   * ⚠️⚠️ **它只在"整个文件一起跑"时才有牙**：用 `-t` 单跑它自己，
+   * 上一条（唯一会挂替身的那条）**根本没执行** ⇒ 它绿——
+   * **我第一遍的变异反证就是这么被骗过的**（一条"看起来守住了"的绿，
+   * 而它守的东西压根没上过场：E7 形态 3「变异不在执行路径上」的同族）。
+   * 全文件跑时那条红是实测的（见 T9 报告 Fix loop 2）。
+   */
+  expect(vi.isMockFunction(URL.createObjectURL)).toBe(false)
+  expect(vi.isMockFunction(URL.revokeObjectURL)).toBe(false)
+})
+
+// ── 类目：新增 / 编辑（D1 那两块 UI）───────────────────────────────────
+
+test('新增类目：填完提交必须调 POST /api/categories 并重取列表', async () => {
+  /**
+   * ⭐ Fix loop 2 / FIX 2：D1 补的那两块 UI（新增 / 编辑）**零覆盖**——
+   * reviewer 实测：把 `onClick={doAdd}` 换成 `() => {}`，40 条用例全绿。
+   * 上一轮只移掉了那颗**具体的雷**（D1 之前的那份备份），
+   * **埋雷的条件还在**：没有任何用例碰过 `addCategory` / `updateCategory`。
+   *
+   * ⚠️ 变异反证：`onClick={doAdd}` → `onClick={() => {}}` ⇒ 本条**必红**。
+   *
+   * ⚠️ 三条断言各管一件事：
+   *   ① 请求真的发出去了，且**请求体逐字**是那四个字段（字段名写错=静默丢字段）；
+   *   ② 列表**重取**了（`提交 ⇒ 重取` 是四节共用的那个模式，M5 的两个缺陷同形）；
+   *   ③ 界面说了话（不然用户不知道存没存上）。
+   *   只有 ① 的话，一个"存了但界面不更新"的实现照样绿。
+   */
+  const { calls } = installFetch({ categories: CATS })
+  render(<Settings />)
+
+  await openSection('类目')
+  await screen.findByText(/通知公告/)
+
+  const add = screen.getByRole('button', { name: '新增' }) as HTMLButtonElement
+  expect(add.disabled, '两个必填都空着，按钮该是点不动的').toBe(true)
+
+  await userEvent.type(screen.getByPlaceholderText('中文名'), 'T9冒烟类目')
+  await userEvent.type(screen.getByPlaceholderText('slug'), 't9smoke')
+  await userEvent.type(
+    screen.getByPlaceholderText('判据（会逐字进 LLM 提示词）'),
+    '临时类目',
+  )
+  await userEvent.click(add)
+
+  const post = calls.find((c) => c.method === 'POST' && c.url === '/api/categories')
+  expect(post, '一次 POST /api/categories 都没发').toBeTruthy()
+  expect(post?.body).toEqual({
+    slug: 't9smoke',
+    label: 'T9冒烟类目',
+    desc: '临时类目',
+    icon: '',
+  })
+  expect(
+    calls.filter((c) => c.method === 'GET' && c.url === '/api/categories').length,
+    '提交之后没有重取列表——用户看不到刚加的那个类目',
+  ).toBeGreaterThan(1)
+  expect(await screen.findByText(/已新增「T9冒烟类目」/)).toBeTruthy()
+})
+
+test('编辑类目：改判据提交必须调 PUT /api/categories/{slug}', async () => {
+  /**
+   * ⭐ Fix loop 2 / FIX 2 的另一半：`desc` 是**逐字进 LLM 提示词的判据**
+   * （`types.ts` 的 `CategoryDetail` 写着「编辑器必须能改它」）,
+   * 而这条路径此前一次都没被跑过。
+   *
+   * ⚠️ 变异反证：`onClick={() => doEdit(editing)}` → `onClick={() => {}}`
+   * ⇒ 本条**必红**。
+   *
+   * ⚠️ 查询必须**限定在编辑框里**（`within`）：编辑框与下面的「新增类目」
+   * 表单**共用同一批 placeholder**，不限定的话会撞"找到多个元素"
+   * ——一条与被测行为毫无关系的红。
+   */
+  const { calls } = installFetch({ categories: CATS })
+  render(<Settings />)
+
+  await openSection('类目')
+  await screen.findByText(/通知公告/)
+  await userEvent.click(screen.getAllByRole('button', { name: '编辑' })[0])
+
+  const box = screen.getByText(/编辑「notice」/).closest('div') as HTMLElement
+  const desc = within(box).getByPlaceholderText('判据（会逐字进 LLM 提示词）')
+  await userEvent.clear(desc)
+  await userEvent.type(desc, '改过的判据')
+  await userEvent.click(within(box).getByRole('button', { name: '保存' }))
+
+  const put = calls.find((c) => c.method === 'PUT')
+  expect(put, '一次 PUT 都没发').toBeTruthy()
+  expect(put?.url).toBe('/api/categories/notice')
+  expect(put?.body).toEqual({
+    slug: 'notice',
+    label: '通知公告',
+    desc: '改过的判据',
+    icon: '📋',
+  })
+  expect(await screen.findByText(/已保存「通知公告」/)).toBeTruthy()
 })
 
 // ── LLM ───────────────────────────────────────────────────────────────

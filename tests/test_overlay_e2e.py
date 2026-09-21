@@ -347,6 +347,17 @@ def data_root(tmp_path, monkeypatch):
         "enabled = true\n",
         encoding="utf-8",
     )
+    # ⚠️ T9 fix loop 2 起还要一份 `categories.toml`：`POST /api/config/pack`
+    # 的**导出**半边会 `load_categories(categories_path())`，而它在文件不存在时
+    # 是**响亮报错**的（`CategoryError` ⇒ `/api/config/pack` 500）。
+    # 这份表自带内容、不从仓库里抄：抄一份等于让测试取决于用户的类目配置。
+    (root / "config" / "categories.toml").write_text(
+        '[[categories]]\nslug = "notice"\nicon = "📋"\nlabel = "通知公告"\n'
+        'desc = "隔离用类目：通知公告"\n\n'
+        '[[categories]]\nslug = "life"\nicon = "🏠"\nlabel = "生活"\n'
+        'desc = "隔离用类目：生活"\n',
+        encoding="utf-8",
+    )
     monkeypatch.setattr(_api, "REPO_ROOT", root)
 
     # 一个真库文件 + 一条 item（带源消息）：让 `/api/items/1/kind` 真的走完
@@ -418,16 +429,29 @@ def _assert_no_new_files_under_data(data_root, before) -> None:
 def test_no_web_endpoint_creates_anything_at_all_under_data(data_root, client):
     """⭐ D11 的完整版本：Web 侧跑一遍写端点，`data/` 下**一个文件都不许多**。
 
-    ⚠️ **这句话原来写得比实际宽**（M6 T9 fix loop 1 / m4）：正文只跑了 5 条，
-    而 `PUT /api/llm`（T9 新增的、**唯一往 `data/` 之外**写的端点）不在里面。
-    ⇒ 现已补上它。剩下的写端点（`/api/categories*`、`/api/groups*`、
-    `/api/items/kinds`、`/api/bulk-undo`、`/api/reorder`、`/api/jobs/*`）
-    **仍然不在这张表里**——它们是**代表性子集**，不是字面上的"所有"：
-    这几条各自需要有效的请求体（类目 slug、job id…），
-    把它们都塞进来会让这条守卫变成"夹具练习"。它们各自的用例在
-    `tests/test_api.py`（含 D11 的主库指纹那条）与 `tests/test_overlay_e2e.py`
-    的其他用例里；**这里守的是"新增文件"这个维度**，而 `/api/llm` 是本批里
-    唯一一个"写的东西不在 `data/`"的端点，正是这个维度上最需要被罩住的一条。
+    ⚠️ **这句话原来写得比实际宽**（M6 T9 fix loop 1 / m4）：正文当时只跑了 5 条，
+    漏了 `PUT /api/llm` **和** `POST /api/config/pack`。两条现在都在表里。
+
+    ⚠️ **fix loop 2 修的是"理由"那一半**（reviewer 抓到的第二处假话）：
+    §m4 的原话称 `/api/llm` 是「**唯一一个**『写的东西不在 `data/`』的端点」
+    ——**紧邻上一句**就列着 `/api/categories*` 与 `/api/groups*`，
+    而它们写的是同一族 `config/*.toml`（`llm_path()` / `config_path()` /
+    `categories_path()` 是**同一个根**）。**「唯一」是假的。**
+
+    ⚠️ 而那句"省略理由"（"它们各自需要有效的请求体，塞进来会变成夹具练习"）
+    对 `POST /api/config/pack` **根本不成立**——reviewer 实测：往
+    `api_import_pack` 里塞一句写 `data/pack-audit.log`，**全量 820 条零红**
+    ⇒ **那个端点的 `data/` 足迹当时没有任何人守**。它不是"夹具练习"：
+    先 `GET /api/config/pack` 拿一个合法包、再原样 POST 回来就完了
+    （见下面正文），而且它是这张表里**破坏力最大**的一条（导入会重写
+    `config/*.toml` 与 overlay 的别名表）。
+
+    ⇒ 现表里 7 条。**仍然不在表里**的是 `/api/categories*`、`/api/groups*`、
+    `/api/items/kinds`、`/api/bulk-undo`、`/api/reorder`、`/api/jobs/*`
+    ——这几条**确实**各自需要有效的请求体（类目 slug、job id…），
+    把它们都塞进来会把守卫写成"夹具练习"。
+    ⚠️ **这是一句如实的话，不是挡箭牌**：它只覆盖列出来的那几条，
+    `/api/llm` 与 `POST /api/config/pack` 已经从这句话里拿掉了。
 
     ⚠️ 为什么不能只盯 `data/vigil.db` 的指纹（既有那条守卫做的事）：
     spec §8 白纸黑字说旧表述「挡不住『我可以写 `data/cache/` 啊』」，
@@ -453,6 +477,18 @@ def test_no_web_endpoint_creates_anything_at_all_under_data(data_root, client):
     r = client.put(
         "/api/llm",
         json={"base_url": "https://x/v1", "model": "m", "enable_thinking": None},
+    )
+    assert r.status_code == 200, r.text
+    # ⚠️ T9 fix loop 2：`POST /api/config/pack`（**导入**）也在表里了。
+    # 它写的是 `config/groups.toml` / `config/categories.toml` /
+    # `config/persons.toml` 与 overlay 的别名表——**一个字节都不该落在 `data/`**。
+    # ⚠️ 不需要造夹具：**先导出、再原样导回来**（`apply=True`）。
+    # 包里装的就是本机此刻的配置 ⇒ 走完整的写路径而内容不变，
+    # 而且这正是用户在网页上会做的事（导出 → 改几行 → 导入）。
+    pack = client.get("/api/config/pack").json()["toml"]
+    r = client.post(
+        "/api/config/pack",
+        json={"toml": pack, "apply": True, "keep_settings": True},
     )
     assert r.status_code == 200, r.text
 
