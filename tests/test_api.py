@@ -2384,15 +2384,18 @@ class _GatedLLM:
     ⚠️ 只卡第一次：第二次立刻返回，这样「取消之后第二批还发不发」是可数的
     （`calls`）——那正是 `should_stop` 那条接线的机械判据。
 
-    ⚠️ `tail_delay`（第 2 批起每次多睡一会儿）是给
-    `test_the_release_helper_drains_before_the_isolation_is_undone` 用的：
-    它把"放行之后、写 overlay 之前"的那段时间拉宽，好让那条判据**确定**地
-    落在"worker 还没写"的窗口里，而不是看调度器脸色。
+    ⚠️⚠️ **这里曾经有一个 `tail_delay`（第 2 批起多睡一会儿），fix loop 4 删掉了**
+    ——它的论证是**错的**（复审探针实测）：变异场景（`_drain_jobs` 不等待）下 worker
+    的第 2 次调用发生在 **monkeypatch 还原之后**，那时 `reorder.chat_json` 已被还原成
+    **真**的 `chat_json` ⇒ **根本走不到这个假模型**、也就**没有 sleep**
+    （worker 放行后 **0.13s** 就到 `overrides.connect()`，pristine 才是 1.5s）。
+    ⇒ 它拦不住它所针对的那件事，只让 pristine 路径白等。**别顺手加回来**：
+    真要拦住"放行之后还在跑的 worker"，办法是让隔离**不依赖时序**（见
+    `tests/conftest.py::_un_isolated_overlay`），不是把时间窗口调大。
     """
 
-    def __init__(self, payload: dict, *, tail_delay: float = 0.0) -> None:
+    def __init__(self, payload: dict) -> None:
         self.payload = payload
-        self.tail_delay = tail_delay
         self.entered = threading.Event()   # 第 1 次调用已进入（确认"真的在飞"）
         self.gate = threading.Event()      # 测试放行
         self.calls = 0
@@ -2404,16 +2407,7 @@ class _GatedLLM:
         if self.calls == 1:
             self.entered.set()
             self.gate.wait(30)
-        elif self.tail_delay:
-            time.sleep(self.tail_delay)
         return LLMResult(payload=self.payload, input_tokens=1, output_tokens=1)
-
-
-# 假模型第 2 批起的**尾延迟**（秒）。它把"放行之后、写 overlay 之前"那段拉宽，
-# 于是"worker 还没写"这件事是**确定**的——否则 session 级不变式
-# （`tests/conftest.py::_real_overlay_stays_untouched`）会变成"看谁先跑"的守卫，
-# 而那种守卫最后都会被人注释掉。
-_GATED_TAIL_DELAY = 0.3
 
 
 @pytest.fixture
@@ -2422,7 +2416,7 @@ def gated_llm(monkeypatch):
     from vigil import api as _api
     from vigil import reorder as _reorder
 
-    llm = _GatedLLM(_REORDER_PAYLOAD, tail_delay=_GATED_TAIL_DELAY)
+    llm = _GatedLLM(_REORDER_PAYLOAD)
     monkeypatch.setattr(_reorder, "chat_json", llm)
     monkeypatch.setattr(_api, "load_llm_key", lambda *a, **k: "k-llm")
     yield llm
@@ -2896,9 +2890,11 @@ def test_the_release_helper_drains_before_the_isolation_is_undone(
     ⚠️ 本用例**显式**调 `_release_and_wait`（而不是靠夹具 teardown），因为
     "放行"与"隔离失效"的**先后**正是被测的东西——交给 teardown 就没法在中间插桩。
 
-    ⚠️ 假模型带 `tail_delay`：它让第 2 批在放行之后还要睡 0.3s，于是
-    "worker 还没写到 `apply_reorder`"这件事是**确定**的（否则这条判据会
-    变成"看调度器脸色"的 flaky 守卫，而 flaky 的守卫最后都会被人注释掉）。
+    ⚠️⚠️ 沉降（第 ③ 步）**必须与 `_drain_jobs` 无关**（复审 FIX 2）：
+    它就是被测的那个东西，用它来等 = **用被测物当仪器**——把 `_drain_jobs` 改成
+    `return True` 时它当场变瞎（实测：那条判据 **1 passed 全绿**）。
+    现在等的是**那个文件自己**有没有变（与 Python 侧的机制零共享状态）：
+    给它整整 2 秒去做那件坏事，然后再断言它没做。
     """
     from vigil import api as _api
     from vigil import overrides as _ov
@@ -2908,7 +2904,7 @@ def test_the_release_helper_drains_before_the_isolation_is_undone(
     _ov.ensure_schema(stand_in)
     before = _overlay_state(stand_in)
 
-    llm = _GatedLLM(_REORDER_PAYLOAD, tail_delay=0.3)
+    llm = _GatedLLM(_REORDER_PAYLOAD)
     monkeypatch.setattr(_reorder, "chat_json", llm)
     monkeypatch.setattr(_api, "load_llm_key", lambda *a, **k: "k-llm")
 
@@ -2920,10 +2916,11 @@ def test_the_release_helper_drains_before_the_isolation_is_undone(
     assert _release_and_wait(llm.gate), "放行之后 job 没有在超时内结束"
     # ② 现在才模拟"隔离已失效"（teardown 之后 monkeypatch 被还原的那一刻）
     monkeypatch.setattr(_ov, "OVERRIDES_DB", stand_in)
-    # ③ ⚠️ 必须**等 worker 真的结束**再断言：伤害是**异步**发生的（worker 还活着，
-    #    它跑完 `apply_reorder` 才写），不等的话这条判据就成了"看谁先跑"
-    #    ——实测过：第一版少了这一等，变异体（去掉 drain）**照样绿**。
-    _drain_jobs()
+    # ③ 有界沉降：**看那个文件自己**（不是看 `_drain_jobs`）。它一变就立刻退出
+    #    （变异体下马上红），不变就等满 2s 再断言（pristine 下是这条代价）。
+    deadline = time.monotonic() + 2.0
+    while _overlay_state(stand_in) == before and time.monotonic() < deadline:
+        time.sleep(0.01)
     assert _overlay_state(stand_in) == before, (
         "worker 在隔离撤销**之后**才写 overlay —— 真实场景里那就是 "
         "`data/overrides.db`（隔离之外的那个库）"
@@ -2940,6 +2937,11 @@ def test_a_blocked_job_is_left_for_the_teardown_to_release(client_factory, gated
 
     ⚠️ 所以这里**故意不放行**：自己放行就变成"测试自己收尾"，而这条路
     （teardown 放行 → worker 在隔离撤销之后才写）就**没有人走**了。
+
+    ⚠️ 这里**不再**调 `gated_llm.tail_delay = 1.5`（fix loop 4 删）：那个延迟在
+    **它自己要复现的变异场景里根本不生效**（worker 的第 2 次调用那时已落到真的
+    `chat_json` 上，不走假模型），实测删掉它 21 条时序用例全绿。伤害**落进哪里**
+    由 `tests/conftest.py::_un_isolated_overlay` 决定（会话级 tmp），**与 timing 无关**。
     """
     c = client_factory()
     job_id = c.post("/api/reorder").json()["job_id"]
@@ -2947,11 +2949,6 @@ def test_a_blocked_job_is_left_for_the_teardown_to_release(client_factory, gated
     assert c.get(f"/api/jobs/{job_id}").json()["state"] == "running", (
         "job 已经结束了 ⇒ teardown 的放行是空操作，本用例没覆盖到目标路径"
     )
-    # ⚠️ 把"放行之后、写 overlay 之前"那段拉宽：伤害的形状是"worker 比 monkeypatch
-    # 的还原**慢一步**"，而夹具收尾偶尔会超过默认的 0.3s（实测：全套跑时就有一次
-    # 没被复现出来）⇒ 变异反证会变成"看运气"的。1.5s 让它在任何调度下都成立。
-    # ⚠️ 改得动是因为 worker 每次调用都**现读** `tail_delay`，而它此刻正卡在第 1 批。
-    gated_llm.tail_delay = 1.5
 
 
 def test_api_reorder_survives_a_worker_that_starts_before_submit_returns(

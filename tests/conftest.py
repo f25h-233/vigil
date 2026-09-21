@@ -426,10 +426,15 @@ def _isolate_jobs_registry(monkeypatch):
 def _overlay_fingerprint(db: pathlib.Path) -> tuple:
     """`(主文件 sha256, item_edits 行数, MAX(edit_id), item_state 行数)`。**只读**。
 
-    ⚠️ `mode=ro` **且不建库**：量它的动作本身一个字节都不许写
-    （`ensure_schema` / `connect` 都会建文件——那是写，不是量）。
+    ⚠️ 对**不存在**的路径早退（返回 `("<missing>", 0, 0, 0)`）并且**不建文件**：
+    量它的动作本身一个字节都不许写（`ensure_schema` / `connect` 都会建文件
+    ——那是写，不是量）。⚠️ 这条"不建文件"今天**由早退守着，不是由 `mode=ro` 守着**
+    （连接那行在早退之后）——`_real_overlay_stays_untouched` 里有针对它的自检。
     ⚠️ **不量 `-shm`**：任何连接（**含只读的**）挂上去都可能动它，它一变就会产生
     「与环境相关」的假红，而假红的守卫最后都会被人注释掉。
+    ⚠️ **不量 mtime**：判据是「**内容**没变」，而 mtime 不是内容的一部分
+    （fix loop 3 实测过一次：真实文件 mtime 从 `02:29:53` 走到 `03:27:30` 而
+    字节**完全没变**）。至于"到底谁碰了它"，**我没测出来**——所以这里不写原因。
     ⚠️ `-wal` 里的行**由行数反映**（只读连接看得见 WAL 里的已提交行）——
     所以"只比较主文件字节"是够的，没有"写进 WAL 看不见"的缺口。
     ⚠️ 库在但表不在（半成品/坏文件）⇒ 记一个哨兵值而不是抛：那种状态下
@@ -452,12 +457,12 @@ def _overlay_fingerprint(db: pathlib.Path) -> tuple:
 
 
 def _default_overlay_paths() -> list[pathlib.Path]:
-    """会话开始时**「默认写入目标」**那条路径（正常情况就是仓库里 `data/overrides.db`）。
+    """会话开始时**「默认写入目标」**那条路径 + **仓库里**那份 `data/overrides.db`。
 
-    ⚠️ 取 `overrides.OVERRIDES_DB` 的**会话初始值**（此时还没打任何隔离夹具），
-    而不是写死 `REPO_ROOT / "data" / "overrides.db"`：前者正是 `monkeypatch` 在
-    teardown 里把默认路径**还原成**的那一个——**伤害落的就是它**。
-    （两者在正常环境里是同一条路径：这时两条都量，见下。）
+    ⚠️ 取 `overrides.OVERRIDES_DB` 的**会话初始值**，而不是写死 `REPO_ROOT / …`：
+    那正是 `monkeypatch` 在 teardown 里把默认路径**还原成**的那一个——**伤害落的就是它**。
+    fix loop 4 起它由 `_un_isolated_overlay` 指到会话级 tmp（于是伤害落进 tmp），
+    而仓库里那份**必须始终原封不动** ⇒ 两条都量、分别断言。
     """
     from vigil import overrides as _ov
 
@@ -469,12 +474,43 @@ def _default_overlay_paths() -> list[pathlib.Path]:
 
 
 @pytest.fixture(scope="session", autouse=True)
-def _real_overlay_stays_untouched():
-    """⭐ 会话级不变式：**真实的** `data/overrides.db` 在整个测试会话里一个字都不许变。
+def _un_isolated_overlay(tmp_path_factory):
+    """把 `overrides.OVERRIDES_DB` 的**模块默认值**重定向到一个**会话级 tmp**（fix loop 4 / FIX 1）。
 
-    **为什么需要它**（M6 T6 fix loop 3，复审 Important）：此前那条「夹具 teardown
-    要等 worker 结束」的判据，**等的就是 `_drain_jobs` 自己**。复审用两个改法证明了
-    它守不住任何东西：
+    **从「探测器」改成「预防器」**：`_isolate_overrides_path` 是**逐用例**打补丁的，
+    它在每个用例 teardown 里**先于** worker 把默认路径**还原成仓库里那条真路径**，
+    下一个用例开始前才重新指向 tmp——复审量到那个窗口有 **15–18ms**，而 worker 是不是
+    恰好落在窗口里是**硬币**（M2-1b 下那条 session 不变式的命中率只有 **19/37**）。
+
+    重定向之后，那个窗口里的"默认路径"指向的是**会话级 tmp** ⇒ 伤害**根本落不到
+    真实资产上**（复审实测 6/6：真库 sha/行数一动不动，伤害落进替身 `rows=2`）。
+
+    ⚠️ 逐用例的隔离**照旧**（本夹具只改模块默认值，不动 `_isolate_overrides_path`）。
+    ⚠️ 替身必须**建好表**：半成品文件会让 worker 的写以 `no such table` 收场，
+    于是"伤害"被一次响亮失败挡掉——而下一个人会把那种绿读成"没有伤害"。
+    """
+    from vigil import overrides as _ov
+
+    original = _ov.OVERRIDES_DB
+    target = tmp_path_factory.mktemp("un-isolated") / "overrides.db"
+    _ov.ensure_schema(target)
+    _ov.OVERRIDES_DB = target
+    try:
+        yield target
+    finally:
+        _ov.OVERRIDES_DB = original
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _real_overlay_stays_untouched(_un_isolated_overlay, tmp_path_factory):
+    """⭐ 会话级不变式（**兜底**）：会话里没有任何东西写进"隔离之外"的那两个库。
+
+    量的两条（见 `_default_overlay_paths`）：
+      ① **仓库里真实的** `data/overrides.db` —— 本项目第一条规矩，**必须原封不动**；
+      ② 会话级替身（`_un_isolated_overlay` 指的那个 tmp）—— **伤害会落在这里**。
+
+    **为什么还要它**（M6 T6 fix loop 3，复审 Important）：那条「夹具 teardown 要等 worker
+    结束」的判据，**等的就是 `_drain_jobs` 自己**；复审用两个改法证明了它守不住任何东西：
 
       * 把 `_drain_jobs` 的 while 改成 `return True` ⇒ 时序子集 **6 passed 全绿**；
       * 把两个夹具 teardown 换回裸 `gate.set()` ⇒ 只有故意失败的探针红，而**同一
@@ -484,19 +520,28 @@ def _real_overlay_stays_untouched():
     那套机制**（"探针被写进被测物内部"）。
 
     **为什么这条独立于被测物**：它不读 `jobs.registry`、不调 `_drain_jobs`、
-    不看任何夹具 teardown 的行为——它只在会话的**一头一尾**各量一次**那个文件
+    不看任何夹具 teardown 的行为——它只在会话的**一头一尾**各量一次**那些文件
     本身**（sha256 + 行数），量具与 Python 侧的机制**没有任何共享状态**。
 
     **为什么必须是会话级**：伤害发生在**夹具 teardown 之后**（worker 是异步的），
-    function 级的量具会在伤害发生**之前**就把结论定了——那正是上一轮那条空守卫
+    function 级的量具会在伤害发生**之前**就把结论定了——那正是 fix loop 2 那条空守卫
     的形态（"断言跑在伤害之前"）。
 
-    ⚠️ **只读**：全程 `mode=ro` 打开，**不在仓库里写任何东西**（连建库都不做）。
+    ⚠️ 它是**兜底**：第一道防线是 `_un_isolated_overlay`（预防）。所以它红了**先看替身**
+    ——替身红=有人绕过了逐用例隔离；**仓库那份红**才是真正不可接受的。
 
-    ⚠️ 它红了先排除一件事：**服务在本轮测试期间被人工操作过**（那会真的改写这个
-    文件——那是环境动的，不是测试写的）。确认没人动过，那就是**测试写进了真实
-    资产**，按本项目第一条规矩处理（`conftest.py` 顶上那两道隔离夹具就是为它写的）。
+    ⚠️ 它红了也先排除一件事：**服务在本轮测试期间被人工操作过**（那会真的改写这些
+    文件——那是环境动的，不是测试写的）。
     """
+    # ⚠️ 量具自身的自检（fix loop 4 / FIX 5a）：对**不存在**的路径量一次，**不许**把
+    # 文件造出来。（今天这条由 `is_file()` 早退守着；把早退删掉、连接不带 `mode=ro`
+    # ⇒ 那一次量就把文件造出来了 —— 那时这条断言会红，变异反证实测过。）
+    probe = tmp_path_factory.mktemp("fingerprint-probe") / "never-created.db"
+    _overlay_fingerprint(probe)
+    assert not probe.is_file(), (
+        "`_overlay_fingerprint` 建了文件——它不是只读的量具（量它自己就会写）"
+    )
+
     targets = _default_overlay_paths()
     before = {p: _overlay_fingerprint(p) for p in targets}
     yield
