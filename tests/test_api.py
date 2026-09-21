@@ -2261,6 +2261,54 @@ def fake_llm(monkeypatch):
 
 
 @pytest.fixture
+def partial_failing_llm(monkeypatch):
+    """假模型：**第一批**抛 `LLMError`（503 的形状），其余批正常返回。
+
+    ⚠️ 夹具库里是**两批**（111 群 msg 11/12 一批、222 群 msg 13 一批），
+    所以"第一批失败"= 前两条源消息没取得判定 ⇒ 它们的条目没判成，
+    而第三条照常判出来（收尾那句里的两个数因此都非零、能各自被钉住）。
+    """
+    from vigil import api as _api
+    from vigil import reorder as _reorder
+    from vigil.llm import LLMError, LLMResult
+
+    calls = {"n": 0}
+
+    def fake(cfg, *, system, user, **kw):  # noqa: ANN001, ANN003
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise LLMError("重试 3 次仍失败: HTTP 503 (code 50508)")
+        return LLMResult(payload=_REORDER_PAYLOAD, input_tokens=10, output_tokens=5)
+
+    monkeypatch.setattr(_reorder, "chat_json", fake)
+    monkeypatch.setattr(_api, "load_llm_key", lambda *a, **k: "k-llm")
+    return calls
+
+
+@pytest.fixture
+def all_failing_llm(monkeypatch):
+    """假模型：**每一批都失败**，而且报错**很长**（超过收尾文案的截断上限）。
+
+    ⚠️ 长报错是承重的：`_ERROR_CLIP` 那条「截断要看得见」只有在这个形状下
+    才断言得到（短报错永远走不到那个分支 ⇒ 一条到不了的断言）。
+    """
+    from vigil import api as _api
+    from vigil import reorder as _reorder
+    from vigil.llm import LLMError
+
+    long_error = "重试 3 次仍失败: HTTP 503 (code 50508) " + "上游过载。" * 40
+    calls = {"n": 0}
+
+    def fake(cfg, *, system, user, **kw):  # noqa: ANN001, ANN003
+        calls["n"] += 1
+        raise LLMError(long_error)
+
+    monkeypatch.setattr(_reorder, "chat_json", fake)
+    monkeypatch.setattr(_api, "load_llm_key", lambda *a, **k: "k-llm")
+    return {"calls": calls, "long_error": long_error}
+
+
+@pytest.fixture
 def slow_llm(monkeypatch):
     """假模型：**卡住不返回**，让 job 停在 `running`（用例结束后解封）。"""
     from vigil import api as _api
@@ -2300,6 +2348,62 @@ def test_api_reorder_starts_a_job_and_the_poll_says_it_finished(client_factory, 
         time.sleep(0.02)
     assert body["state"] == "done"
     assert body["kind"] == "reorder"
+
+
+def test_api_reorder_summary_admits_a_failed_batch(client_factory, partial_failing_llm):
+    """⭐⭐ 冒烟 **Bug A**：收尾文案是**用户唯一读到的那句话**，它不许把
+    「有批次没判成」说成「0 条没判成」。
+
+    ⚠️ 现场（冒烟那一轮）：2 批真失败（`HTTP 503, code 50508`），而界面/job
+    说的是「22 条改了类目，**0 条没判成**（它们没被动）」——用户没有任何办法
+    知道有 2 批没判过。两条缺陷叠加（都在这一轮的修里）：
+
+      ① `plan.unjudged` 从 `judged` 反向派生 ⇒ 结构上恒为空；
+      ② `work()` 收了 `stats` 却**从没读过** ⇒ `failed_batches` / `errors` 全丢。
+
+    ⚠️ 三条断言各守一半，缺一条就是一个能绿的半修：
+      · `2 条没判成` —— ① 的机械形式（本夹具第一批失败 ⇒ 前两条没判成）；
+      · `1 批没有取得判定` + 首个原因 —— ②（失败批次数与原文真的出去了）；
+      · `0 条没判成` **不许出现** —— 这正是冒烟现场那句假话。
+    """
+    c = client_factory()
+    job_id = c.post("/api/reorder").json()["job_id"]
+    body = _wait_for_job(c, job_id)
+
+    assert body["state"] == "done"
+    msg = body["message"]
+    assert "2 条没判成" in msg, f"没判成的条目数没说出来：{msg!r}"
+    assert "1 批没有取得判定" in msg, f"失败的批次数没说出来：{msg!r}"
+    assert "HTTP 503" in msg, f"首条错误没带出来，用户只能去翻服务端日志：{msg!r}"
+    assert "0 条没判成" not in msg, (
+        "有一批真失败了却报「0 条没判成」——冒烟 Bug A 那句假话正是这个形状"
+    )
+
+
+def test_api_reorder_never_says_zero_unjudged_when_every_batch_failed(
+    client_factory, all_failing_llm
+):
+    """⭐⭐ 冒烟 Bug A 的**全失败**形状（那条反证的现场）：每一批都失败。
+
+    修前这里回的是「0 条改了类目，**0 条没判成**（它们没被动）」——而事实是
+    3 条条目一条都没判过。这正是本项目最忌的那类话。
+
+    ⚠️ 第三条断言是 `_clip_error` 的判据：报错很长 ⇒ 必须**看得见地**截断
+    （末尾一个「…」），而完整的报错**不许**整段塞进 message 把这句话淹掉。
+    """
+    c = client_factory()
+    job_id = c.post("/api/reorder").json()["job_id"]
+    body = _wait_for_job(c, job_id)
+
+    assert body["state"] == "done"
+    msg = body["message"]
+    assert "0 条没判成" not in msg, (
+        "165 批全失败那种现场下，收尾文案仍然说「0 条没判成」（冒烟 Bug A）"
+    )
+    assert "3 条没判成" in msg, f"三条条目一条都没判过，文案里却没有这个数：{msg!r}"
+    assert "2 批没有取得判定" in msg, f"夹具是两批、两批都该被报出来：{msg!r}"
+    assert all_failing_llm["long_error"] not in msg, "那条长报错整段塞进来了（会淹掉这句话）"
+    assert msg.endswith("…"), f"截断了却没有留下「…」——读的人会以为那就是完整报错：{msg!r}"
 
 
 def test_api_reorder_refuses_a_second_job_while_one_runs(client_factory, slow_llm):
@@ -2914,6 +3018,97 @@ def test_api_import_pack_snapshots_categories_so_undo_steps_back_exactly_one(
     # ④ 再撤一次 ⇒ 退到改名之前。这一格是**改名**留下的，导入不该把它挤掉。
     assert c.post("/api/categories/undo").json() == {"undone": True}
     assert [x["slug"] for x in c.get("/api/categories").json()["categories"]] == before_rename
+
+
+def test_api_import_then_undo_rolls_the_alias_table_back_too(client_factory):
+    """⭐ re-review Ⅰ-1（= F1 那条判据的**第二次现身**）：撤销**也**回滚别名表。
+
+    ⚠️ 现象（reviewer 的探针）：`导入前 {}` → `导入后 {'life': 'sport'}` →
+    `撤销后 {}` —— **别名表跟着一起回去了**。这不是巧合：F1 的快照存的就是
+    「`categories.toml` 原文 + 那一刻的别名表」这一**对**
+    （`_snapshot_categories_before_import`），撤销时 `replace_kind_aliases`
+    把整表换回去。
+
+    而界面那句范围说明当时写着「群 / 人物 / **改名映射**不在这次回滚的范围里」
+    ——三个名字里有一个是假的，而它是用户**唯一**读到的范围说明
+    （`Settings.dom.test.tsx` 有一条并列的文案守卫）。
+
+    ⚠️ 为什么现有那条 F1 用例对这一维是**瞎的**：它用的包**不带别名**，
+    于是别名表在整条链路上恒为 `{}` ——"回滚了"与"压根没动过"分不开
+    （T3 I1/I2 的老形状）。
+
+    ⚠️⭐ **为什么这个形状是刻意设计的**（第一版被自己的反证抓回来了）：别写成
+    「导入前 `{}` → 导入后 `{'life':'sport'}` → 撤销后 `{}`」那种**最自然**的形状
+    ——那样即使**别名表根本没被回滚**，撤销之后 `life` 又变回一个**现存 slug**，
+    而「对账」（`reconcile_if_stale`，挂在每一次查询上）会把 `old_kind` 是现存
+    slug 的行剪掉 ⇒ 观测到的**也是** `{}`。两种机制在那个形状下**长得一模一样**，
+    于是那条断言**永远不可能红**（实测：把快照里的别名表拿掉，它照绿）。
+    ⇒ 判据必须取一行**撤销之后仍然合法**的映射：包带来一条本机没有的历史
+    slug（`ghost_old → academic`，换机器导入时很常见）——它 `old_kind` 不在
+    现存 slug 里、`new_kind` 在，**剪枝不会动它**，所以它**只可能**被
+    「整表换回导入前那一份」这一步清掉。
+
+    ⚠️ 两边都要非空：导入前有一条**改名**留下的别名（非空 ⇒ 撤销后若它不在，
+    就证明发生过整表替换，而不是"本来就是空的"）；包里的别名必须真的落库
+    （否则这条用例对别名这一维仍然瞎）。
+
+    ⚠️ 变异反证（真跑过，见 last-fix-report）：把别名表从快照里去掉
+    （快照行的 `aliases` 存 NULL，即"旧格式快照"那一支）⇒ 本条**必红**
+    （撤销后 `ghost_old → academic` 还在）。
+    """
+    c = client_factory()
+    assert c.get("/api/categories").json()["aliases"] == {}, (
+        "夹具起始的别名表不是空的——下面「回到这一份」的断言就说不清是回滚还是本来就空"
+    )
+
+    # ① 一次改名 ⇒ 别名表非空（`notice → sport`），同时拍下一格快照
+    assert c.put("/api/categories/notice", json={"slug": "sport"}).status_code == 200
+    after_rename = c.get("/api/categories").json()["aliases"]
+    assert after_rename == {"notice": "sport"}, f"改名没留下别名：{after_rename!r}"
+
+    # ② 导入一份**带别名**的包：类目表换成同一批 slug（剪枝判据与撤销后一致），
+    #    外加一条本机没有的历史 slug 映射。
+    pack = (
+        "schema = 1\n"
+        "\n"
+        "[[categories]]\n"
+        'slug = "academic"\n'
+        'label = "学业"\n'
+        'desc = "包里的学业"\n'
+        "\n"
+        "[[categories]]\n"
+        'slug = "life"\n'
+        'label = "生活"\n'
+        'desc = "包里的生活"\n'
+        "\n"
+        "[[categories]]\n"
+        'slug = "sport"\n'
+        'label = "体育"\n'
+        'desc = "包里的体育"\n'
+        "\n"
+        "[[kind_aliases]]\n"
+        'old_kind = "ghost_old"\n'
+        'new_kind = "academic"\n'
+    )
+    r = c.post("/api/config/pack", json={"toml": pack, "apply": True, "keep_settings": True})
+    assert r.status_code == 200, r.text
+    imported = c.get("/api/categories").json()["aliases"]
+    assert imported == {"notice": "sport", "ghost_old": "academic"}, (
+        f"包里的别名没落库 —— 这条用例对别名这一维就是瞎的：{imported!r}"
+    )
+
+    # ③ 撤销**一次** ⇒ 别名表必须回到**导入前那一份**（= 改名之后）。
+    #    ⚠️ `ghost_old` 那行**不在**这一份里，而它撤销之后仍然是合法的
+    #    （`old_kind` 不是现存 slug）⇒ 剪枝不会替我们把这条断言弄绿。
+    assert c.post("/api/categories/undo").json() == {"undone": True}
+    after_undo = c.get("/api/categories").json()["aliases"]
+    assert after_undo == after_rename, (
+        "撤销没有把别名表整表换回去——`Settings.tsx` 里那句「改名映射不在这次回滚的"
+        f"范围里」只在这条断言成立时才是一句假话（拿到 {after_undo!r}）"
+    )
+    assert "ghost_old" not in after_undo, (
+        f"包塞进别名表的那一行没被撤销掉（整表没换回去）：{after_undo!r}"
+    )
 
 
 def test_api_import_pack_returns_400_not_500_for_a_shape_error(client_factory, tmp_path):

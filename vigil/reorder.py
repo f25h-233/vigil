@@ -36,9 +36,13 @@ class ReorderChange:
 @dataclass(frozen=True)
 class ReorderPlan:
     changes: tuple[ReorderChange, ...] = ()
-    # ⚠️ **没判成**的 item：失败批次、预算提前停止、取消……一条也没写进 verdicts
-    # 的那些。它们与「判了、但结论是不用改」是**两回事**，必须分开报
-    # （`repass` 的 E5 就是这条：把没判成的当成判死，方向是数据丢失）。
+    # ⚠️ **没判成**的 item：它的源消息**一条判定都没取得**（批次失败、取消、
+    # 预算提前停止、压根不在任何批次里、整批返回空）——它们与「判了、但结论是
+    # 不用改」是**两回事**，必须分开报（`repass` 的 E5 就是这条：把没判成的
+    # 当成判死，方向是数据丢失；这边方向轻一点，但"没说"同样是没说自己
+    # 有资格说的话）。
+    # ⚠️⭐ 它**不许**从 `judged` 反向派生（冒烟 Bug A-1 的形状：那样差集恒为空集，
+    # 165 批全失败时也会回一句「0 条没判成」）。算法见 `_unjudged_items`。
     unjudged: tuple[int, ...] = ()
 
 
@@ -79,6 +83,42 @@ def _current_kinds(conn: sqlite3.Connection, item_ids: Sequence[int]) -> dict[in
     return out
 
 
+def _unjudged_items(
+    conn: sqlite3.Connection,
+    item_ids: dict[int, list[int]],
+    judged_msgs: set[int],
+) -> tuple[int, ...]:
+    """在 scope 里、但**没有取得任何判定**的 item（按 item_id 升序）。
+
+    ⚠️⭐ 判据是「**源消息**有没有取得判定」，**不是**「item 有没有出现在
+    `judged` 里」（冒烟 Bug A-1 的成因）：从 `judged` 反向派生的差集
+    **恒为空集**——`item_ids` 与 `judged` 同源，`all_items ⊆ judged_items`
+    是恒真的。于是 165 批全失败、一条判定都没有时，它照样回一句
+    「0 条改了类目，**0 条没判成**」——而这正是本项目最忌的那类话
+    （「只说自己有资格说的话」）。
+
+    ⚠️ 「没取得判定」= 那条源消息所在的批次**失败 / 被取消 / 撞预算 /
+    压根不在任何批次里 / 整批返回空**：这五条路径一条都不写判定，于是
+    **自动**落进这里；将来新增的任何一条 `continue` 也一样。这与
+    `repass` 的 `unjudged_ids` 是同一条判据（那个模块的注释写了理由：
+    不另立计数器——"没写进判定"这件事本身就是唯一可靠的信号）。
+
+    ⚠️ 一整批返回空（`BatchOutcome.empty_payload`）**算没判成**，不算
+    "判成 0 条"：M5 的实测结论是「**整批放弃 ≠ 逐条判死**」（那 100 条里
+    53 条属于前者）——没有批内对照时，"模型什么都没产出"与"模型判它不该
+    有条目"分不开。反过来，"同批为别的消息产出了、唯独没为这条产出"
+    （repass 的 a2）**有**批内对照 ⇒ 算取得了判定，本条目不进 `unjudged`。
+
+    ⚠️ 软删的条目**不算**没判成：它们本来就不参与重排（见 `alive` 的理由），
+    把它们算进来等于让"用户自己删掉的"冒充成"我们没判的"。
+    """
+    judged_items = {iid for mid in judged_msgs for iid in item_ids.get(mid, ())}
+    candidates = {iid for iids in item_ids.values() for iid in iids} - judged_items
+    return tuple(
+        sorted(iid for iid in candidates if store.get_item(conn, iid) is not None)
+    )
+
+
 def plan_reorder(
     conn: sqlite3.Connection,
     *,
@@ -112,6 +152,20 @@ def plan_reorder(
         on_progress("[reorder] 没有可重排的源消息")
         return ReorderPlan(), stats
 
+    # ⚠️⭐ 条目的取数范围是**全部源消息**的产物，**不是"判过的那批"**
+    # （冒烟 Bug A-1）：后者与 `judged` 同源 ⇒ 收尾时那个差集恒为空集。
+    # ⚠️ 而且它必须在**所有提前退出之前**算出来——取消 / 预算 / 「一条批都没有」
+    # 这三条路径上一条判定都没有，而用户一样要被告知那件事（从前那三条路径
+    # 都直接 `return ReorderPlan()`，`unjudged` 是空的）。
+    # ⚠️ 一条源消息可能对应**多个** item（`save_items` 的批内去重来源取并集，
+    # 见 `overrides.delete_item` 的 E7 论证）⇒ 用列表而不是单值。
+    item_ids: dict[int, list[int]] = {
+        mid: list(iids) if isinstance(iids, (list, tuple, set)) else [iids]
+        for mid, iids in store.existing_items_for_messages(
+            conn, [m.msg_id for m in src_msgs]
+        ).items()
+    }
+
     batches, src_ids = context_batches(
         conn, config=config, batch_size=batch_size, context=context
     )
@@ -122,8 +176,11 @@ def plan_reorder(
         f"送 {stats.sent_messages} 条消息"
     )
     if not batches:
+        # ⚠️ 一条批次都没有 ⇒ 一条判定都没取得 ⇒ 在 scope 里的条目**全部**没判成。
+        # 从前这里返回的是空的 `unjudged`，于是收尾文案说「0 条没判成」——
+        # 而事实是一条都没判（`_unjudged_items` 的判据天然覆盖这一条路径）。
         on_progress("[reorder] 没有任何含源消息的上下文批次，结束（一条都不会动）")
-        return ReorderPlan(), stats
+        return ReorderPlan(unjudged=_unjudged_items(conn, item_ids, set())), stats
 
     llm_cfg = LLMConfig(
         api_key=api_key, model=model, base_url=base_url,
@@ -134,6 +191,13 @@ def plan_reorder(
     # （`repass` 勘误 E5 的同一条判据）：一次 429 被当成「模型说它该是别的类目」，
     # 方向是**静默改错分类**。
     judged: dict[int, store.ExtractedItem] = {}
+
+    # ⚠️ 「取得了判定」的**源消息**——与上面的 `judged` **不是一回事**：
+    # `judged` 记的是"拿到了产出条目"（只用来算新类目），这个集合记的是
+    # "这条源消息有没有得到答复"（`unjudged` 的判据，见 `_unjudged_items`）。
+    # 一个消息"被判为不用改"（答复里没为它产出条目）**算取得了判定**——
+    # 那与"我们压根没问成"是两件事，混在一起就会把失败说成 0。
+    judged_msgs: set[int] = set()
 
     for index, batch in enumerate(batches, start=1):
         if should_stop is not None and should_stop():
@@ -172,6 +236,11 @@ def plan_reorder(
             continue
 
         stats.batches += 1
+        # ⚠️ 这一批的答复**可解析** ⇒ 批内每条源消息都算取得了判定（包括
+        # "没为它产出条目"的那种：那是 repass 的 a2，有批内对照）。
+        # ⚠️ 而**整批返回空**（a0）不算——见 `_unjudged_items` 的论证。
+        if not outcome.empty_payload:
+            judged_msgs.update(outcome.counts)
         for mid, n in outcome.counts.items():
             if n and mid not in judged:
                 for it in outcome.produced:
@@ -184,13 +253,7 @@ def plan_reorder(
         )
 
     # ── 把判定折成变更清单 ────────────────────────────────────────────
-    items_by_msg = store.existing_items_for_messages(conn, list(judged))
-    # ⚠️ 一条源消息可能对应**多个** item（`save_items` 的批内去重来源取并集，
-    # 见 `overrides.delete_item` 的 E7 论证）⇒ 用列表而不是单值。
-    item_ids: dict[int, list[int]] = {}
-    for mid, iids in items_by_msg.items():
-        item_ids[mid] = list(iids) if isinstance(iids, (list, tuple, set)) else [iids]
-
+    # ⚠️ `item_ids` 在上面就算好了（全部源消息的产物，不是"判过的那批"）。
     wanted: dict[int, str] = {}
     for mid, produced in judged.items():
         for iid in item_ids.get(mid, ()):
@@ -210,12 +273,10 @@ def plan_reorder(
         for iid in sorted(alive)
         if iid in current and current[iid] != wanted[iid]
     )
-    judged_items = set(alive)
-    all_items = {iid for iids in item_ids.values() for iid in iids}
-    unjudged = tuple(sorted(all_items - judged_items))
+    unjudged = _unjudged_items(conn, item_ids, judged_msgs)
 
     on_progress(
-        f"[reorder] 判定完成：{len(alive)} 条有结论 → **{len(changes)} 条需要改类目**，"
+        f"[reorder] 判定完成：{len(alive)} 条有结论 → {len(changes)} 条需要改类目，"
         f"{len(unjudged)} 条没判成（它们不会被动）"
     )
     return ReorderPlan(changes=changes, unjudged=unjudged), stats

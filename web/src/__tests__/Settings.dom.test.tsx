@@ -250,6 +250,10 @@ test('提交中的「加入监视」必须点不动（双击不许发两次 POST
 
   await screen.findByText('甲群')
   await userEvent.type(screen.getByPlaceholderText('群号'), '444')
+  // ⚠️ 群名必须填（re-review Ⅱ-1 起手填表单要求非空）：不填的话下面那个 POST
+  // **根本不会发**，而这批断言（"按钮禁用 + 只发一次"）会红在**与它们想守的
+  // 东西无关**的原因上——一条把排障指向错方向的假红。
+  await userEvent.type(screen.getByPlaceholderText('群名'), '丁群')
   await userEvent.click(screen.getByRole('button', { name: '加入监视' }))
 
   await waitFor(() => {
@@ -358,6 +362,57 @@ test('无名群（快照里 name 为空）的「加入监视」必须把空名�
   })
 })
 
+test('手填表单不许把群名留空（这一页没有改名入口，空名群在网页上改不回来）', async () => {
+  /**
+   * ⭐ **re-review Ⅱ-1（Minor）**：`/api/groups` 从 F2 起**接受空名**（那是给
+   * 「快照里名字取不到」的群留的路——上面那条用例钉着它），而这一页
+   * **没有任何改名入口**（全文件 `patchGroup` 只有 `{enabled:true/false}` 两处）
+   * ⇒ 手滑加的空名群在网页上永远改不回来，只能去手改 `config/groups.toml`。
+   *
+   * ⚠️ 判据是「**一个请求都不许发**」：客户端已经知道它是个坏值，发出去就等于
+   * 造出那个改不回来的群（与人物节「QQ 号必须是正整数」同形）。
+   *
+   * ⚠️ 三条断言各自的变异形状（**顺序是刻意的**，见下）：
+   *   ① `POST 条数 == 0` —— 形状「整段校验被删掉」：坏值被发出去 ⇒ 红在①；
+   *   ② 「而且有话说」 —— 形状「校验留着但**不出声**」（`if (…) return` 里
+   *      少了那句 `setMsg`）：请求确实没发（① 照绿），而用户点了按钮什么都
+   *      没发生 ⇒ 红在②。**两半都要**：只守①的话，一个"静默拦下"的实现照样绿
+   *      （那正是 M5 记过的「点了撤销、什么都没发生、也没有任何话说」）。
+   *   ③ 补上名字之后**发得出去** —— 防"一刀切禁掉提交"：只有①②的话，
+   *      一个把 `submit()` 开头直接 `return` 的实现照样绿。
+   *
+   * ⚠️ 顺序为什么是①在前（实测的）：把「有话说」放前面时，形状「删掉校验」
+   * 会让**那句话先找不到**（`)` 之后它被成功提示覆盖/压根没设），
+   * 报出来的红是②——而真正承重的那件事（坏值被 POST 出去了）没被说出来。
+   * ⚠️ 代价如实记：在"校验整段删除"这个形状下②**到不了**（①先红、
+   * 用例就停了）；它只在"静默拦下"那个形状里上场。
+   *
+   * ⚠️ 只收紧**这个表单**、不动服务端：上面那条「无名群必须把空名原样发出去」
+   * 今天照绿，就是这件事的证据（无名群走的是列表里那个按钮，不是这个表单）。
+   */
+  const { calls } = installFetch({ groups: AVAILABLE })
+  render(<Settings />)
+
+  await screen.findByText('甲群')
+  await userEvent.type(screen.getByPlaceholderText('群号'), '444')
+  await userEvent.click(screen.getByRole('button', { name: '加入监视' }))
+
+  expect(
+    calls.filter((c) => c.method === 'POST' && c.url === '/api/groups').length,
+    '客户端已经知道它是个坏值，却还是把请求发出去了',
+  ).toBe(0)
+  expect(await screen.findByText(/群名不能空着/)).toBeTruthy()
+
+  await userEvent.type(screen.getByPlaceholderText('群名'), '丁群')
+  await userEvent.click(screen.getByRole('button', { name: '加入监视' }))
+  const post = calls.find((c) => c.method === 'POST' && c.url === '/api/groups')
+  expect(post?.body, '补上群名之后仍然发不出去——那条校验把入口焊死了').toEqual({
+    id: 444,
+    name: '丁群',
+    tier: 'normal',
+  })
+})
+
 // ── 类目 ──────────────────────────────────────────────────────────────
 
 test('删类目时未知条目数就必须要求选择迁移目标', async () => {
@@ -408,6 +463,39 @@ test('撤销类目改动失败时必须有话说（未处理的 rejection 不算
 
   expect(await screen.findByText(/没有可撤销的类目改动/)).toBeTruthy()
   expect(calls.some((c) => c.url.endsWith('/api/categories/undo'))).toBe(true)
+})
+
+test('撤销成功那句话的范围说明：别名映射跟着回滚，不在范围里的只有群 / 人物', async () => {
+  /**
+   * ⭐ **re-review Ⅰ-1（Important，= F1 那条判据的第二次现身）**。
+   *
+   * 从前这句写的是「群 / 人物 / **改名映射**不在这次回滚的范围里」——而别名表
+   * **跟着一起回滚**：F1 的快照存的就是「`categories.toml` 原文 + 那一刻的
+   * 别名表」这一对，撤销时整表换回去（reviewer 的探针：`导入前 {}` →
+   * `导入后 {'life':'sport'}` → `撤销后 {}`）。三个名字里有一个是假的，
+   * 而它是用户**唯一**读到的范围说明。
+   *
+   * ⚠️ 这条守的是**文案**，行为那一半由
+   * `tests/test_api.py::test_api_import_then_undo_rolls_the_alias_table_back_too`
+   * 守（"别名表真的回到导入前那一份"）。**两者缺一不可**：只修后端，这句话
+   * 仍然在骗人；只改文案，下一个人改回去也没有任何东西会红。
+   *
+   * ⚠️ 变异反证：把「改名映射」放回「不在」那半句 ⇒ 本条**必红**
+   * （第二条断言要的正是"它们不许出现在同一个句子里"）。
+   */
+  installFetch({ categories: CATS })
+  render(<Settings />)
+
+  await openSection('类目')
+  await screen.findByText(/通知公告/)
+  await userEvent.click(screen.getByRole('button', { name: /撤销上一次类目改动/ }))
+
+  const msg = (await screen.findByText(/已撤销/)).textContent ?? ''
+  expect(msg).toContain('改名映射')
+  // 「改名映射」与「不在」不许出现在同一句话里（中间不跨那个括号）
+  expect(msg).not.toMatch(/改名映射[^（]*不在/)
+  // 群 / 人物**确实**不在范围里（这一半是真的，不许被顺手改掉）
+  expect(msg).toMatch(/群\s*\/\s*人物[^。]*不在/)
 })
 
 // ── 人物 ──────────────────────────────────────────────────────────────

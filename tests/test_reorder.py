@@ -363,6 +363,121 @@ def test_a_failed_batch_produces_no_changes(db_with_items, failing_llm):
     )
     assert plan.changes == ()
     assert stats.failed_batches == 1
+    # ⚠️ 两条路径都要报成「没判成」（冒烟 Bug A-1）：第一批**失败**、
+    # 第二批**整批返回空**（a0）——两种都没有取得判定，而 item 1/2/3 都还在。
+    # ⚠️ a0 算没判成而不是"判成 0 条"：M5 的实测结论是「整批放弃 ≠ 逐条判死」。
+    assert plan.unjudged == (1, 2, 3), (
+        "没判成的条目没被列出来——收尾文案会说「0 条没判成」（冒烟 Bug A）"
+    )
+
+
+def test_a_failed_batch_leaves_only_its_own_items_unjudged(db_with_items, monkeypatch):
+    """⭐⭐ 冒烟 Bug A 的**部分失败**形状：`unjudged` 只收没判成的那批。
+
+    夹具是两个群 ⇒ **两批**（甲群 msg 1/2、乙群 msg 3）。这里让**第一批**抛
+    `LLMError`（`HTTP 503` 的形状、冒烟现场的那一种）、第二批正常返回 ⇒
+
+      · `plan.unjudged` 必须是 **(1, 2)**——第一批那两条的条目；
+      · **判过的那批照常出变更**（item 3）：一有失败就整轮放弃是另一种坏法，
+        而且它会让这条用例在"两边都空"时**绿得看不出区别**。
+
+    ⚠️ 修前的行为：`unjudged` 恒为 `()`（`all_items` 从 `judged` 反向派生 ⇒
+    差集恒空）——于是这句「2 条没判成」在界面上永远说不出来。
+    """
+    calls = {"n": 0}
+    # ⚠️ 只给 msg 3 一条条目（手写这个 payload，不走 `_payload_quoting_everything`：
+    # 那个辅助函数**为每条消息各出一条**，喂一个只含 msg 3 的 kinds 表会
+    # `KeyError(1)`——而那会被 `plan_reorder` 当成"本地后处理失败"记一笔，
+    # 于是两条断言都会红在**与它们想守的东西无关**的原因上）。
+    payload = {
+        "items": [
+            {
+                "quote": _CONTENT[3],
+                "kind": _NEW_KIND,
+                "title": "重判第 3 条",
+                "confidence": 0.9,
+            }
+        ]
+    }
+
+    def fake(cfg, *, system, user, **kw):  # noqa: ANN001, ANN003
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise LLMError("HTTP 503 (code 50508)")
+        return LLMResult(payload=payload, input_tokens=10, output_tokens=5)
+
+    monkeypatch.setattr(reorder, "chat_json", fake)
+    plan, stats = reorder.plan_reorder(
+        db_with_items.conn, config=db_with_items.config, api_key="k",
+        on_progress=lambda _: None,
+    )
+    assert (stats.failed_batches, stats.batches) == (1, 1)
+    assert plan.unjudged == (1, 2), (
+        "失败那批的条目没被报成「没判成」——收尾文案会说「0 条没判成」（冒烟 Bug A）"
+    )
+    assert {c.item_id for c in plan.changes} == {3}, (
+        "判过的那批没照常出变更：失败不该让整轮放弃"
+    )
+
+
+def test_every_batch_failing_leaves_every_item_unjudged(db_with_items, monkeypatch):
+    """⭐⭐ 冒烟 Bug A-1 的**全失败**形状（就是那条反证的现场）。
+
+    冒烟那一轮把 `chat_json` 换成必抛的替身 ⇒ 165 批全失败、判定 0 批，
+    而修前的 `unjudged` **仍是 `()`** ⇒ `api.py` 回一句
+    **「0 条改了类目，0 条没判成（它们没被动）」**——事实是一条都没判成。
+    这正是本项目最忌的那类话（「只说自己有资格说的话」）。
+    """
+    def fake(cfg, *, system, user, **kw):  # noqa: ANN001, ANN003
+        raise LLMError("HTTP 503 (code 50508)")
+
+    monkeypatch.setattr(reorder, "chat_json", fake)
+    plan, stats = reorder.plan_reorder(
+        db_with_items.conn, config=db_with_items.config, api_key="k",
+        on_progress=lambda _: None,
+    )
+    assert stats.failed_batches == 2, "夹具是两批、两批都该失败（否则下面那句话无关）"
+    assert plan.changes == ()
+    assert plan.unjudged == (1, 2, 3), (
+        "全失败时 unjudged 还是空的——用户会读到「0 条没判成」（冒烟 Bug A）"
+    )
+
+
+def test_soft_deleted_items_are_not_reported_as_unjudged(db_with_items, failing_llm):
+    """软删的条目**不算**没判成：它本来就不参与重排（见 `alive` 的理由）。
+
+    ⚠️ 判据要用**没判成的那一批**里的一条：这里 item 1 被软删，而两批都没取得
+    判定（`failing_llm`：第一批抛、第二批整批空）。⇒ `unjudged` 是 **(2, 3)**：
+    把 1 算进去等于让"用户自己删掉的"冒充成"我们没判的"，那个数会被读成
+    "有一条该看的结果没出来"。
+    """
+    ov = overrides.connect(db_with_items.overlay_path)
+    try:
+        overrides.delete_item(ov, item_id=1, msg_id=None)
+    finally:
+        ov.close()
+
+    plan, _ = reorder.plan_reorder(
+        db_with_items.conn, config=db_with_items.config, api_key="k",
+        on_progress=lambda _: None,
+    )
+    assert plan.unjudged == (2, 3), "软删的条目混进了「没判成」"
+
+
+def test_budget_stop_leaves_the_untouched_batches_unjudged(db_with_items, fake_llm):
+    """预算提前停止 ⇒ 没跑到的那些批次一条判定都没有（与取消同一条判据）。
+
+    ⚠️ 预算闸在**每一批之前**检查，而假模型每批报 10+5=15 token ⇒
+    取 `budget_tokens=15`：第一批跑完、第二批之前停下。于是 msg 3 没判成、
+    msg 1/2 判过（item 1/2 照常改类目）。
+    """
+    plan, stats = reorder.plan_reorder(
+        db_with_items.conn, config=db_with_items.config, api_key="k",
+        budget_tokens=15, on_progress=lambda _: None,
+    )
+    assert stats.budget_hit is True, "预算闸没生效——下面那条断言就与预算无关了"
+    assert len(plan.changes) == 2
+    assert plan.unjudged == (3,), "撞预算之后没跑的那批没被报成「没判成」"
 
 
 def test_a_hallucinated_slug_never_reaches_the_plan(db_with_items, llm_returning_unknown_kind):
@@ -425,7 +540,13 @@ def test_apply_reorder_does_not_revive_an_item_deleted_after_planning(db_with_it
 
 
 def test_should_stop_halts_between_batches(db_with_items, fake_llm):
-    """取消是协作式的：`should_stop` 在**每一批之间**被检查。"""
+    """取消是协作式的：`should_stop` 在**每一批之间**被检查。
+
+    ⚠️ 取消之后**没跑到的那些批次**一条判定都没有 ⇒ 它们的条目必须出现在
+    `unjudged` 里（冒烟 Bug A 的另一条提前退出路径）。第一批判过了，所以
+    只有 msg 3 的那一条没判成——两件事都要断言，否则"取消后统统算没判成"
+    也能绿。
+    """
     calls = {"n": 0}
 
     def stop():
@@ -437,3 +558,5 @@ def test_should_stop_halts_between_batches(db_with_items, fake_llm):
         should_stop=stop, on_progress=lambda _: None,
     )
     assert stats.stopped is True
+    assert len(plan.changes) == 2, "第一批判过的两条该照常出变更"
+    assert plan.unjudged == (3,), "取消之后没跑的那批没被报成「没判成」"

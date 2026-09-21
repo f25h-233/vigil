@@ -80,10 +80,23 @@ function GroupsSection() {
       setMsg('群号必须是正整数')
       return
     }
+    // ⚠️⭐ **手填的群名不许空着**（re-review Ⅱ-1）：`/api/groups` 从 F2 起接受
+    // 空名（那是给**快照里名字取不到**的群留的路——`collect` 刻意留 `""`，
+    // 无名群必须能原样加进来），所以**服务端不许收紧**。但这一页
+    // **没有任何改名入口**（全文件 `patchGroup` 只有 `{enabled:true/false}` 两处），
+    // 于是手滑加的空名群在网页上**永远改不回来**，只能去手改 `config/groups.toml`。
+    // ⇒ 只收紧**这个表单**。
+    if (name.trim() === '') {
+      setMsg('群名不能空着——这一页没有改名入口，空名群只能手改 config/groups.toml 才改得回来。')
+      return
+    }
     setBusy(true)
     try {
       await api.addGroup(n, name.trim(), 'normal')
-      setMsg(`已加入 ${n}。⚠️ 下次 vigil export 会拉它的**全部历史**——首轮实测大群约 1,664 条 / 21 批 / 6.3 分钟。`)
+      // ⚠️ 这里从前写着 `**全部历史**`：`<p>` 里的 `**` **不是** markdown，
+      // 它就是一个字面的星号（用户看到 `**全部历史**`）。与下面「已撤销」那句
+      // 一起清掉（re-review Ⅱ-2 的同族：文案里的记号要么是语法、要么别写）。
+      setMsg(`已加入 ${n}。⚠️ 下次 vigil export 会拉它的全部历史——首轮实测大群约 1,664 条 / 21 批 / 6.3 分钟。`)
       setId(''); setName('')
       setTick((t) => t + 1)
     } catch (e) {
@@ -402,7 +415,7 @@ function LlmSection() {
         </select>
       </label>
       <p className="text-xs text-white/40">
-        ⚠️ 密钥**不在**这份配置里（它走仓库根的 <code>.env</code>），所以这里也没有它的输入框。
+        ⚠️ 密钥不在这份配置里（它走仓库根的 <code>.env</code>），所以这里也没有它的输入框。
       </p>
       <button onClick={save} disabled={busy}
               className="rounded-lg bg-sky-500/20 px-3 py-1.5 text-sm text-sky-200 disabled:opacity-40">
@@ -455,7 +468,7 @@ function CategoriesSection() {
       await api.addCategory(
         draft.slug.trim(), draft.label.trim(), draft.desc, draft.icon.trim(),
       )
-      setMsg(`已新增「${draft.label.trim()}」。它在信息流的类目筛选里**立刻**可见。`)
+      setMsg(`已新增「${draft.label.trim()}」。它在信息流的类目筛选里立刻可见。`)
       setDraft({ slug: '', label: '', desc: '', icon: '' })
       setTick((t) => t + 1)
     } catch (e) {
@@ -511,7 +524,7 @@ function CategoriesSection() {
       {editing !== null && (
         <div className="mt-3 rounded-lg bg-white/5 p-3">
           <p className="text-xs text-white/55">
-            编辑「{editing}」——改 slug 等于**改名**：旧名字下的条目不改 id，
+            编辑「{editing}」——改 slug 等于改名：旧名字下的条目不改 id，
             从此按新名字显示（这条映射会留在下面的「改过名的类目」里）。
           </p>
           <div className="mt-2 grid gap-1.5">
@@ -561,7 +574,7 @@ function CategoriesSection() {
         <div className="mt-3 rounded-lg bg-amber-500/10 p-3 text-sm text-amber-100">
           {pending.count > 0 ? (
             <>
-              <p>⚠️ 「{pending.label}」还有 **{pending.count} 条**条目指着它。删之前必须选一个迁移目标——否则那些条目会指向一个不存在的类目。</p>
+              <p>⚠️ 「{pending.label}」还有 {pending.count} 条条目指着它。删之前必须选一个迁移目标——否则那些条目会指向一个不存在的类目。</p>
               <select value={migrateTo} onChange={(e) => setMigrateTo(e.target.value)}
                       className="mt-2 rounded-lg bg-black/30 px-2 py-1 text-sm">
                 <option value="">— 选一个 —</option>
@@ -603,13 +616,21 @@ function CategoriesSection() {
               // ⚠️ **成功路径必须说一句，而且要说清范围**（M6 终审 F1）。
               // 从前这里只有 `setTick(...)`：撤成功了一个字都不说，用户不知道
               // 刚刚退掉了什么。而"退掉了什么"在与**导入**交界时尤其要紧——
-              // 一次导入整体重写了 `categories.toml`（F1 修掉之后它也进撤销栈），
-              // 而这次撤销**只**回滚那一份文件：包写进去的群 / 人物 / 别名映射
-              // 原样留着。不说的话，用户会以为"撤销"把整次导入都退了回去。
+              // 一次导入整体重写了 `categories.toml`（F1 修掉之后它也进撤销栈）。
+              //
+              // ⚠️⭐ 范围里的**每一个名字**都要是真的（re-review Ⅰ-1）。这次撤销
+              // 回滚的是**「类目文件 + 别名表」这一对**（F1 的快照存的就是那一对，
+              // 撤销时 `replace_kind_aliases` 把整表换回去）——实测：包塞进别名表的
+              // `ghost_old → academic` 在撤销后**不在**了，而导入前那条
+              // `notice → sport` 原样回来。所以从前那句
+              // 「群 / 人物 / **改名映射**不在这次回滚的范围里」里有一个是**假话**，
+              // 而它是用户唯一读到的范围说明。**不在**范围的只有群 / 人物
+              // （那两份文件由包写、撤销不碰）。判据：
+              // `tests/test_api.py::test_api_import_then_undo_rolls_the_alias_table_back_too`。
               setMsg(
                 r.undone
-                  ? '已撤销——类目表回到**上一次程序改动它之前**那一份' +
-                    '（群 / 人物 / 改名映射**不在**这次回滚的范围里）。'
+                  ? '已撤销——类目表与改名映射都回到「上一次程序改动它之前」那一份' +
+                    '（群 / 人物不在这次回滚的范围里）。'
                   : '没有可撤销的类目改动（撤销栈是空的）。',
               )
               setTick((t) => t + 1)
@@ -634,7 +655,8 @@ function CategoriesSection() {
 // **零引用** ⇒ 用户够不到 ⇒ **那个特性事实上不存在**。
 //
 // 三条刻意的形状，每一件都有一个具体的坏法：
-//   ① `job_id` 落 `localStorage`：重排要跑 1–2 分钟，用户很可能刷新页面。
+//   ① `job_id` 落 `localStorage`：重排是**分钟级**的活儿（实测 1–78 分钟，
+//      见 `start()` 里那段），用户很可能刷新页面。
 //      不存的话刷新一次就再也看不到那个 job 的结果了，而它**还在服务端跑着**、
 //      还占着唯一的 `JobBusy` 名额（再点「开始重排」拿到 409，却不知道为什么）。
 //   ② 轮询的依赖列表里 `job?.job_id` 与 `job?.state` **两个都要**：放整个 `job`
@@ -710,7 +732,23 @@ function ReorderSection() {
       setJob(j)
       setUndoable(true)
       window.localStorage.setItem(REORDER_JOB_KEY, j.job_id)
-      setMsg('已开始。重排要跑 1–2 分钟，可以离开这个页面（刷新也不会丢）。')
+      // ⚠️⭐ 这句话**不许承诺分钟数**（冒烟 Bug B）：从前写的是「重排要跑
+      // 1–2 分钟」——那个数字对 M1 那次采样（41 批 / 5,604 条 / 64 s）成立，
+      // 对本仓当前的真实体量差 **40–80 倍**（冒烟实测：360 条源消息 → 172 批
+      // → **78 分 27 秒**）。耗时**不是这个程序能预知的量**：它取决于群数、
+      // 消息量，以及端点当时的速度（那一轮 2 批撞 503，而 `LLMConfig` 是
+      // `timeout=180 / max_retries=3 / sleep(2**attempt)` ⇒ 单批最坏 9 分钟）。
+      //
+      // ⚠️ 为什么**不**做动态估算（那个选项更花哨，也更危险）：`done` 的语义是
+      // 「最后一条**成功**批次的序号」（失败的批次不推进它），拿它算速率会
+      // 系统性偏慢；而开头几批里若有一批正在重试，外推出的"还需 X 小时"就是
+      // **新的一句假话**——这条缺陷（说了自己没有资格说的话）修成另一句话，
+      // 等于没修。⇒ 给一句**与体量无关、可核**的话，把"还要多久"交给界面上
+      // 那个真的进度（`done/total`，见下面那个任务框）与「取消重排」按钮。
+      setMsg(
+        '已开始。要跑多久取决于群数与消息量（实测从一两分钟到几十分钟都有），' +
+          '可以先离开这个页面——进度会一直显示在这一页，刷新也不会丢。',
+      )
     } catch (e: unknown) {
       // ⚠️ 409 = **已有 job 在跑**（唯一的 `JobBusy` 名额）。这不是"出错了"，
       // 而是"等一下"——后端那句 detail 已经把话说清楚了，原样显示即可
@@ -775,7 +813,7 @@ function ReorderSection() {
   return (
     <div className="space-y-3">
       <p className="text-xs text-white/40">
-        重排 = 让 LLM 按**当前类目定义**重判已有条目。它只写 overlay，条目的{' '}
+        重排 = 让 LLM 按当前类目定义重判已有条目。它只写 overlay，条目的{' '}
         <code>item_id</code> 前后不变（D16），所以一整批改错了可以一次退回。
       </p>
 
@@ -924,7 +962,7 @@ function PackSection() {
     <div className="space-y-4">
       <div>
         <p className="text-xs text-white/55">
-          导出（**不含密钥**——密钥走 <code>.env</code>，不在这三份配置里）
+          导出（不含密钥——密钥走 <code>.env</code>，不在这三份配置里）
         </p>
         <textarea readOnly value={toml ?? ''} rows={10}
                   className="mt-1 w-full rounded-lg bg-black/30 p-2 font-mono text-xs text-white/70" />

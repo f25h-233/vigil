@@ -65,6 +65,37 @@ _ACTOR_PREFIXES = ("reorder:", "bulk:")
 _PROGRESS_BATCHES = re.compile(r"批次 (\d+)/(\d+)")
 _PROGRESS_TOTAL = re.compile(r"→ (\d+) 批")
 
+# 收尾文案里那句 LLM 原始报错最多留多少字符（见 `_clip_error`）。
+_ERROR_CLIP = 160
+
+
+def _clip_error(text: str, limit: int = _ERROR_CLIP) -> str:
+    """截断要**看得见**：不留那个「…」的话，读的人会以为这就是完整的报错
+    ——那正是这一轮在修的那类缺陷（说一句自己没有资格说的话）换个地方重演。
+    """
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+def _batch_problem(plan: reorder.ReorderPlan, stats: reorder.ReorderStats) -> str:
+    """收尾文案里「有几批没取得判定」那半句；**没有失败时是空串**。
+
+    ⚠️⭐ 冒烟 Bug A-2：`work()` 从前把 `stats` 收下就**再也没读过**——
+    `failed_batches` / `errors` 全丢，于是 job 的收尾 message 只说
+    「22 条改了类目，**0 条没判成**（它们没被动）」，而那一轮实测有 **2 批真的
+    失败了**（`HTTP 503, code 50508`）。界面上的失败信息
+    （`[reorder]第 142 批失败: 重试 3 次仍失败: …`）只在跑的过程中一闪而过，
+    用户唯一读到的那句话把它盖掉了。
+
+    ⚠️ 失败批次数**单独说**，不从 `plan.unjudged` 推：两者可以不等——失败那批
+    的条目可能已经全被用户软删掉（`unjudged` 是 0，而确确实实有 N 批没跑成）。
+    合成一个数就会在那种边界上再产出一句假话。
+    """
+    if not stats.failed_batches:
+        return ""
+    first = stats.errors[0] if stats.errors else "（没留下原因）"
+    return f"；{stats.failed_batches} 批没有取得判定，首个原因：{_clip_error(first)}"
+
+
 # ⚠️ 这张表同时承担**两个**职责，动它之前先看清两种后果不一样：
 #
 #   1) 真文件发出去时的 media type：`FileResponse(..., media_type=_MIME.get(suffix))`。
@@ -309,14 +340,24 @@ def create_app(config: Config) -> FastAPI:
             finally:
                 conn.close()
             if job.cancel.is_set():
-                return "已取消（一条都没改）"
+                # ⚠️ 「一条都没改」是真话，但它**不完整**：取消不等于"用户同意
+                # 有批次失败了"——503 那半句照报（`_batch_problem`）。
+                # ⚠️ 这里**不报** `plan.unjudged`：取消是用户自己按的，没跑到的
+                # 批次在他预期之内；而失败不在预期之内，所以只有它必须说出来。
+                return "已取消（一条都没改）" + _batch_problem(plan, stats)
             ov = overrides.connect()
             try:
                 n = reorder.apply_reorder(ov, plan, actor=actor)
             finally:
                 ov.close()
+            # ⚠️⭐ 这两半缺一不可（冒烟 Bug A-2）：
+            #   ① `unjudged` 由 `plan_reorder` **按源消息**算出来（不是从
+            #      "判过的那批"反向派生）⇒ 全失败时它是「K 条没判成」而不是 0；
+            #   ② `stats` 里那两条失败信息必须**跟着这句话一起出去**——它从前
+            #      是"收了不读"，于是用户对"有几批没判成"没有任何办法。
             return (
                 f"{n} 条改了类目，{len(plan.unjudged)} 条没判成（它们没被动）"
+                + _batch_problem(plan, stats)
             )
 
         try:
