@@ -1341,7 +1341,9 @@ def test_downgrade_apply_without_fields_never_clears_place(cli_env, monkeypatch,
 # ── groups：与 export 抢同一个缓存文件 ⇒ 上锁（U-4，M6 T1）────────
 
 
-def test_groups_refuses_to_run_while_another_instance_holds_the_lock(cli_env, monkeypatch):
+def test_groups_refuses_to_run_while_another_instance_holds_the_lock(
+    cli_env, monkeypatch, capsys
+):
     """⭐ U-4 的另一半：`groups` 撞上正在跑的 export 时**响亮失败**，不静默并发。
 
     ⚠️ 变异反证：把 `cmd_groups` 里的 `with lock.SingleInstance():` 去掉
@@ -1349,6 +1351,11 @@ def test_groups_refuses_to_run_while_another_instance_holds_the_lock(cli_env, mo
 
     ⚠️ 判据必须是「退出码 2」而不是「抛了 AlreadyRunning」：退出码是
     任务计划与用户唯一能看的东西（`cmd_daily` / `cmd_export` 都是这个契约）。
+    ⚠️ 但**只有退出码是不够的**（M6 终审 #4）：同文件里 `repass` / `export` /
+    `daily` / `deadline-audit` 的同类用例**两者都钉**（`rc == 2` + 那行
+    `[跳过] …`）——"响亮地失败"的**机械形式**正是那行输出，只钉退出码的话，
+    一个"退 2 但一个字都不说"的实现照样绿，而用户对着任务计划的
+    「上次运行结果：2」无从知道"是有人在跑、不是我坏了"。
     """
     from vigil import lock
 
@@ -1358,6 +1365,7 @@ def test_groups_refuses_to_run_while_another_instance_holds_the_lock(cli_env, mo
     monkeypatch.setattr(lock.SingleInstance, "__enter__", boom)
     rc = cli.main(["groups"])
     assert rc == 2
+    assert "[跳过]" in capsys.readouterr().out, "退 2 却一个字都没说：用户无从知道为什么没跑"
 
 
 # ── groups：末尾顺手写群清单快照（M6 T4；复审 Important-2 补的覆盖）────

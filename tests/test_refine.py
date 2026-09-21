@@ -528,6 +528,39 @@ def test_refine_keeps_deadline_with_literal_evidence():
     assert out[0].deadline_ts == ts
 
 
+def test_an_item_whose_source_is_not_in_the_batch_is_caught_by_the_first_gate():
+    """⭐ M6 终审 #26：`_verify_deadlines` 里那句 `if srcs` 的**不可达性**是实测的。
+
+    ⚠️ 现象（reviewer 记的）：`srcs` 取不到任何 ts 时，时序核验（第二道闸）会被
+    **静默放弃**——一个 fail-open 的分支，"一旦可达就是零信号"。
+    而它今天不可达，**理由必须被机械钉住、不能只是一句散文**：
+
+      源消息不在本批里 ⇒ 第一道闸门的 `texts.get(mid, "")` 拿到**空串**
+      ⇒ `deadline_supported(死线, "")` 为假 ⇒ 条目被记进 `unsupported`、
+      死线被清 ⇒ 下面那条 `elif`（第二道闸门）**根本走不到**。
+
+    ⇒ 本用例就是那个证明：源消息不在批里时，走的是 **`unsupported`**（1），
+    不是 `backdated`，而且死线确实被清掉了（fail-**closed**，不是 fail-open）。
+
+    ⚠️ 变异反证：把第一道闸门改成 `if it.deadline_ts and srcs and not
+    deadline_supported(...)`（= 让"取不到源文"也跳过它）⇒ 本条**必红**
+    （`unsupported` 变 0，而那条死线会活下来——一个源文未知却带死线的条目）。
+    """
+    import datetime as dt
+
+    ts = int(dt.datetime(2026, 9, 16, 12, 0).timestamp())
+    # 批里**没有** msg 1（item 声称的来源）
+    batch = [_msg(2, content="9月16日12:00开始报名缴费")]
+    out, unsupported, backdated = refine._verify_deadlines(
+        [_extracted(deadline_ts=ts)], batch
+    )
+    assert (unsupported, backdated) == (1, 0), (
+        "源消息不在本批时，第一道闸门**没有** fail-closed 地拦住它——"
+        "那么下面那条 `if srcs` 就真的可达、真的会静默放弃时序核验"
+    )
+    assert out[0].deadline_ts is None
+
+
 def test_parse_deadline_treats_out_of_range_dates_as_no_deadline():
     """⚠️ 「能解析成日期」与「能转成 unix 秒」是**两件事**——坏输入有两种形状。
 

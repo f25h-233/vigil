@@ -340,9 +340,13 @@ def apply_plan(
     代价是中途失败会留下**部分软删**——但那是**可撤销**的（undo / 再跑一次补齐），
     与物理删的"删一半"完全不同量级。这条取舍写在报告里。
 
-    ⚠️ **降级（`plan.downgrades`）本轮不执行**：overlay 目前不支持 `set_field`
-    （`_apply_to_state` 对未知 action 静默忽略），而改主库的 `items.place` 会打破
-    "主库一字未改"。⇒ 记进 `stats.downgrades_deferred`，留给后续决定，**不硬做**。
+    ⚠️ **降级（`plan.downgrades`）本轮不执行**：`item_state` 只有
+    `(kind, deleted)` 两列 ⇒ `set_field` 的那次折叠**没有可写的地方**
+    （`_apply_to_state` 里那一支是**显式惰性**的，与 tombstone 同形；M6 终审 #24
+    修掉的旧注释写的是"`_apply_to_state` 对未知 action 静默忽略"——**那句与代码
+    相反**：`set_field` 是**已知** action，而未知 action 从 T10 起是 `raise`），
+    而改主库的 `items.place` 会打破"主库一字未改"。
+    ⇒ 记进 `stats.downgrades_deferred`，留给后续决定，**不硬做**。
     """
     from . import overrides
 

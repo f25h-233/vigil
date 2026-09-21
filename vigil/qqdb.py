@@ -45,8 +45,8 @@ def strip_fake_header(src: pathlib.Path, dst: pathlib.Path) -> pathlib.Path:
 
     ⚠️ **写 dst 必须原子**（U-4，M6 T1）。原实现是
     ``open(dst, "wb")`` —— 那是「**先截断、再拷**」，而 dst 与 `export`
-    **共用同一个文件**（`export.py:329` 与 `cli.py:66` 指向同一个路径，
-    由 `export._clear_db_path` 定义）。并发时
+    **共用同一个文件**（导出路径与 ``vigil groups`` 经 `cmd_groups` 指向
+    **同一个路径**，它由 `export._clear_db_path` 定义）。并发时
     （用户手跑 ``vigil groups`` 而任务计划正在跑 ``vigil export``）：
 
       1. 后者把这个文件**从 0 字节重新写**；
@@ -62,8 +62,16 @@ def strip_fake_header(src: pathlib.Path, dst: pathlib.Path) -> pathlib.Path:
     而这里恰恰是并发场景；用同一个临时名会让两个进程互相写坏对方正在拷的
     临时文件 —— 而那只会在 replace 之后才现形，**长得像数据损坏**。
     ⚠️ 临时文件必须与目标**同目录**（``os.replace`` 不跨卷）。
-    ⚠️ 失败路径要清掉临时文件：`data/cache/` 会被本函数反复扫到，
-    残留的 `.tmp<pid>` 只会越积越多。
+    ⚠️ 失败路径要清掉临时文件：它的范围**只是"占盘"**，不是"被人扫到"——
+    本函数从不列目录，全仓也没有东西扫 `data/cache/`（M6 终审 #1：从前的
+    理由写的是「会被本函数反复扫到、越积越多」，**那是事实错误**，会让
+    后来者按一个假前提去"清理"）。
+    ⚠️ **代价如实记**：真正的失败路径有两个，本函数只覆盖**能跑完的那一个**。
+    被 `SIGKILL`（任务计划强杀 / 蓝屏）打断时 `except BaseException` 也覆盖不到
+    ——那会留下一个 `.tmp<pid>`，而它是**知情接受**的：峰值 **3.29 GB/次** 的
+    残留只是白占盘，**没有任何自动清理**（glob 全删是错的：会误删并发写者的
+    活临时文件，那条修法已撤销，见计划勘误 E3）。要清就人工确认没有
+    `vigil export` 在跑之后手动删。
     """
     if not src.is_file():
         raise QQDBError(f"库文件不存在: {src}")

@@ -31,12 +31,18 @@ test('撤销成功后必须让筛选列表重取一次', async () => {
    *
    * ⚠️ 变异反证：把 `App.tsx` 的 `if (r.undone) setDataTick((t) => t + 1)`
    * 删掉 ⇒ 本条**必红**。
+   *
+   * ⚠️ `before` 必须取在**首个响应返回之后**（M6 终审 #20）：从前的写法是
+   * `waitFor(() => calls.some('/api/items'))` —— 那只保证请求**发出去了**，
+   * 而它 `.then` 里的 `setState` 还没跑。于是"首屏那份数据落地"引起的重渲染
+   * 有可能落在 `before` 之后 ⇒ 这一条与它的阴性对照
+   * （「撤销没撤成时不许白白重取一次」）**互为自校验**的那对关系被削弱。
+   * 判据改成等一句**只有数据回来之后才会渲染**的话（空列表的文案）：
+   * 它一出现，首屏那次请求就一定已经 resolve 过了。
    */
   const calls = installFetch(true)
   render(<App />)
-  await waitFor(() =>
-    expect(calls.some((c) => c.url.startsWith('/api/items'))).toBe(true),
-  )
+  await screen.findByText('还没有任何条目。', undefined, { timeout: 2000 })
   const before = calls.filter((c) => c.url.startsWith('/api/items')).length
 
   await userEvent.click(screen.getByRole('button', { name: /撤销/ }))

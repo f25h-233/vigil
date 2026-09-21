@@ -459,7 +459,11 @@ test('done 的 job：撤销入口在、点了真的发 /undo、刷新后入口�
   await userEvent.click(screen.getByRole('button', { name: '开始重排' }))
   await screen.findByText(/运行中/)
   finish()
-  await screen.findByText(/4 条改了类目/)
+  // ⚠️ `{ timeout: 5000 }` **不是可选糖**（M6 终审 #21）：这条面板要等轮询到
+  // 终态才渲染，而默认窗口是 1000ms、轮询间隔也是 1000ms ⇒ 实测余量只有
+  // 33–79ms，**约 1/9 次假红**。flaky 的守卫最终会被注释掉，所以本文件另外
+  // 两处同形状（`/12 条改了类目/`、`/9 条改了类目/`）都写了 5000——**只漏这一处**。
+  await screen.findByText(/4 条改了类目/, undefined, { timeout: 5000 })
 
   // ① 入口在
   expect(await screen.findByRole('button', { name: /撤销这次重排/ })).toBeTruthy()

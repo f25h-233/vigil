@@ -126,8 +126,12 @@ def test_a_reader_never_sees_a_partial_file(tmp_path, monkeypatch):
 def test_failure_leaves_the_original_intact_and_no_temp_file(tmp_path, monkeypatch):
     """中途失败 ⇒ 原文件原样、且**不留临时文件**。
 
-    ⚠️ 不留临时文件是承重的：`data/cache/` 会被 `strip_fake_header` 反复扫到，
-    残留的 `.tmp<pid>` 会被后来的 cache 判据当成无关文件，越积越多。
+    ⚠️ 这里的理由**只是"别白占盘"**（M6 终审 #1 修掉的那条错理由）：
+    从前的写法说「`data/cache/` 会被 `strip_fake_header` 反复扫到，残留的
+    `.tmp<pid>` 会被后来的 cache 判据当成无关文件，越积越多」——**那句是假的**：
+    本函数从不列目录，缓存判据只看目标文件本身的 `(size, mtime)`，
+    全仓没有任何东西扫 `data/cache/`。留着假理由的代价是后来者按一个
+    假前提去做"清理"（而真的清理会误删并发写者的活临时文件）。
     """
     src = _make_fake_header_src(tmp_path / "nt_msg.db", b"OLD" * 200)
     dst = qqdb.strip_fake_header(src, tmp_path / "cache" / "clear.db")

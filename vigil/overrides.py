@@ -681,9 +681,22 @@ _RECONCILE_LOUD_AFTER = 3
 # * **写端点**（`api_update_category` / `api_delete_category` / `api_category_undo`）
 #   取它，覆盖 `set_kind_alias → snapshot → 写文件` **整段**。
 #
-# ⚠️ **是 `RLock` 不是 `Lock`**：写端点自己也会经 `store.kind_counts(...)` 走到
-# 对账（同一条线程），可重入才不死锁。锁的取用顺序也只有一个方向
-# （`write_lock` → `ALIAS_LOCK`），对账那一侧**从不**去拿 `write_lock`。
+# ⚠️ **保留 `RLock`（不是 `Lock`），但理由按实情写**（M6 终审 #16 / 勘误 E7：
+# **没被考验的理由不许写成结论**）：
+#   · 从前的写法断言「写端点自己也会经 `store.kind_counts(...)` 走到对账
+#     （同一条线程）⇒ 可重入才不死锁」。**今天不成立**：`api_delete_category`
+#     那次 `store.kind_counts()` 在**取锁之前**；`api_update_category` 在锁内
+#     走的是 `prune_aliases`（不经过对账）。
+#   · **实测**（终审记录在 `final-review.md`）：`_is_owned()` 命中 **0 次**，
+#     把 `RLock` 换成 `Lock` **照样全量绿** ⇒ 可重入的必要性**没有被任何判据
+#     考验过**，所以这里**不许**把它写成"必须"。
+#   · 那为什么还留着它：**防御性**，而且防的是一个具体的形状——「持锁时再走一次
+#     查询入口」。对账（`reconcile_if_stale`）**挂在每一个查询入口上**、
+#     **也取这把锁**；只要将来有人在锁内加一次 `store.kind_counts` / `get_item`
+#     （"顺手读一下现在有几条"是最自然的下一步），`Lock` 就会**死锁**——没有
+#     超时、没有日志、服务卡在一条请求上。代价只是一个可重入计数。
+#   · 取用顺序只有一个方向（`write_lock` → `ALIAS_LOCK`），对账那一侧**从不**
+#     去拿 `write_lock`。
 #
 # ⚠️ **范围（如实写，不编理由）**：这把锁是**进程内**的 ⇒ **服务进程内已闭合**。
 # 跨进程仍有一个**毫秒级窗口**：`refine` / `digest` 是**别的进程**，

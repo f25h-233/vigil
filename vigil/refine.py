@@ -404,6 +404,17 @@ def _verify_deadlines(
             # ⚠️ 源消息的 ts 取**最早**的那条（一条 item 可以有多条源消息）：
             # 死线必须晚于**它出现的最早时刻**才算合理，取最晚的会放过一批。
             srcs = [ts_by_msg[mid] for mid in it.src_msg_ids if mid in ts_by_msg]
+            # ⚠️ **`srcs` 为空 ⇒ 这一支"放弃核验"（fail-open），而它今天不可达**
+            # （M6 终审 #26）。不可达的理由是**实测的**、不是"看着不可能"：
+            # 源消息不在本批里 ⇒ 上面第一条闸门的 `texts.get(mid, "")` 拿到空串
+            # ⇒ `deadline_supported` 判**假** ⇒ 这条 `elif` **根本走不到**
+            # ——那种条目进的是 `unsupported` 计数。
+            # `test_an_item_whose_source_is_not_in_the_batch_is_caught_by_the_first_gate`
+            # 钉着这条推理（删掉那条用例的理由就只剩一句散文了）。
+            # ⇒ 留着 `if srcs` 是**防御性**的；代价如实记：真到了这里，时序核验
+            # 会被**静默**放弃（不计数、不打日志）。要把它变成信号得加一个新计数，
+            # 而那个计数在"不可达"这件事上恒为 0——**今天加了也看不见**
+            # （这是"注释点明"而不是"加计数"的唯一理由，不是省事）。
             if srcs and not deadline_sane(it.deadline_ts, min(srcs)):
                 backdated += 1
                 it = replace(it, deadline_ts=None)
@@ -491,8 +502,19 @@ def refine(
         # 用户看到的是「[refine] 没有待处理的消息」，与「这个窗口本来就空」
         # **一字不差**：一句无法区分两种事实的日志，等于没有日志。
         if stats.skipped_deleted:
+            # ⚠️ **句首的总数必须自己带上**（M6 终审 #23）：下面那行
+            # 「扫描 N 条 → …」在**早退之后**，而这两行是**互斥**的（整窗被墓碑时
+            # 走的是 `if not messages: return`，那行永远不打印）⇒ 只写"其中"
+            # 就是指向一个**还没打印、也可能永远不打印**的数。
+            # ⚠️ 但**不许**为此去改 `stats.scanned` 本身：它的语义是"过滤之后
+            # 真正要处理多少条"（CLI 拿 `scanned - sent_messages` 报"本地筛掉"），
+            # 把墓碑算进去会让那句话把"被墓碑挡下的"错报成"本地筛掉的"
+            # （`test_refine_skipped_deleted_counts_only_what_it_actually_skipped`
+            # 钉着 `stats.scanned == 2` / `== 0` 这两个值）。
+            # ⇒ 只在这一行里现算总数。
             on_progress(
-                f"[refine] 其中 {stats.skipped_deleted:,} 条已软删，跳过重抽（D15 墓碑）"
+                f"[refine] 扫描 {stats.scanned + stats.skipped_deleted:,} 条，"
+                f"其中 {stats.skipped_deleted:,} 条已软删，跳过重抽（D15 墓碑）"
             )
 
         if not messages:

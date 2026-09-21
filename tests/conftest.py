@@ -98,7 +98,15 @@ desc = "隔离用类目：兼职招聘"
 #      · `config.REPO_ROOT` 与 `api.REPO_ROOT` 是**两个模块全局**
 #        （`config.py` / `api.py` 各一个），下面的夹具只挪得动其中一个；
 #      · `validate_config_raw` 对**相对** `output_db` 的解析基准是
-#        `config.REPO_ROOT`——那是 import 期算好的常量，`monkeypatch` 够不着；
+#        `config.REPO_ROOT`。⚠️ **它是模块全局，`monkeypatch` 够得着**
+#        （M6 T4 复审实测：`setattr(config, "REPO_ROOT", tmp)` 之后，相对
+#        `output_db` 立刻挂到 tmp 下）——**够不着的不是在 import 期算好的
+#        `REPO_ROOT` 本身，而是由它派生出来的那几个常量**
+#        （`DEFAULT_PERSONS` / `DEFAULT_CATEGORIES` / `DEFAULT_LLM_TOML` /
+#        `LOCK_PATH`）：它们的值里**已经烙进了**那个根，要挪就得逐个
+#        `monkeypatch`（这就是下面四道 `_isolate_*` 夹具存在的原因）。
+#        ⚠️ 这里纠正的是一句**错的论证**（M6 终审 #13）：结论（路径写绝对）
+#        仍成立，但按错的理由去理解它，下一个人的判断会在别处错。
 #      · 于是「只挪了 `api.REPO_ROOT`，而临时 `groups.toml` 里写的是相对
 #        `output_db`」会把产物**指回真实仓库的 `data/`**：快照路径
 #        （`groups_snapshot.default_path` = `output_db.parent / …`）正是从它推出来的。
@@ -139,6 +147,17 @@ def _isolate_categories_toml_path(tmp_path_factory, monkeypatch):
     monkeypatch.setattr(_cats, "DEFAULT_CATEGORIES", path)
     st = path.stat()
     monkeypatch.setattr(overrides, "_LAST_RECONCILE", (st.st_mtime_ns, st.st_size))
+    # ⚠️ **它的兄弟变量必须一起隔离**（M6 终审 #27）：`_RECONCILE_FAILURES` 与
+    # `_LAST_RECONCILE` 是同一族的**模块级状态**，而上面那一行刚为它的兄弟做过
+    # 一模一样的事——漏掉兄弟就是**同形状的第二个入口**，而失败形态是
+    # 「与环境相关的假红」：某个用例让对账**连续**失败到阈值（3）之后计数留在
+    # 模块上，下一个用例只该看到一条 warning，却拿到 `_log.error`——而那条升级
+    # 分支有自己的用例（`test_repeated_reconcile_failures_escalate_to_error`），
+    # 它会因此变成**取决于执行顺序**的红/绿。
+    # ⚠️ 那个用例自己也会 monkeypatch 这个变量（它的第一段要断言"前两次只许
+    # warning"）——两处**不冲突**（各设各的），这里加的是**兜底**：
+    # 兜住的是"别的用例把计数留在模块上"那条路。
+    monkeypatch.setattr(overrides, "_RECONCILE_FAILURES", 0)
 
 
 @pytest.fixture

@@ -402,6 +402,50 @@ def _array_section(raw: dict, key: str, path: pathlib.Path) -> list:
     return section
 
 
+def _snapshot_categories_before_import(path: pathlib.Path) -> bool:
+    """把 `path` **此刻**的原文 + **此刻**的别名表存成一格撤销快照。返回是否拍了。
+
+    ⚠️ **为什么必须由导入来拍**（M6 终审 F1，Important）：`import_pack` **整体
+    重写** `paths.categories`，而 `/api/categories/undo` 的契约是「把
+    `categories.toml` 回滚到**上一次程序写它之前**的样子」——**导入也是「程序写它」**。
+    不拍的话，撤销栈里那一格还是更早的那次改动（比如一次改名），于是
+
+        改名 → 导入一份只带类目的包 → 点「撤销上一次类目改动」
+
+    会把类目退到**改名之前**，而包里的群 / 人物 / 别名**原样留着**：一次
+    **混合状态**，而成功路径**一个字都不说**（界面上那句话与它实际做的事对不上）。
+
+    ⚠️ **三条位置约束都是承重的**（调用点在 `import_pack` 里）：
+      · **文件被重写之前** —— 快照要的是"覆盖前的原文"，拍晚了存的就是新内容；
+      · **别名表被改之前** —— 快照存的是「文件原文 + 别名表」这一**对**，
+        两者必须来自**同一时刻**（拍在别名写之后 ⇒ 撤销会把「旧文件 + 新别名表」
+        装回去 ⇒ `old_kind` 又变成现存 slug ⇒ 不变量破；见
+        `overrides.save_config_snapshot` 与 T5 fix loop 2 的 FIX 1/C-1）；
+      · **`ALIAS_LOCK` 之内** —— 否则对账（`reconcile_if_stale`，挂在每一次查询上）
+        能插进"拍了快照、还没写文件"的那一瞬里剪枝。
+
+    ⚠️ **调用方必须先 `overrides.ensure_schema()`**：`overrides.connect()` **不建表**，
+    而 `save_config_snapshot` 内部要读 `kind_alias` 去填 `aliases` 列。终审的变异 D
+    实测过这条缝有多险：把快照插进 `import_pack` 却漏了 `ensure_schema`，
+    一次「不带别名的包」的导入会在**三条无关用例**上炸出
+    `sqlite3.OperationalError: no such table: kind_alias`——**红在异常上**，
+    而没有任何一条用例是因为"快照真的拍错了"而红的。
+
+    ⚠️ **文件不在 ⇒ 不拍**（返回 `False`）：没有文件就没有"它被覆盖之前的样子"
+    可回滚。这一支是**真实**的（出口判据 4 就是往一个全新的根里导入，
+    那个根下还没有 `categories.toml`），所以它**不许抛**。代价如实记：
+    这一格的缺失意味着撤销栈里更早的那一格会露头（"多退一格"）。
+    """
+    if not path.is_file():
+        return False
+    ov = overrides.connect()
+    try:
+        overrides.save_config_snapshot(ov, body=path.read_text(encoding="utf-8"))
+    finally:
+        ov.close()
+    return True
+
+
 def _read_local_config(path: pathlib.Path) -> tuple[Config | None, str]:
     """读本机那份 `groups.toml`：返回 `(配置或 None, 读不出来的原因)`。
 
@@ -435,6 +479,12 @@ def import_pack(
     反过来的话，中间崩溃会留下「配置里已经没有 `life` 了、但别名还没建」
     ⇒ 条目永久悬空。这与 `api.api_update_category` 的顺序是**同一条理由**。
 
+    ⚠️ **再往前还有一步：拍快照**（M6 终审 F1）。`categories.toml` 会被这一步
+    整体重写，而它是撤销栈（`/api/categories/undo`）唯一保护的**那一份文件**
+    ——不拍的话，「撤销上一次类目改动」会**跳过这次导入**、多退一格，把类目退到
+    更早那次改动之前，而群/人物/别名留在导入后的状态里。见
+    `_snapshot_categories_before_import` 的完整论证。
+
     ⚠️ **整段取 `overrides.ALIAS_LOCK`**（T5 的不变量）：别名写完、类目文件
     还没写的那一瞬间，若 `reconcile_if_stale`（挂在**每一次查询**上）跑进来，
     它会拿**磁盘上那份还是旧的**类目表去剪枝 ⇒ 刚写进去的别名被判成
@@ -446,13 +496,28 @@ def import_pack(
     # 这个字段只在**真的合并保留**的那一支置位（见下面 ⑤）。
     report = ImportReport()
 
-    # ① 别名 → ② 类目 → ③ 剪枝：三段在同一把锁里（见 docstring）。
+    # ⓪ 快照 → ① 别名 → ② 类目 → ③ 剪枝：四段在同一把锁里（见 docstring）。
     with overrides.ALIAS_LOCK:
+        # ⚠️ `ensure_schema()` 不能省：`overrides.connect()` **不建表**，
+        # 而 `vigil config import` 可能是这台机器上第一条碰 overlay 的命令
+        # （没有它就是一个 `no such table: kind_alias` 的裸 traceback）。
+        # ⚠️ **F1 起它必须排在最前面**：下面的快照要读 `kind_alias`，而包里可能
+        # 一条 `[[kind_aliases]]` 都没有——从前的写法是"只在 `pack.aliases` 非空时
+        # 建表"，把快照插在写文件之前就会红在 `no such table` 上（终审变异 D 的实测）。
+        overrides.ensure_schema()
+
+        # ⓪ 快照（M6 终审 F1）：导入**整体重写** `categories.toml` ⇒ 撤销栈必须
+        # 先记下"覆盖前的那一份"，否则一次「改名 → 导入 → 撤销」会退到改名之前
+        # 而包里的群/人物/别名留着（一次混合状态）。完整论证见函数 docstring。
+        #
+        # ⚠️ 与 `api_update_category` 的「空操作不拍快照」**刻意不同**：那边判等
+        # 只需要比较两个 `Category`；这边是整份重写 + 别名合并 + 群/人物，
+        # 判等要把四种改动都算进去才准。判错的代价**不对称**——漏拍就是 F1 本身
+        # （用户被送到一个说不通的现场），多拍一格只是"撤销看着没反应"。
+        # ⇒ 宁可多拍，不许漏拍。
+        _snapshot_categories_before_import(paths.categories)
+
         if pack.aliases:
-            # ⚠️ `ensure_schema()` 不能省：`overrides.connect()` **不建表**，
-            # 而 `vigil config import` 可能是这台机器上第一条碰 overlay 的命令
-            # （没有它就是一个 `no such table: kind_alias` 的裸 traceback）。
-            overrides.ensure_schema()
             ov = overrides.connect()
             try:
                 # ⚠️ **先整体算出最终表、再整体落**（Fix loop 2 / FIX 1a+1b）。

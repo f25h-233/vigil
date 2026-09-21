@@ -266,6 +266,98 @@ test('提交中的「加入监视」必须点不动（双击不许发两次 POST
   expect(await screen.findByText(/全部历史/)).toBeTruthy()
 })
 
+test('已停用的群（known 但没 watched）必须能一键启用，而不是给一个必然 409 的「加入监视」', async () => {
+  /**
+   * ⭐ **M6 终审 F2（Important）**：界面上「停用」从前是一条**单向门**。
+   *
+   * `/api/groups` 刻意把群分成两个字段：`watched` = 已纳入**且** `enabled`，
+   * `known` = 已纳入（可能被停用）。而界面只读 `watched` ⇒ 一个 `enabled = false`
+   * 的群走 `else` 支渲染成「加入监视」，那个 POST **必然** 409
+   * 「群已经在配置里了」；而全文件里 `patchGroup` 只有 `{enabled:false}` 一处调用
+   * ⇒ **网页上再也启用不回来**。而后端自己推荐的正确动作**正是**
+   * 「改成 enabled = false」（`DELETE /api/groups/{gid}` 的 409 文案原文）。
+   *
+   * ⚠️ 四块断言，缺一块就是一个空壳：
+   *   ① 停用的那个群渲染的是「启用」（不是「加入监视」）；
+   *   ② 没纳入的那个群**照旧**渲染「加入监视」（`known:false` 那一支不许被牵连）；
+   *   ③ 点「启用」发的是 **PATCH `/api/groups/222`**、体是 `{enabled:true}`；
+   *   ④ **一个 POST /api/groups 都不许发**——那个 POST 是"必然 409"本身，
+   *      只断言 ③ 的话，一个"两个都发"的实现照样绿。
+   *
+   * ⚠️ 变异反证（真跑过）：把 `g.known ? … : …` 那一支删回原来的两分支
+   * ⇒ 本条**必红**（找不到「启用」）。
+   */
+  const { calls } = installFetch({
+    groups: {
+      available: true,
+      reason: '',
+      generated_at: 1_700_000_999,
+      groups: [
+        { id: 111, name: '甲群', messages: 1664, last_ts: 1_700_000_000, watched: true, known: true },
+        { id: 222, name: '乙群', messages: 10, last_ts: 1_700_000_000, watched: false, known: true },
+        { id: 333, name: '丙群', messages: 3, last_ts: 1_700_000_000, watched: false, known: false },
+      ],
+    },
+  })
+  render(<Settings />)
+
+  await screen.findByText('甲群')
+  // ① 停用的那个群
+  const enable = await screen.findByRole('button', { name: '启用' })
+  // ② 未纳入的那个群：列表里的「加入监视」只有一个（另一个同名按钮是底部手填表单）
+  expect(screen.getAllByRole('button', { name: '加入监视' }).length).toBe(2)
+
+  await userEvent.click(enable)
+  // ③ PATCH 打到了**那个群**，体是启用
+  const patch = calls.find((c) => c.method === 'PATCH')
+  expect(patch?.url, '启用没有 PATCH 那个群').toBe('/api/groups/222')
+  expect(patch?.body).toEqual({ enabled: true })
+  // ④ 一个 POST 都没发
+  expect(
+    calls.filter((c) => c.method === 'POST' && c.url === '/api/groups').length,
+    '给一个已在配置里的群发了「加入监视」——那个请求必然 409',
+  ).toBe(0)
+})
+
+test('无名群（快照里 name 为空）的「加入监视」必须把空名原样发出去，不许编一个', async () => {
+  /**
+   * ⭐ **M6 终审 F2 的连带**：快照里「名字读不出来」是**正常状态**
+   * （`groups_snapshot.collect` 刻意留 `""`，理由在它的 docstring 里），
+   * 界面把它显示成「(无名) 111」。从前后端要求 name 非空 ⇒ 这个群
+   * **必然**拿回 400「群名不能为空」，在网页上**加不进来**。
+   *
+   * ⚠️ 判据是**发出去的那个名字**：`{name: ''}` —— **不是**"随便补一个"。
+   * 补一个（`群 111` / `(无名)`）是把一个**我们不知道的事实**写进配置文件，
+   * 而它之后会出现在日报与信息流里，与真群名无从区分。
+   *
+   * ⚠️ 变异反证（真跑过）：把 `api_add_group` 改名后的空名检查加回去
+   * ⇒ 后端那条用例红在 400；前端这条钉的是**请求体**（`name: ''`），
+   * 把 `g.name` 换成 `g.name || '群' + g.id` ⇒ 本条**必红**。
+   */
+  const { calls } = installFetch({
+    groups: {
+      available: true,
+      reason: '',
+      generated_at: 1_700_000_999,
+      groups: [
+        { id: 444, name: '', messages: 7, last_ts: 1_700_000_000, watched: false, known: false },
+      ],
+    },
+  })
+  render(<Settings />)
+
+  expect(await screen.findByText(/无名/)).toBeTruthy()
+  // ⚠️ 列表里的那个在**前**（`<ul>` 在表单之前），表单那个同名按钮在**后**
+  await userEvent.click(screen.getAllByRole('button', { name: '加入监视' })[0])
+
+  const post = calls.find((c) => c.method === 'POST' && c.url === '/api/groups')
+  expect(post?.body, '无名群发出去的名字被补成了一个我们自己编的值').toEqual({
+    id: 444,
+    name: '',
+    tier: 'normal',
+  })
+})
+
 // ── 类目 ──────────────────────────────────────────────────────────────
 
 test('删类目时未知条目数就必须要求选择迁移目标', async () => {

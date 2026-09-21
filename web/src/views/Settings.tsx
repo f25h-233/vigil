@@ -132,6 +132,20 @@ function GroupsSection() {
   )
 }
 
+// ⚠️ **三个状态、三支按钮**（M6 终审 F2，Important）。`/api/groups` 刻意把群分成
+// 两个字段（见 `types.ts` 的 `GroupRow`）：`known` = 已纳入（**可能被停用**），
+// `watched` = 已纳入**且** `enabled`。此前界面只读 `watched` ⇒ 一个
+// `enabled = false` 的群渲染成「加入监视」，而那个 POST 撞 `api_add_group` 的
+// 409「群 111 已经在配置里了」——**停用在界面上是一条单向门**：全文件里
+// `patchGroup` 只有 `{enabled:false}` 一处调用，没有任何按钮发得回 `true`。
+// 而后端自己推荐的正确动作**正是**「改成 enabled = false」（`DELETE /api/groups/{gid}`
+// 的 409 文案原文），于是用户按它的建议操作之后**在网页上再也回不去了**。
+//
+// ⚠️ 三支的判据必须是 `known`（不是 `name`、也不是"它看起来像被停用"）：
+// `known && !watched` 是**唯一**能证明"它已在配置里"的字段。
+// ⚠️ 无名群（`collect` 刻意把取不到群名的留成 `""`，见它的 docstring）走第三支时
+// 必须能把名字**空着**发出去——后端从 F2 起接受空名（"名字未知"是快照里的正常
+// 状态，`groups.toml` 与 `cli.py` 的显示路径都早就容许它）。
 function GroupRowView({ g, onChanged }: { g: GroupRow; onChanged: () => void }) {
   const [busy, setBusy] = useState(false)
   const [err, setErr] = useState<string | null>(null)
@@ -161,6 +175,14 @@ function GroupRowView({ g, onChanged }: { g: GroupRow; onChanged: () => void }) 
             移除
           </button>
         </>
+      ) : g.known ? (
+        // ⚠️ 这一支**只放「启用」**：想彻底删掉它的人先启用、再移除（两步、不是死路），
+        // 而多一个「移除」在这里会诱导用户对"我刚停用、还想留着"的群误点删除。
+        <button disabled={busy}
+                onClick={() => act(() => api.patchGroup(g.id, { enabled: true }))}
+                className="rounded px-2 py-1 text-xs text-sky-300">
+          启用
+        </button>
       ) : (
         <button disabled={busy} onClick={() => act(() => api.addGroup(g.id, g.name, 'normal'))}
                 className="rounded px-2 py-1 text-xs text-sky-300">
@@ -577,7 +599,21 @@ function CategoriesSection() {
         onClick={() =>
           api
             .undoCategorieChange()
-            .then(() => setTick((t) => t + 1))
+            .then((r) => {
+              // ⚠️ **成功路径必须说一句，而且要说清范围**（M6 终审 F1）。
+              // 从前这里只有 `setTick(...)`：撤成功了一个字都不说，用户不知道
+              // 刚刚退掉了什么。而"退掉了什么"在与**导入**交界时尤其要紧——
+              // 一次导入整体重写了 `categories.toml`（F1 修掉之后它也进撤销栈），
+              // 而这次撤销**只**回滚那一份文件：包写进去的群 / 人物 / 别名映射
+              // 原样留着。不说的话，用户会以为"撤销"把整次导入都退了回去。
+              setMsg(
+                r.undone
+                  ? '已撤销——类目表回到**上一次程序改动它之前**那一份' +
+                    '（群 / 人物 / 改名映射**不在**这次回滚的范围里）。'
+                  : '没有可撤销的类目改动（撤销栈是空的）。',
+              )
+              setTick((t) => t + 1)
+            })
             .catch((e) => setMsg(e instanceof Error ? e.message : String(e)))
         }
         className="mt-3 rounded-lg bg-white/5 px-3 py-1.5 text-xs text-white/60"

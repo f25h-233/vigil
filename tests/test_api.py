@@ -1743,6 +1743,48 @@ def test_api_patch_group_disables_without_deleting(client_factory):
     body = c.get("/api/groups").json()
     assert all(not g["watched"] for g in body["groups"])
     assert any(g["id"] == 111 for g in body["groups"]), "停用不是删除——条目还在"
+    # ⚠️ **停用之后必须 still `known`**（M6 终审 F2）：界面按 `known` 分三支，
+    # 而「已停用」与「没纳入」在 `watched` 上**同形**（都是 False）——
+    # 少了这一个字段，界面就只能给一个必然 409 的「加入监视」。
+    assert next(g for g in body["groups"] if g["id"] == 111)["known"] is True
+
+
+def test_api_add_group_accepts_a_group_whose_name_is_unknown(client_factory):
+    """⭐ M6 终审 **F2** 的连带：无名群必须加得进来。
+
+    ⚠️ **现象**：群名的来源是快照（`groups_snapshot.collect`），而它**刻意**把
+    取不到群名的群留成 `""`（"名字缺失是正常状态"，那句论证在它的 docstring 里）
+    ⇒ 界面上那个群显示成「(无名) 111」，而它的「加入监视」从前必然拿回
+    **400「群名不能为空」**——网页上唯一的加群入口（底部手填表单）之外**没有出路**。
+
+    ⚠️ 三类事实一起断言，缺一条就是一个看起来在守的空壳：
+      ① 端点接受空名（201）；
+      ② 名字**真的是空的**落进 `groups.toml`（不是被悄悄补成 `?`/群号之类
+         ——那是**编**一个名字，而本项目最贵的形态就是"写下一个自己不知道的事实"）；
+      ③ **显示路径**退回**裸群号**：`group_names_map` 从 F3 起跳过空名，
+         于是 `item_out` 的 `names.get(gid, str(gid))` 拿到的是 `"111"`。
+         不跳过的话条目会显示一个**空群名**——那与"读不出来源群"长得一样。
+
+    ⚠️ 变异反证（真跑过）：把 `api_add_group` 里那句 `if not name: 400` 加回去
+    ⇒ 本条**必红**（在 ① 上）；把 `group_names_map` 的 `if g.name` 去掉
+    ⇒ 本条**红在 ③**（`group_name` 变成 `""`）。
+    """
+    c = client_factory()
+    # ⚠️ 222 是**有条目**的那个未配置群（夹具里 3 号条目在 222 群）——
+    # 这样 ③ 才有东西可看：一个**有条目、名字未知**的群。
+    r = c.post("/api/groups", json={"id": 222, "name": "", "tier": "normal"})
+    assert r.status_code == 201, r.text
+
+    # ② 真的写进去了，而且是空的（不是被补出来的）
+    text = c.get("/api/config/pack").json()["toml"]
+    assert 'name = ""' in text, text
+
+    # ③ 显示路径退回裸群号（而不是空串）
+    by_group = {it["group_id"]: it["group_name"] for it in c.get("/api/items").json()["items"]}
+    assert by_group[222] == "222", (
+        "群名未知时条目显示的是空串——那与「读不出来源群」长得一样"
+    )
+    assert by_group[111] == "甲群", "有名字的群照旧显示名字（这一支不许被牵连）"
 
 
 # ── M6 T5：类目编辑端点 ─────────────────────────────────────────────
@@ -2810,6 +2852,68 @@ def test_api_import_pack_applies(client_factory):
     r = c.post("/api/config/pack", json={"toml": text, "apply": True})
     assert r.status_code == 200
     assert r.json()["categories"] >= 1
+
+
+def test_api_import_pack_snapshots_categories_so_undo_steps_back_exactly_one(
+    client_factory,
+):
+    """⭐ M6 终审 **F1**（Important）：导入也进撤销栈，且撤销**只退一格**。
+
+    ⚠️ **现象**（reviewer 的探针 P1 复现过）：`import_pack` 整体重写
+    `categories.toml` 却**从不拍快照**，而 `/api/categories/undo` 的契约是
+    「回滚到**上一次程序写它之前**的样子」——导入也是"程序写它"。于是
+
+        改名 → 导入一份只带类目的包 → 点「撤销上一次类目改动」
+
+    退到的是**改名之前**（栈里那一格比导入更早），而包里的群/人物/别名原样留着
+    ——一次**混合状态**，且成功路径一个字都不说。界面上唯一那句话
+    （`↶ 撤销上一次类目改动`）与它实际做的事对不上。
+
+    ⚠️ **判据为什么断言两次撤销**（缺一条就是空守卫）：
+      · 第一次撤销必须回到 **`post_rename`**（= 导入前那份真状态）——
+        没有它，"拍了一格别的什么东西"照样绿；
+      · 第二次撤销必须回到 **`before_rename`**——它证明那一格**没有把 S0 挤掉**：
+        拍快照时若写成"清空栈再放一格"，第一次撤销照样对，而**从前的历史丢了**。
+
+    ⚠️ 变异反证（真跑过，见 fix 报告）：把 `_snapshot_categories_before_import(...)`
+    那一行删掉 ⇒ 本条**必红**在第一次撤销上（拿到 `before_rename`）。
+    """
+    c = client_factory()
+    before_rename = [x["slug"] for x in c.get("/api/categories").json()["categories"]]
+    assert "academic" in before_rename
+
+    # ① 一次网页改名 ⇒ 撤销栈里拍下 S0（= 改名**之前**）
+    assert c.put("/api/categories/academic", json={"slug": "academic_v2"}).status_code == 200
+    post_rename = [x["slug"] for x in c.get("/api/categories").json()["categories"]]
+    assert post_rename != before_rename
+
+    # ② 导入一份**只带类目**的包（`apply=true`）——它整体重写 categories.toml。
+    #    ⚠️ 刻意不带 `[settings]`/`[[groups]]`：那样 `pack.config is None`、
+    #    第 ⑤ 步整段跳过，于是"撤销之后群配置留着"这件事**只**由类目这一格决定
+    #    （与 reviewer 的探针 P1 同一个形状）。
+    pack = (
+        "schema = 1\n"
+        "\n"
+        "[[categories]]\n"
+        'slug = "sport"\n'
+        'label = "体育"\n'
+        'desc = "只带类目的包"\n'
+    )
+    r = c.post("/api/config/pack", json={"toml": pack, "apply": True, "keep_settings": True})
+    assert r.status_code == 200, r.text
+    assert [x["slug"] for x in c.get("/api/categories").json()["categories"]] == ["sport"]
+
+    # ③ 撤销**一次** ⇒ 必须退到「导入之前」，而不是「改名之前」
+    assert c.post("/api/categories/undo").json() == {"undone": True}
+    after_first = [x["slug"] for x in c.get("/api/categories").json()["categories"]]
+    assert after_first == post_rename, (
+        "导入没进撤销栈：撤销跳过这次导入、多退了一格"
+        f"（拿到 {after_first}，应当是导入前的 {post_rename}）"
+    )
+
+    # ④ 再撤一次 ⇒ 退到改名之前。这一格是**改名**留下的，导入不该把它挤掉。
+    assert c.post("/api/categories/undo").json() == {"undone": True}
+    assert [x["slug"] for x in c.get("/api/categories").json()["categories"]] == before_rename
 
 
 def test_api_import_pack_returns_400_not_500_for_a_shape_error(client_factory, tmp_path):

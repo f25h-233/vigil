@@ -133,9 +133,18 @@ def _cmd_groups_locked(args) -> int:
             groups_snapshot.collect(counts, names),
             groups_snapshot.default_path(config),
         )
-        print(f"[快照] 已写 {snap_path}", file=sys.stderr)
     except Exception as exc:  # noqa: BLE001 — 快照是增强项，任何失败都只警告
         print(f"[警告] 群清单快照写不出去（不影响群列表）：{exc}", file=sys.stderr)
+    else:
+        # ⚠️ **报进度必须留在 `try` 外面**（M6 终审 #14；规矩的完整论证在
+        # `export.py` 的 `on_progress(snap_note)` 那一段）：写在 `try` 里的话，
+        # "报进度失败"（stderr 被关掉 / 管道断开 / 日志写不进去）会被上面那句
+        # `except Exception` 吞成「群清单快照写不出去」——**一个指向错误方向的
+        # 诊断**：真相是输出流的问题，而那句话让用户去查快照（而它**已经写好了**）。
+        # 能吞的只有"打扫类"失败；**报进度是本次运行的记录，它的失败必须冒出去**。
+        # ⚠️ `else` 而不是"挪到 except 之后"：后者会在**失败时**也打印这一行
+        # ——那就成了一句假话（写着"已写"，其实没写）。
+        print(f"[快照] 已写 {snap_path}", file=sys.stderr)
 
     watched = {g.id for g in config.enabled_groups}
     known = {g.id for g in config.groups}

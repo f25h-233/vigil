@@ -664,7 +664,13 @@ def create_app(config: Config) -> FastAPI:
         except Exception as exc:  # noqa: BLE001
             logs.emit(f"[警告] 群名读取失败，信息流退回裸群号：{exc!r}")
             return {}
-        return {g.id: g.name for g in cfg.groups}
+        # ⚠️ **空名不进这张表**（M6 终审 F2）：`str(g.name)` 若为 `""`，下面
+        # `item_out` 的 `names.get(gid, str(gid))` **命中键**（键在、值空）
+        # ⇒ 条目显示一个**空群名**，而那是"这条条目读不出来源群"的假相；
+        # 跳过之后它退回**裸群号**——与 `cli.py` 的 `gname or m.group_id`
+        # 同一条口径，也正是 `groups_snapshot.collect` 把"名字未知"留成 `""`
+        # 时**预期**的显示结果（加群端点从 F2 起接受空名，所以这条路径真实存在）。
+        return {g.id: g.name for g in cfg.groups if g.name}
 
     def item_out(
         it: store.ApiItem, names: dict[int, str], cats: dict[str, Category]
@@ -1371,9 +1377,17 @@ def create_app(config: Config) -> FastAPI:
                 status_code=400,
                 detail="群号必须是正整数（拒绝 true：bool 是 int 的子类，会静默变成 1）",
             )
+        # ⚠️ **空名是合法输入**（M6 终审 F2，Important）：群名的来源是快照
+        # （`groups_snapshot.collect`），而它**刻意**把取不到群名的群留成 `""`
+        # ——"名字缺失是正常状态"（那句论证在 `collect` 的 docstring 里）。
+        # 从前这里 400「群名不能为空」⇒ 界面上那些显示成「(无名) 111」的群
+        # **必然加不进来**，而它们恰恰是「配置页是唯一的加群入口」这件事的
+        # 一部分。`groups.toml` 与 `cli.py` 的显示路径**本来就容许**空名
+        # （`cli.py` 是 `gname or m.group_id`，`config.py` 的 `validate_config_raw`
+        # 对 `name` 不做非空校验）⇒ 这道闸只挡在这里，是**不一致**。
+        # ⚠️ 空名不写进 `groups.toml` 的后果也要说清：显示路径退回**裸群号**
+        # （`group_names_map` 从 F2 起跳过空名，见它的 docstring）。
         name = str(body.get("name", "")).strip()
-        if not name:
-            raise HTTPException(status_code=400, detail="群名不能为空")
         _reject_controls(name, "name")
         tier = str(body.get("tier", TIER_NORMAL))
         if tier not in VALID_TIERS:
@@ -1409,6 +1423,11 @@ def create_app(config: Config) -> FastAPI:
             name = old.name
             if "name" in body:
                 name = str(body["name"]).strip()
+                # ⚠️ 与 `api_add_group` **刻意相反**（M6 终审 F2）：那边接受空名，
+                # 因为它的名字来自快照、而"快照里读不出名字"是正常状态；
+                # 这边收到的是**用户正填在输入框里的**一个名字，空串只可能是
+                # 手滑或想抹掉它——两者都不该以"写一个空名进 groups.toml"收场
+                # （要表达"未知"就该走快照那条路，而不是把它改成未知）。
                 if not name:
                     raise HTTPException(status_code=400, detail="群名不能为空")
                 _reject_controls(name, "name")
