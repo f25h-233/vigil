@@ -508,8 +508,9 @@ def test_refine_drops_deadline_without_literal_evidence():
     ts = int(dt.datetime(2026, 9, 15, 12, 0).timestamp())
     batch = [_msg(1, content="各位小班：明早7：20各班在宿舍楼下集合")]
     item = _extracted(deadline_ts=ts)
-    out, dropped = refine._drop_unsupported_deadlines([item], batch)
+    out, dropped, backdated = refine._verify_deadlines([item], batch)
     assert dropped == 1
+    assert backdated == 0, "「源文里没依据」与「时序倒挂」是两个数，不许混在一起"
     assert out[0].deadline_ts is None
     assert out[0].title == item.title       # 其余字段一个都不许动
 
@@ -519,8 +520,11 @@ def test_refine_keeps_deadline_with_literal_evidence():
 
     ts = int(dt.datetime(2026, 9, 16, 12, 0).timestamp())
     batch = [_msg(1, content="9月16日12:00开始报名缴费")]
-    out, dropped = refine._drop_unsupported_deadlines([_extracted(deadline_ts=ts)], batch)
+    out, dropped, backdated = refine._verify_deadlines(
+        [_extracted(deadline_ts=ts)], batch
+    )
     assert dropped == 0
+    assert backdated == 0
     assert out[0].deadline_ts == ts
 
 
@@ -1035,8 +1039,19 @@ def test_to_item_keeps_place_with_evidence(msg_factory):
     assert it.place == "西太湖校区"
 
 
-def test_to_item_drops_past_deadline(msg_factory):
-    """item 83 的形状：死线早于消息日。"""
+def test_to_item_no_longer_applies_the_timing_gate(msg_factory):
+    """⭐ 时序闸门**不在** `_to_item` 里了（M6 T10 / M5 遗留 #4 的第二半）。
+
+    原来是 `test_to_item_drops_past_deadline`（item 83 的形状：死线早于消息日）。
+    T10 把闸门挪去了写入边界的 `_verify_deadlines`——**唯一**的理由是那里有
+    `RefineStats` 的两个计数器，而留在 `_to_item` 里时它清掉的值**没有任何
+    计数器**（`deadlines_dropped` 只数 `deadline_supported` 那道闸），
+    后果是「一批 12 条过期死线被全清」在运维侧**零告警**。
+
+    ⇒ 所以本条断的是「日期**留着**」。谁把闸门挪回 `_to_item`（不删、也不计数），
+    **本条立刻变红**——而那正是本任务要挡的形状：条目结果完全一样，
+    只有账目变了，没有任何用户可见的差异（brief 的 Step 2 ⚠️ 原话）。
+    """
     # ⚠️ ts 是本机实算值（1785902400 = 2026-08-05 12:00 本地时，见报告「偏差」）
     batch = [msg_factory(1, "档案袋封口时间：5 月 6 日", ts=1785902400, uid="u_1")]
     it = refine._to_item(
@@ -1046,7 +1061,10 @@ def test_to_item_drops_past_deadline(msg_factory):
         known_kinds=frozenset({"notice"}),
     )
     assert it is not None
-    assert it.deadline_ts is None
+    assert it.deadline_ts is not None, (
+        "时序闸门被挪回了 `_to_item`：它清掉的值没有任何计数器（M5 遗留 #4），"
+        "「一批 12 条过期死线被全清」会重新变成零告警"
+    )
 
 
 def test_to_item_keeps_future_deadline(msg_factory):
@@ -1315,3 +1333,135 @@ def test_refine_reports_the_skip_on_the_progress_line(seeded, monkeypatch):
     )
     assert any("已软删" in x and "1" in x for x in lines), \
         f"跳过数必须出现在进度里，实际：{lines}"
+
+
+# ── M6 T10：M5 遗留清理（#4 时序闸门的计数、#7 话术、F1 墓碑日志）────────
+
+
+def test_a_backdated_deadline_is_counted(seeded, monkeypatch):
+    """⭐ M5 遗留 #4：时序倒挂必须**有计数**，不许静默清掉。
+
+    造的是 `item 83` 的形状——死线 `2026-05-06`、消息日 `2026-08-05`。
+    ⚠️ 与「模型编日期」**刻意分开**：那条路径的源文里**找不到**那个日期
+    （`deadline_supported` 挡下），这一条的源文里**有**「5月6日」，是**过去
+    的既成事实**被当成了新死线。两者的运维含义完全不同（前者说明模型在编，
+    后者说明提示词或数据源有问题），合成一个数会让两者都说不清。
+
+    ⚠️ 变异反证：把 `_verify_deadlines` 里那个 `elif it.deadline_ts:` 分支
+    整段删掉 ⇒ 本条**必红**（`backdated` 会是 0，而条目的 deadline 仍被清）。
+
+    ⚠️ 更值钱的那条变异：把闸门**挪回** `_to_item`（不删、但也不计数）
+    ⇒ 条目结果**完全一样**，而 `stats.deadlines_backdated` 是 0。
+    **这条才是本任务要挡的形状**——「行为对、账目错」比「行为错」更难发现，
+    因为没有任何用户可见的差异。（`test_to_item_no_longer_applies_the_timing_gate`
+    是它的另一半。）
+    """
+    import datetime as dt
+
+    event_ts = int(dt.datetime(2026, 8, 5, 12, 0).timestamp())
+    seeded.execute(
+        "INSERT INTO messages (msg_id, group_id, ts, sender_uid, content)"
+        " VALUES (9, 100, ?, 'u_a', '档案袋封口时间：5月6日')",
+        (event_ts,),
+    )
+    seeded.commit()
+
+    def script(_user: str) -> dict:
+        return {"items": [
+            {"quote": "档案袋封口时间：5月6日", "kind": "notice",
+             "title": "档案袋封口", "detail": None, "deadline": "2026-05-06",
+             "place": None, "amount": None, "confidence": 0.9}
+        ]}
+
+    monkeypatch.setattr(refine, "chat_json", FakeLLM(script=script))
+
+    stats = refine.refine(
+        StubConfig(), api_key="k", conn=seeded, batch_size=1,
+        on_progress=lambda *_: None,
+    )
+
+    assert stats.deadlines_backdated == 1, (
+        "死线早于消息时间的事实必须出现在账目里（M5 遗留 #4）："
+        "此前它被清掉而**无任何计数**，运维侧零告警"
+    )
+    assert stats.deadlines_dropped == 0, (
+        "源文里**有**「5月6日」的字面依据 ⇒ 不该计进「模型在编」那一格"
+    )
+    # 只降级 deadline_ts 这一个字段：条目本身照常落库（与既有取舍一致）
+    assert seeded.execute(
+        "SELECT title, deadline_ts FROM items WHERE title = '档案袋封口'"
+    ).fetchone() == ("档案袋封口", None)
+
+
+def test_a_fully_tombstoned_window_says_so(seeded, monkeypatch):
+    """⭐ M5 遗留 F1：整窗全被墓碑时，日志必须**与「窗口本来就空」不同形**。
+
+    从前那行日志排在 `if not messages: return` **之后**——于是它本该说出的
+    那件事（整窗都被墓碑挡下了）恰恰让它自己永远不执行。用户看到的是
+    「[refine] 没有待处理的消息」，与「这个窗口本来就没有消息」**一字不差**：
+    一句无法区分两种事实的日志，等于没有日志。
+
+    ⚠️ 变异反证：把那句 `on_progress` 挪回 `if not messages: return` **之后**
+    ⇒ 本条**必红**（一行日志都收不到）。这个变异**不改变任何返回值、
+    不改变任何数据库状态**——它只让一句人话消失。所以只有把日志本身
+    当断言对象，才挡得住它。
+    """
+    from vigil import overrides
+
+    overrides.ensure_schema()
+    ov = overrides.connect()
+    try:
+        for item_id, msg_id in ((1, 1), (2, 2), (3, 3)):
+            overrides.delete_item(ov, item_id=item_id, msg_id=msg_id)
+    finally:
+        ov.close()
+
+    lines: list[str] = []
+    stats = refine.refine(
+        StubConfig(), api_key="k", conn=seeded, batch_size=1,
+        on_progress=lines.append,
+    )
+
+    assert stats.scanned == 0, "整窗都被墓碑挡下 ⇒ 一条都不剩（这正是触发早退的形状）"
+    assert any("已软删" in ln for ln in lines), (
+        f"整窗全被墓碑时没有说出原因，实际日志：{lines}"
+    )
+
+
+def test_the_progress_line_reports_the_deduped_count(seeded, monkeypatch):
+    """⭐ M5 遗留 #7：进度话术必须报**去重后**的落库条数。
+
+    `store.save_items` 会把同 `(title, event_ts, group_id)` 的条目并成一条
+    （`store._dedupe_batch`），所以「模型产出了几条」与「库里落了几条」**会**
+    不同。报去重**前**的那个数，就是报了一个**没落库**的条数——纯话术，
+    但它是账目（用户看到「2 条 → 2 条 item」而库里只有 1 行）。
+
+    ⚠️ 变异反证：把 `{saved} 条 item` 改回 `{len(produced)} 条 item`
+    ⇒ 本条**必红**（收到的是「2 条 item」）。
+    """
+    def script(_user: str) -> dict:
+        # 两条**同标题**、都摘录自同一条消息 ⇒ `(title, event_ts, group_id)` 相同
+        return {"items": [
+            {"quote": "明天下午有讲座", "kind": "activity",
+             "title": "西太湖报告厅有讲座", "detail": None, "deadline": None,
+             "place": None, "amount": None, "confidence": 0.9},
+            {"quote": "地点西太湖报告厅", "kind": "activity",
+             "title": "西太湖报告厅有讲座", "detail": None, "deadline": None,
+             "place": None, "amount": None, "confidence": 0.9},
+        ]}
+
+    monkeypatch.setattr(refine, "chat_json", FakeLLM(script=script))
+
+    lines: list[str] = []
+    stats = refine.refine(
+        StubConfig(), api_key="k", conn=seeded, batch_size=30,
+        on_progress=lines.append,
+    )
+
+    assert stats.items_saved == 1, (
+        "两条同 (title, event_ts, group_id) 的条目必须并成一条——"
+        "本条的前提条件不成立的话，下面的断言测的就不是去重"
+    )
+    assert any(
+        "1 条 item（另有 1 条与批次内重复，已合并）" in ln for ln in lines
+    ), f"进度话术报的是去重**前**的条数，实际日志：{lines}"

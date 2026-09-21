@@ -554,7 +554,14 @@ def test_missing_static_asset_is_404_not_index_html(
 
 
 def _vigil_db_fingerprint(db: pathlib.Path) -> dict[str, str]:
-    """`data/vigil.db` 的**整个文件集**指纹：主文件 + WAL 边车（`-wal` / `-shm`）。
+    """`data/vigil.db` 的**整个文件集**指纹：主文件 + WAL 边车（`-wal`）。
+
+    ⚠️ **`-shm` 刻意不在表里**（M6 T10 / M5 遗留 #23，已复现）：它的形状是
+    **假红**——一条读写连接开-关、且它是最后一条时（**合规、零写入**），
+    `-wal`/`-shm` 双双变 `<missing>` ⇒ 守卫报「变了」，而人去看一个
+    **不存在的问题**。实测它的检出价值 = 0（「变了的集合」只有 `{-wal}`）。
+    ⚠️ 保留下来的 `-wal` 是**承重**的：`INSERT` 在 WAL 模式下先落 `-wal`，
+    只盯主文件会漏掉「写了但还没 checkpoint」这一整类（见下）。
 
     ⚠️ **为什么不能只哈希主文件**（T8 审查的 FIX 1，实测）：生产库是
     `journal_mode=wal`，而 **WAL 下写完之后主文件的字节可以一字不变**——
@@ -571,7 +578,8 @@ def _vigil_db_fingerprint(db: pathlib.Path) -> dict[str, str]:
     刻意不统一，免得把「侧车刚被建出来」误读成「写过了」。
     """
     out: dict[str, str] = {}
-    for suffix in ("", "-wal", "-shm"):
+    # ⚠️ 只有两格：`-shm` 见 docstring（M6 T10 / M5 遗留 #23）。
+    for suffix in ("", "-wal"):
         path = db if not suffix else db.with_name(db.name + suffix)
         out[suffix or "main"] = (
             hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else "<missing>"
@@ -628,7 +636,7 @@ def test_no_write_endpoint_touches_the_wal_sidecar(client, db_path):
     这条把夹具库切成 `journal_mode=wal`，并且**整段过程一直开着一条读者连接**
     （= 生产中 api 与 refine 并发的形状）⇒ 违规写的证据**只**会留在 `-wal` 里。
     实测：把 `api_set_kind` 变异成写主库时，**只哈希主文件的守卫全绿**，
-    而本条（含 `-wal`/`-shm`）变红。三条写端点都过一遍。
+    而本条（含 `-wal`）变红。三条写端点都过一遍。
     """
     con = sqlite3.connect(str(db_path))
     try:
@@ -815,6 +823,41 @@ def test_person_rejects_control_chars(client, tmp_path, monkeypatch):
     text = (tmp_path / "fake_root" / "config" / "persons.toml").read_text(encoding="utf-8")
     assert "甲" in text and "备注" in text
     assert client.get("/api/persons").json()["persons"][0]["note"] == "备注"
+
+
+def test_label_and_note_are_checked_for_controls_before_stripping(
+    client, tmp_path, monkeypatch
+):
+    """⭐ 两个字段必须**待遇相同**（M5 遗留 #25）。
+
+    ⚠️ 断面：`label` 是**先 strip 再查**控制字符，而 `note` 不 strip。
+    于是同一次请求里两个字段待遇相反——`label="甲\\n"` 拿到 **201**，且那个
+    换行被静默剥掉（用户以为自己输入的东西被原样接受了）；而 `note="甲\\n"`
+    是 400。`_reject_controls` 的 docstring 承诺的是「**响亮地拒绝**」。
+
+    ⚠️ 变异反证：把 `_reject_controls(raw_label, "label")` 换回
+    `_reject_controls(label, "label")`（即排在 strip 之后）⇒ 本条**必红**
+    （`label="甲\\n"` 会拿到 201）。
+    """
+    from vigil import api as _api
+
+    monkeypatch.setattr(_api, "REPO_ROOT", tmp_path / "fake_root")
+    (tmp_path / "fake_root" / "config").mkdir(parents=True)
+
+    for field in ("label", "note"):
+        # ⚠️ 另一个字段必须**填成合法值**：留空的话 `label` 会先撞
+        # 「label 不能为空」那道 400，本条就变成在测别的东西了。
+        body = {"uin": 111, "label": "甲", "note": "乙"}
+        body[field] = "甲\n"
+        r = client.post("/api/persons", json=body)
+        assert r.status_code == 400, (
+            f"{field} 里的换行被静默接受了（{r.status_code}）——"
+            "同一次请求里两个字段的待遇必须相同"
+        )
+
+    # 阳性对照：同样的值、只是没有换行 ⇒ 201（否则「一律 400」也会绿）
+    ok = client.post("/api/persons", json={"uin": 111, "label": "甲", "note": "乙"})
+    assert ok.status_code == 201, ok.text
 
 
 def test_persons_endpoints_always_pass_a_path(client, tmp_path, monkeypatch):

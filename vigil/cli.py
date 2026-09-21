@@ -393,6 +393,15 @@ def cmd_refine(args) -> int:
                     f"[注意] {stats.deadlines_dropped} 条截止日在源消息里找不到字面依据，"
                     f"未落库（条目本身仍照常出现）"
                 )
+            if stats.deadlines_backdated:
+                # ⚠️ **与上一条分开报**（M6 T10 / M5 遗留 #4）：上一条说明模型在编，
+                # 这一条说明**提示词或数据源有问题**（为什么会有三个月前的死线
+                # 被当成新的？）。合成一句会让两种病都说不清——而在此之前它
+                # **根本没有计数器**，一批 12 条过期死线被全清是零告警的。
+                logs.emit(
+                    f"[注意] {stats.deadlines_backdated} 条截止日**早于源消息时间**，"
+                    "已降级为无死线（死线比消息还早 = 一条已过期的「⏰ 别忘」）"
+                )
             if stats.errors:
                 logs.emit(f"\n[失败] {len(stats.errors)} 批出错：")
                 for e in stats.errors[:5]:

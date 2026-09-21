@@ -111,6 +111,81 @@ def test_undo_then_rebuild_still_consistent(ov):
     assert row["deleted"] == 0
 
 
+# ── M6 T10 / M5 遗留 #9：未知 action 必须**响亮** ─────────────────────
+#
+# 断面（M5 终审实测）：两条折叠路径的 `if/elif` 对未知 `action` **静默什么都不做**
+# ——`_append(action="restore")` ⇒ 事件入库、`item_state` 无表示、
+# `rebuild_state()` 之后**该 item 整行消失**。两者"恒等"因此被满足，但状态是错的。
+
+
+def test_an_unknown_action_is_rejected_by_the_incremental_fold(ov):
+    """⭐ 增量折叠：未知 action ⇒ 抛 `OverlayError`，不许静默忽略。
+
+    ⚠️ **两个函数都必须加**（`_apply_to_state` 与 `rebuild_state`）：只加一个
+    会让「增量 == 全量重算」这条**唯一的契约**破掉——而那正是
+    `test_rebuild_state_matches_incremental` 守着的东西。
+    **"一个响一个不响"比"两个都静默"更难查**。
+
+    ⚠️ `ACTION_TOMBSTONE` 是特例（见下一条测试）：它对 `item_state` 完全惰性
+    （承重的，见 `delete_item` 的 docstring），所以 `else: raise` 之后必须给它
+    一个**显式的空分支**——靠"落到 else 什么都不做"实现惰性不再成立。
+
+    变异反证：把 `_apply_to_state` 里那个 `else: raise` 换回 `else: pass`
+    （即删掉整支）⇒ 本条**必红**。
+    """
+    with pytest.raises(overrides.OverlayError, match="未知的 action"):
+        overrides._append(
+            ov, item_id=1, msg_id=None, action="restore", field=None,
+            old_value=None, new_value=None, actor="t", now=1,
+        )
+
+
+def test_an_unknown_action_is_rejected_by_the_full_rebuild(ov):
+    """⭐ 全量重算：同一份日志上，`rebuild_state` 也必须抛。
+
+    ⚠️ 直接往事件表塞一行（绕过 `_append` 的闸门）是**刻意的**：库存量里
+    可能存在旧版本写下的未知 action，而"读路径静默把它折成什么都不是"
+    正是 #9 的那半个形状。两条折叠路径对同一份日志必须给出同一个答案。
+
+    变异反证：删掉 `rebuild_state` 里那个 `else: raise` ⇒ 本条**必红**。
+    """
+    ov.execute(
+        "INSERT INTO item_edits (item_id, msg_id, action, field, old_value,"
+        " new_value, actor, created_at)"
+        " VALUES (1, NULL, 'restore', NULL, NULL, NULL, 't', 1)"
+    )
+    with pytest.raises(overrides.OverlayError, match="未知的 action"):
+        overrides.rebuild_state(ov)
+
+
+def test_the_tombstone_action_stays_inert_on_both_paths(ov):
+    """⭐ `ACTION_TOMBSTONE` 对 `item_state` **完全惰性**（显式写出来，不靠 else）。
+
+    ⚠️ 这里**单写一行墓碑**（不经 `delete_item`）：`delete_item` 是「墓碑 + delete
+    两行」，`item_state` 里那一行是 **delete 行**写的——拿它当判据会把
+    「墓碑惰性」测成「delete 生效」（第一版就是这么写错的，实测当场红了）。
+
+    墓碑行只经 `deleted_msg_ids` 那一次折叠起作用（「垫在 delete 行之前」是承重的，
+    见 `delete_item` 的 docstring）。`else: raise` 之后，这份惰性必须由**显式的
+    空分支**承担——两条折叠路径各一支，少一支就会让任何带墓碑行的日志
+    直接抛 `OverlayError`。
+
+    变异反证：删掉任一支 `elif action == ACTION_TOMBSTONE:` ⇒ 本条**必红**。
+    """
+    overrides._append(
+        ov, item_id=9, msg_id=555, action=overrides.ACTION_TOMBSTONE, field=None,
+        old_value=None, new_value=None, actor="t", now=1,
+    )
+    assert ov.execute("SELECT * FROM item_state WHERE item_id = 9").fetchone() is None, (
+        "墓碑行在 `item_state` 里留下了表示——它是惰性的（delete 行才是承重的）"
+    )
+    overrides.rebuild_state(ov)   # 全量重算也必须咽得下墓碑行
+    assert ov.execute("SELECT * FROM item_state WHERE item_id = 9").fetchone() is None
+    assert overrides.deleted_msg_ids(ov) == frozenset(), (
+        "墓碑行只是 delete 事件的**一半**：单独存在时不该让任何消息被墓碑化"
+    )
+
+
 # ---------------------------------------------------------------------------
 # 新增守卫（**brief 之外**）——每一条都对着 `task-4-report.md` 的
 # `## 变异反证` 里实测**存活**的变异体。brief 的三个代码块本身逐字未改。
@@ -124,7 +199,13 @@ def test_ensure_schema_default_path_is_isolated():
     变异反证：把那个夹具的 `autouse=True` 去掉 ⇒ 这条立刻变红；
     **没有这条时，全量 461 条里一条都不会红**。
     """
-    assert overrides.OVERRIDES_DB != REPO_ROOT / "data" / "overrides.db"
+    # ⚠️ 旧写法只排除**一个字面路径**（`REPO_ROOT/"data"/"overrides.db"`），
+    # 夹具指向任何别的仓库内路径（比如 `data/ov2.db`）仍然绿——
+    # 而后果一样：测试会往**入不了 git 的**真 `data/` 里写字，且没有任何东西能还原它。
+    # 判据改成「落在仓库内的路径一律判红」（M6 T10 / M5 遗留 #10）。
+    assert not overrides.OVERRIDES_DB.is_relative_to(REPO_ROOT), (
+        f"夹具把 overlay 指向了仓库内的 {overrides.OVERRIDES_DB}——测试会污染真实数据"
+    )
     overrides.ensure_schema()
     conn = sqlite3.connect(str(overrides.OVERRIDES_DB))
     try:
@@ -948,6 +1029,81 @@ def test_reconcile_is_gated_by_the_config_file_state(tmp_path, monkeypatch):
         assert overrides.kind_aliases(w) == {}
     finally:
         w.close()
+
+
+def test_repeated_reconcile_failures_escalate_to_error(tmp_path, monkeypatch, caplog):
+    """⭐ T5 延迟清单里那条「**T10 之前收**」：长期破着的不变量必须有信号。
+
+    **不变量**：「`kind_alias` 表里没有 `old_kind ∈ 现存 slug` 的行」，而它
+    **只由 `reconcile_if_stale` 的剪枝维持**。那个函数抛瞬时异常时只
+    `_log.warning`——删掉那句 warning 全量**照样绿**；而 `vigil_exit_check.py`
+    只查"越界类目"、**查不到这种破法**（`old_kind` 仍是现存 slug 的行会**顶掉**
+    合法映射，条目显示的是**旧类目**，而角标与越界判据都看不见）。
+    ⇒ 一次失败的剪枝会让不变量**长期破着而零信号**。
+    ⇒ 最小修法：模块级**连续**失败计数，`≥3` 次升 **ERROR**，把后果写进消息。
+
+    ⚠️ 「**连续**」是承重的：一次成功就已经对平了，之后必须从 1 数起——
+    否则一个跑了一整天的进程会把偶发失败累计成 ERROR，而噪声日志的下场
+    是被关掉（那是"零信号"的另一种写法）。
+
+    变异反证：
+      · 删掉 `_RECONCILE_FAILURES += 1`（计数永远到不了阈值）⇒ 本条**必红**；
+      · 删掉成功路径上的归零 ⇒ 本条最后一段**必红**。
+    """
+    import logging
+
+    from vigil import categories as categories_mod
+
+    path = tmp_path / "categories.toml"
+    path.write_text(_cats_toml(("live", "ghost")), encoding="utf-8")
+    monkeypatch.setattr(categories_mod, "DEFAULT_CATEGORIES", path)
+    monkeypatch.setattr(overrides, "_LAST_RECONCILE", None)
+    monkeypatch.setattr(overrides, "_RECONCILE_FAILURES", 0)
+
+    real_prune = overrides.prune_kind_aliases
+    state = {"fail": True}
+
+    def flaky(conn, *, live_slugs):
+        if state["fail"]:
+            raise sqlite3.OperationalError("database is locked")
+        return real_prune(conn, live_slugs=live_slugs)
+
+    monkeypatch.setattr(overrides, "prune_kind_aliases", flaky)
+    overrides.ensure_schema()
+
+    with caplog.at_level(logging.WARNING, logger="vigil.overrides"):
+        # 前两次：只许 warning —— 偶发的一次瞬时失败是**预期内**的
+        # （函数 docstring：overlay 上本来就有别的写者），升 ERROR 会变成噪声
+        assert overrides.reconcile_if_stale() == 0
+        assert overrides.reconcile_if_stale() == 0
+        assert not [r for r in caplog.records if r.levelno >= logging.ERROR], (
+            "偶发的一两次失败就升 ERROR —— 那会把日志变成噪声"
+        )
+
+        # 第三次：**连续**三次 ⇒ 升 ERROR，并把**后果**写进消息
+        assert overrides.reconcile_if_stale() == 0
+        errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
+        assert len(errors) == 1, (
+            f"连续 3 次对账失败没有升级成 ERROR（不变量破了却零信号）：{caplog.records}"
+        )
+        message = errors[0].getMessage()
+        assert "旧类目" in message, (
+            "升 ERROR 的消息必须写清**后果**（不变量破了会怎样），"
+            f"否则读日志的人不知道该慌什么，实际：{message}"
+        )
+
+        # **连续**：一次成功 ⇒ 归零 ⇒ 下一次失败回到 warning
+        caplog.clear()
+        state["fail"] = False
+        assert overrides.reconcile_if_stale() == 0, "这次必须成功"
+        # ⚠️ 成功会**关上闸门**（`_LAST_RECONCILE = key`）⇒ 要再触发一次对账，
+        # 只能改文件——这正是生产里「手改 categories.toml」的形状。
+        path.write_text(_cats_toml(("live", "ghost", "extra")), encoding="utf-8")
+        state["fail"] = True
+        assert overrides.reconcile_if_stale() == 0
+        assert not [r for r in caplog.records if r.levelno >= logging.ERROR], (
+            "成功之后计数没有归零：几次偶发失败会被累计成 ERROR，日志很快变成噪声"
+        )
 
 
 def test_reconcile_does_nothing_when_the_config_is_missing(tmp_path, monkeypatch):

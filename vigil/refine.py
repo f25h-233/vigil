@@ -53,6 +53,11 @@ class RefineStats:
     batches: int = 0  # **实际**跑了几批——预算 break 之后会小于 planned
     items_saved: int = 0
     deadlines_dropped: int = 0   # 源文里找不到依据、被降级的截止日条数
+    # ⚠️ 与上一个分开（M6 T10 / M5 遗留 #4）：那个是「模型在编」，
+    # 这个是「死线早于消息时间」——运维含义完全不同，合成一个数会让两者
+    # 都说不清。它此前**根本没有计数器**，于是「一批 12 条过期死线被全清」
+    # 在日志里完全隐形。
+    deadlines_backdated: int = 0
     input_tokens: int = 0
     output_tokens: int = 0
     budget_hit: bool = False
@@ -331,15 +336,18 @@ def _to_item(
         text = str(value).strip()
         return text or None
 
-    # ⚠️ 两道要素闸门都在**写入边界**上做，理由与 _drop_unsupported_deadlines
+    # ⚠️ 两道要素闸门都在**写入边界**上做，理由与 _verify_deadlines
     # 的 docstring 完全一样：数据一旦入库就到处流，每个读取方各挡一次迟早有人忘。
     sources_text = "\n".join((m.content or "") for m in batch if m.msg_id in source_ids)
     raw_place = _text("place")
     place = raw_place if place_supported(raw_place, sources_text) else None
 
     deadline_ts = _parse_deadline(raw.get("deadline"))
-    if deadline_ts is not None and not deadline_sane(deadline_ts, source.ts):
-        deadline_ts = None
+    # ⚠️ **时序闸门（`deadline_sane`）不在这里**，见 `_verify_deadlines`。
+    # 挪走的理由不是洁癖：闸门留在 `_to_item` 里时，它清掉的值**没有任何
+    # 计数器**——`stats.deadlines_dropped` 只数 `deadline_supported` 那道闸。
+    # 后果是「一批 12 条过期死线被全清」在运维侧**零告警**（M5 遗留 #4）。
+    # 两道闸现在并排站在写入边界上，谁都能一眼看全。
 
     return store.ExtractedItem(
         kind=kind,
@@ -357,29 +365,50 @@ def _to_item(
     )
 
 
-def _drop_unsupported_deadlines(
+def _verify_deadlines(
     produced: list[store.ExtractedItem], batch: list[store.PendingMessage]
-) -> tuple[list[store.ExtractedItem], int]:
-    """写入前核验：源文里找不到字面依据的截止日一律置 None。
+) -> tuple[list[store.ExtractedItem], int, int]:
+    """写入前核验：两道闸，各自记数。
 
     ⚠️ 核验放在**写入边界**而不是渲染层：数据一旦入库就到处流，每个读取方
     各挡一次，迟早有人忘——M2 就只在日报挡过，M3 的 Web 差一点把那 13 条
     幻觉日期原样复活（「今天下午16点之前」被填成 9-14、「明早7:20」被填成 9-15）。
 
-    ⚠️ 只降级 deadline_ts 这一个字段：条目的标题、正文、来源一概不动。
+    ⚠️ 只降级 `deadline_ts` 这一个字段：条目的标题、正文、来源一概不动。
     用户仍然看得到这条信息，只是不再被告知一个编出来的日期。
+
+    **两道闸的区别**（M6 T10 把它们并排放在这里）：
+      * `deadline_supported` —— 源文里**找不到字面依据**（模型编的）
+      * `deadline_sane`      —— 字面有依据，但**死线早于消息时间**（已过期三个月的「⏰ 别忘」）
+
+    ⚠️ 分开计数是**承重的**：两者的运维含义完全不同——前者说明模型在编，
+    后者说明**提示词或数据源有问题**（为什么会有三个月前的死线被当成新的？）。
+
+    **返回值**：`(核验后的条目, 无依据的条数, 时序倒挂的条数)`。
     """
     texts = {m.msg_id: (m.content or "") for m in batch}
+    ts_by_msg = {m.msg_id: m.ts for m in batch}
     out: list[store.ExtractedItem] = []
-    dropped = 0
+    unsupported = 0
+    backdated = 0
     for it in produced:
         if it.deadline_ts and not deadline_supported(
             it.deadline_ts, "\n".join(texts.get(mid, "") for mid in it.src_msg_ids)
         ):
-            dropped += 1
+            unsupported += 1
             it = replace(it, deadline_ts=None)
+        elif it.deadline_ts:
+            # ⚠️ `elif` 而不是第二个 `if`：一条已经被判「无依据」的截止日
+            # **不该再计一次**时序倒挂——那会让两个数加起来大于被清的总数，
+            # 而运维看到「2 条被清」+「2 条被清」却只有 2 条条目时会怀疑账目。
+            # ⚠️ 源消息的 ts 取**最早**的那条（一条 item 可以有多条源消息）：
+            # 死线必须晚于**它出现的最早时刻**才算合理，取最晚的会放过一批。
+            srcs = [ts_by_msg[mid] for mid in it.src_msg_ids if mid in ts_by_msg]
+            if srcs and not deadline_sane(it.deadline_ts, min(srcs)):
+                backdated += 1
+                it = replace(it, deadline_ts=None)
         out.append(it)
-    return out, dropped
+    return out, unsupported, backdated
 
 
 def refine(
@@ -456,6 +485,16 @@ def refine(
             messages = kept
 
         stats.scanned = len(messages)
+        # ⚠️ **必须排在下面那个早退之前**（M5 遗留 F1）：排在后面的话，
+        # 「一整窗消息全被墓碑」会走到 `if not messages: return`，
+        # 于是那行日志**永远不会执行**——而它本该说出的正是这件事。
+        # 用户看到的是「[refine] 没有待处理的消息」，与「这个窗口本来就空」
+        # **一字不差**：一句无法区分两种事实的日志，等于没有日志。
+        if stats.skipped_deleted:
+            on_progress(
+                f"[refine] 其中 {stats.skipped_deleted:,} 条已软删，跳过重抽（D15 墓碑）"
+            )
+
         if not messages:
             on_progress("[refine] 没有待处理的消息")
             return stats
@@ -483,10 +522,6 @@ def refine(
             f"{stats.scanned - stats.sent_messages:,} 条"
             f" → 送模型 {stats.sent_messages:,} 条（候选 {stats.candidates:,} 条）"
         )
-        if stats.skipped_deleted:
-            on_progress(
-                f"[refine] 其中 {stats.skipped_deleted:,} 条已软删，跳过重抽（D15 墓碑）"
-            )
 
         # 没进候选的一律记账为 discarded，其中既含硬丢弃也含「没命中保留规则」。
         # 记账必须做全：refine_runs 覆盖不到的消息会让增量同步永远重扫它们。
@@ -590,8 +625,9 @@ def refine(
 
                 # 截止日降级是**纯本地**判定，放事务外——事务里只留 DB 写。
                 dropped = 0
+                backdated = 0
                 if produced:
-                    produced, dropped = _drop_unsupported_deadlines(produced, batch)
+                    produced, dropped, backdated = _verify_deadlines(produced, batch)
 
                 # ⚠️ 落库 + 记账必须在**同一个事务**里（见 store.transaction 的
                 # docstring）：分开提交时，两步之间崩掉会让同一批消息下次被
@@ -617,6 +653,7 @@ def refine(
 
                 # ⚠️ 只有事务真的提交了才动 stats——回滚了还记账，账目会说谎
                 stats.deadlines_dropped += dropped
+                stats.deadlines_backdated += backdated
                 stats.items_saved += saved
             except Exception as exc:
                 # 捕 `Exception` 而不是某个具体类型：设计意图是「单批失败不中断
@@ -645,7 +682,13 @@ def refine(
             # 而 try 失败会 `continue`、根本到不了这行。
             on_progress(
                 f"[refine] 批次 {index}/{len(batches)}：{len(batch)} 条 → "
-                f"{len(produced)} 条 item"
+                # ⚠️ 用 `saved`（`save_items` 的**返回值**，去重后的落库条数）
+                # 而不是 `len(produced)`（去重**前**）。`store._dedupe_batch` 会把
+                # 同 (title, event_ts, group_id) 的条目并成一条，所以两个数**会**
+                # 不同——而报去重前的数就是报了一个没落库的条数（M5 遗留 #7）。
+                f"{saved} 条 item"
+                + (f"（另有 {len(produced) - saved} 条与批次内重复，已合并）"
+                   if len(produced) > saved else "")
             )
 
         return stats

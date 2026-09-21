@@ -254,6 +254,37 @@ def test_refine_summary_states_the_discard_counts_as_peers_not_a_subset(
     )
 
 
+def test_cli_refine_reports_backdated_deadlines(cli_env, monkeypatch, capsys):
+    """⭐ M5 遗留 #4 的**可见性**那一半：计数必须真的打印出来。
+
+    `RefineStats.deadlines_backdated` 有测试（`test_refine.py` 那条端到端），
+    而「CLI 有没有把它印出来」是**另一件事**——`cli.py` 里那段没守住的话，
+    计数进了 stats 也没人看得见，而 #4 的全部理由就是「运维要看得见」。
+    同族的既有先例：`test_digest.py::test_cli_digest_reports_dropped_deadlines`。
+
+    ⚠️ 与「找不到字面依据」那句**必须是两句话**：两者的处置不同
+    （前者查模型/提示词，后者查提示词或数据源），合成一句就是报了一个
+    说不清是什么的数。
+
+    变异反证：删掉 `cmd_refine` 里那段 `if stats.deadlines_backdated:` 的打印
+    ⇒ 本条红。
+    """
+    monkeypatch.setattr(
+        "vigil.refine.refine",
+        lambda *a, **kw: _refine_stats(deadlines_backdated=3, deadlines_dropped=0),
+    )
+
+    assert cli.main(["refine"]) == 0
+
+    out = capsys.readouterr().out
+    assert "[注意] 3 条截止日**早于源消息时间**" in out, (
+        f"时序倒挂的条数没有出现在 CLI 输出里——#4 要的可见性这一半丢了：{out}"
+    )
+    assert "找不到字面依据" not in out, (
+        "两句告警混成了一句：两个数的运维含义不同，不许互相冒充"
+    )
+
+
 def test_refine_dry_run_returns_zero(cli_env, monkeypatch):
     """`--dry-run` 仍然是 0：它本来就不该有错误，且明确标注了没调模型。"""
     monkeypatch.setattr("vigil.refine.refine", lambda *a, **kw: _refine_stats())

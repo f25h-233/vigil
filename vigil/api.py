@@ -1191,12 +1191,22 @@ def create_app(config: Config) -> FastAPI:
                 status_code=400,
                 detail="uin 必须是正整数（0 是匿名哨兵，不能监视）",
             )
-        label = str(body.get("label", "")).strip()
+        # ⚠️ **控制字符检查必须排在 `.strip()` 之前**（M6 T10 / M5 遗留 #25）。
+        # 排在后面的话，`"甲\n"` 里的换行已经被 strip 剥掉、检查什么也看不见
+        # ⇒ 返回 201 而用户以为自己输入的东西被原样接受了。
+        # 而同一个请求里 `note` 没走 strip，于是**两个字段待遇相反**——
+        # 与 `_reject_controls` docstring 承诺的「响亮地拒绝」矛盾。
+        raw_label = str(body.get("label", ""))
+        raw_note = str(body.get("note", ""))
+        _reject_controls(raw_label, "label")
+        _reject_controls(raw_note, "note")
+
+        label = raw_label.strip()
         if not label:
             raise HTTPException(status_code=400, detail="label 不能为空")
-        note = str(body.get("note", ""))
-        _reject_controls(label, "label")
-        _reject_controls(note, "note")
+        # ⚠️ `note` **故意不 strip**（原实现如此，且 `load_persons` 读回时会
+        # strip 它）——这里只把「查控制字符」提到 strip 之前，不改它的既有语义。
+        note = raw_note
         path = persons_path()
         people = [p for p in load_persons(path) if p.uin != uin]
         people.append(Person(uin=uin, label=label, note=note))

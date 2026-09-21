@@ -809,7 +809,7 @@ def test_refine_redo_does_not_revive_soft_deleted_items(con, monkeypatch):
 
 
 def test_apply_does_not_touch_vigil_db_bytes(tmp_path):
-    """⭐ 机械断言：apply 跑完，`vigil.db`（主文件 + `-wal` + `-shm`）**逐字节相同**。
+    """⭐ 机械断言：apply 跑完，`vigil.db`（主文件 + `-wal`）**逐字节相同**。
 
     ⚠️ 全部写操作都发生在 overlay，主库只有 SELECT ⇒ D11 的保证在 repass 上也成立。
     变异：`apply_plan` 改回 `store.delete_items`（会写主库）⇒ 本条红。
@@ -835,8 +835,14 @@ def test_apply_does_not_touch_vigil_db_bytes(tmp_path):
     conn.close()
 
     def fingerprint() -> dict:
+        # ⚠️ **`-shm` 不在这张表里**（M6 T10 / M5 遗留 #23，终审已复现）。
+        # 它的形状是**假红**：一条读写连接开-关且为最后一条时（合规、零写入），
+        # `-wal`/`-shm` 双双变 `<missing>` ⇒ 守卫报「变了」，而人去看一个
+        # **不存在的问题**。实测它的检出价值 = 0（「变了的集合」只有 `{-wal}`）。
+        # ⚠️ 保留下来的 `-wal` 是**承重**的：`INSERT` 在 WAL 模式下先落 `-wal`，
+        # 只盯主文件会漏掉「写了但还没 checkpoint」这一整类。
         out = {}
-        for suffix in ("", "-wal", "-shm"):
+        for suffix in ("", "-wal"):
             p = db if not suffix else db.with_name(db.name + suffix)
             out[suffix or "main"] = (
                 hashlib.sha256(p.read_bytes()).hexdigest() if p.is_file() else "<missing>"

@@ -657,6 +657,20 @@ def prune_kind_aliases(
 _LAST_RECONCILE: tuple[int, int] | None = None
 
 
+# 对账**连续**失败的次数与升级阈值（M6 T10；T5 延迟清单里那条「T10 之前收」）。
+#
+# ⚠️ **为什么需要它**：不变量「`kind_alias` 里没有 `old_kind ∈ 现存 slug` 的行」
+# **只由 `reconcile_if_stale` 的剪枝维持**，而剪枝失败时只有一句 `_log.warning`
+# （删掉那句 warning 全量照样绿）。于是**长期破着的不变量零信号**：
+# 条目会显示出**旧类目**（`old_kind` 仍是现存 slug 的那一行顶掉了合法映射），
+# 而 `vigil_exit_check.py` 的「类目越界」判据**查不到这种破法**。
+#
+# ⚠️ 「连续」是承重的：一次成功就已经对平了，之后从 1 数起——否则一个跑了
+# 一整天的进程会把偶发失败累计成 ERROR，而噪声日志的下场是被关掉。
+_RECONCILE_FAILURES = 0
+_RECONCILE_LOUD_AFTER = 3
+
+
 # ⚠️ **别名表 + `categories.toml` 的写侧互斥锁**（Fix loop 3 / FIX 2）。
 #
 # 放在 `overrides` 而不是 `api` 的理由：对账是 `store._ensure_overlay` 触发的，
@@ -711,7 +725,7 @@ def reconcile_if_stale() -> int:
     函数，绝不能让它把查询入口炸掉（真正要报错的是 `/api/categories` 与
     `save_categories`，它们照旧响亮）。
     """
-    global _LAST_RECONCILE
+    global _LAST_RECONCILE, _RECONCILE_FAILURES
 
     from . import categories as categories_mod
 
@@ -753,12 +767,31 @@ def reconcile_if_stale() -> int:
             # 另一次干预、另一个进程）⇒ 偶发 `database is locked` 是**预期内**的。
             # 判据与 `group_names_map` 的降级同族：**显示路径宁可降级，也不整页黑**。
             # ⇒ 响亮地记一条日志（不是静默），并且**不置闸门** ⇒ 下一次查询重试。
-            _log.warning("overlay 对账失败（闸门没关，下一次查询会重试）：%s", exc)
+            #
+            # ⚠️ **连续失败到阈值就升 ERROR**（M6 T10 / T5 延迟清单）：
+            # 一次失败是预期内的（overlay 上有别的写者），**持续**失败不是——
+            # 它意味着那个不变量正**一直**破着，而这件事**只有这里能说**：
+            # 剪枝失败的痕迹只在这条日志里，`vigil_exit_check.py` 的越界判据
+            # 看不见它（错的是映射，不是类目名）。
+            _RECONCILE_FAILURES += 1
+            if _RECONCILE_FAILURES >= _RECONCILE_LOUD_AFTER:
+                _log.error(
+                    "overlay 对账**连续**失败 %d 次（闸门没关，下一次查询还会重试）：%s"
+                    "\n⚠️ 后果：别名表已与 categories.toml 不一致 ⇒ 改过名的条目"
+                    "会显示**旧类目**（`old_kind` 仍是现存 slug 的那一行顶掉了"
+                    "合法映射），而这一点在其它任何判据里都看不见。",
+                    _RECONCILE_FAILURES, exc,
+                )
+            else:
+                _log.warning("overlay 对账失败（闸门没关，下一次查询会重试）：%s", exc)
             return 0
         # ⚠️ **成功之后才置闸门**（FIX 1）：从前的写法是**动手之前**就置
         # ⇒ 一次瞬时失败（锁库、磁盘满）就**永不重试**，而调用方拿到的是 0
         # （看起来"已经对过账了"）⇒ **不变量静默地一直破着**。
         _LAST_RECONCILE = key
+        # ⚠️ 成功 ⇒ **连续**失败计数归零（M6 T10）：不变量此刻已经对平，
+        # 之后的失败是新的计数起点——否则偶发失败会被累计成 ERROR（噪声）。
+        _RECONCILE_FAILURES = 0
         return pruned
 
 
@@ -978,6 +1011,26 @@ def rebuild_state(conn: sqlite3.Connection) -> None:
                 " ON CONFLICT(item_id) DO UPDATE SET kind = excluded.kind, deleted = 0",
                 (item_id, new_value),
             )
+        elif action == ACTION_TOMBSTONE:
+            # 惰性：墓碑行对 `item_state` **没有任何表示**（这是承重的，
+            # 见 `delete_item` 的 docstring）。显式写出来，而不是靠"落到 else"
+            # ——下面那个 `else` 已经变成 `raise` 了。
+            pass
+        elif action == ACTION_SET_FIELD:
+            # ⚠️ **与 tombstone 同形的惰性，实施时才确认的**（brief 只点名了
+            # tombstone）：`item_state` 只有 `(kind, deleted)` 两列 ⇒ 字段降级
+            # 在这张表里**没有表示**——它不是"没人管"，是"没有可写的地方"。
+            # 既有用例 `test_deleted_msg_ids_ignores_msgs_of_items_that_are_not_deleted`
+            # 正是走**真实写路径**（`_append`，不手搓 INSERT）造一条带 msg_id 的
+            # `set_field`，少了这一支它会直接抛（实测）。
+            pass
+        else:
+            raise OverlayError(
+                f"未知的 action：{action!r}。合法值："
+                f"{sorted({ACTION_SET_KIND, ACTION_SET_FIELD, ACTION_DELETE, ACTION_TOMBSTONE})}。"
+                "⚠️ `ACTION_TOMBSTONE` 对 `item_state` **完全惰性**，它**不该**"
+                "走到这里——若你正在给它加分支，先读 `delete_item` 的 docstring。"
+            )
 
 
 def _apply_to_state(
@@ -1000,4 +1053,25 @@ def _apply_to_state(
             "INSERT INTO item_state (item_id, kind, deleted) VALUES (?, ?, 0)"
             " ON CONFLICT(item_id) DO UPDATE SET kind = excluded.kind, deleted = 0",
             (item_id, new_value),
+        )
+    elif action == ACTION_TOMBSTONE:
+        # 惰性：墓碑行对 `item_state` **没有任何表示**（这是承重的，
+        # 见 `delete_item` 的 docstring）。显式写出来，而不是靠"落到 else"。
+        pass
+    elif action == ACTION_SET_FIELD:
+        # ⚠️ 与 tombstone 同形的惰性（见 `rebuild_state` 里那一支的论证）：
+        # `item_state` 只有 `(kind, deleted)` 两列，字段降级在这里没有表示。
+        pass
+    else:
+        # ⚠️ **未知 action 必须响亮**（M6 T10 / M5 遗留 #9）。此前是静默忽略，
+        # 后果实测过：`_append(action="restore")` ⇒ 事件入库、`item_state`
+        # 无表示、`rebuild_state()` 之后**该 item 整行消失**。
+        # ⚠️ `rebuild_state` 里也有同一支，**少一处就会让两者不再恒等**
+        # （而那正是这两个函数唯一的契约，`test_rebuild_state_matches_incremental`
+        # 守着它）——"一个响一个不响"比"两个都静默"更难查。
+        raise OverlayError(
+            f"未知的 action：{action!r}。合法值："
+            f"{sorted({ACTION_SET_KIND, ACTION_SET_FIELD, ACTION_DELETE, ACTION_TOMBSTONE})}。"
+            "⚠️ `ACTION_TOMBSTONE` 对 `item_state` **完全惰性**，它**不该**"
+            "走到这里——若你正在给它加分支，先读 `delete_item` 的 docstring。"
         )
