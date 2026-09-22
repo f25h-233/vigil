@@ -95,26 +95,54 @@ test('浅色主题真的是浅色、深色主题真的是深色（出口判据 4
 test('正文与弱化文字在面板上都读得清（WCAG：正文 ≥4.5 / 弱化文字 ≥3）', () => {
   for (const t of THEMES) {
     const bg = parse(value(t.id, '--v-bg'))
-    const card = over(parse(value(t.id, '--v-surface')), bg)
     // ⚠️ 软底 / 危险按钮的底**也是半透明的**（默认主题与蒸汽波、玻璃都是 rgba）
-    // ⇒ 必须先合成到卡片底上再算对比度。拿**未合成**的色值去比，等于把
+    // ⇒ 必须先合成到**它所在的那个面**上再算对比度。拿**未合成**的色值去比，等于把
     // 「深底上的 20% 浅蓝」当成「浅蓝实底」——结论正好反过来：实测默认主题
-    // `--v-accent-soft` 未合成时按 #38bdf8 算 ⇒ 1.61（**假红**，而默认块是 T1
-    // 冻结的基线、不许改值）；合成到卡片底 ≈rgb(30,59,75) 后 ⇒ 8.84（真值）。
-    // ⚠️ 判据（≥4.5 / ≥3）一个字没动，动的是"底该取哪个值"。合成用 `card` 而
-    // 不是 `bg`：卡片比页面底**浅**，浅底 ⇒ 对比度更低 ⇒ 取更严的那一侧。
-    // 这条修正的完整依据（四套主题两种算法的逐项数字）见 task-3-report.md 偏差 1。
-    const soft = over(parse(value(t.id, '--v-accent-soft')), card)
-    const dangerBtn = over(parse(value(t.id, '--v-danger-btn')), card)
-    expect(contrast(parse(value(t.id, '--v-fg')), card), `${t.id} 正文/卡片`).toBeGreaterThanOrEqual(4.5)
-    expect(contrast(parse(value(t.id, '--v-fg-3')), card), `${t.id} 弱化文字/卡片`).toBeGreaterThanOrEqual(3)
-    expect(
-      contrast(parse(value(t.id, '--v-accent-text')), soft),
-      `${t.id} 软底按钮文字`,
-    ).toBeGreaterThanOrEqual(3)
-    expect(
-      contrast(parse(value(t.id, '--v-danger-text')), dangerBtn),
-      `${t.id} 危险按钮文字`,
-    ).toBeGreaterThanOrEqual(3)
+    // `--v-accent-soft` 未合成时按 #38bdf8 算 ⇒ 1.61（对卡片；**假红**，而默认块是 T1
+    // 冻结的基线、不许改值）；合成到面上后 ⇒ **7.65**（真值，两个面里更差的那个）。
+    // ⚠️ 判据（≥4.5 / ≥3）一个字没动，动的是"底取哪些值"。这条修正的完整依据
+    // （四套主题两种算法的逐项数字）见 task-3-report.md 偏差 1。
+    //
+    // ⭐ F2（fix 轮，reviewer 实测）：文字**不是只坐在卡片上**——选中行 / 输入框 focus /
+    // 按钮 active 的底是 `--v-surface-2`，它通常比卡片更浅、更"贴近"文字 ⇒
+    // 每条文字类断言**对两个面各算一次，取更差的那个**。实测差距不小：glass 的
+    // `--v-accent-text` 在卡片上 6.17、在 `--v-surface-2` 上只有 **4.42**（差 1.75），
+    // 而 4.42 才是屏幕上真会发生的那个数。
+    const faces = [
+      { name: '--v-surface', rgba: parse(value(t.id, '--v-surface')) },
+      { name: '--v-surface-2', rgba: parse(value(t.id, '--v-surface-2')) },
+    ]
+
+    /**
+     * 一条断言的**屏幕真值**：`text` 是文字 token，`chip` 是可选的"软底"token
+     * （`null` ⇒ 文字直接坐在面上）。
+     * 合成顺序照真实堆叠走：`--v-surface*` 先叠到 `--v-bg`（两者都半透明），
+     * 软底再叠到那个面上；**文字那一侧也要叠**（F2b，见下）。
+     */
+    const worst = (text: string, chip: string | null) =>
+      faces
+        .map((f) => {
+          const bottom = over(f.rgba, bg)
+          const painted = chip === null ? bottom : over(parse(value(t.id, chip)), bottom)
+          // ⭐ F2b（fix 轮，reviewer 实测）：**文字侧不合成 = 数字虚高**。
+          // `--v-fg-3` 这类是 `rgba(255,255,255,.55)` 半透明色，只 `parse()` 不 `over()`
+          // 等于拿"屏幕上不存在的颜色"去比：实测默认主题（对卡片）读 17.29、真值 **6.01**；
+          // glass 读 10.96、真值 6.30。今天这两条都达标（**没有假绿**），但留着就是一类
+          // **可构造的假绿**：把某个 `--v-*text` 写成与它软底同值的半透明色时，断言读到
+          // 5.53（过）、屏幕真值 1.45（几乎看不见）。
+          const ink = over(parse(value(t.id, text)), painted)
+          return { ratio: contrast(ink, painted), where: `${chip ?? '(裸文字)'} @ ${f.name}` }
+        })
+        .reduce((a, b) => (b.ratio < a.ratio ? b : a))
+
+    const body = worst('--v-fg', null)
+    const muted = worst('--v-fg-3', null)
+    const soft = worst('--v-accent-text', '--v-accent-soft')
+    const danger = worst('--v-danger-text', '--v-danger-btn')
+    // 断言消息带上"最差的那个面"：只写"glass 软底按钮文字 4.42"看不出是哪个面在拉低
+    expect(body.ratio, `${t.id} 正文/面（最差面 ${body.where}）`).toBeGreaterThanOrEqual(4.5)
+    expect(muted.ratio, `${t.id} 弱化文字/面（最差面 ${muted.where}）`).toBeGreaterThanOrEqual(3)
+    expect(soft.ratio, `${t.id} 软底按钮文字（最差面 ${soft.where}）`).toBeGreaterThanOrEqual(3)
+    expect(danger.ratio, `${t.id} 危险按钮文字（最差面 ${danger.where}）`).toBeGreaterThanOrEqual(3)
   }
 })

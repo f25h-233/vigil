@@ -192,15 +192,85 @@ describe('表单控件规则的分层（F4 守卫）', () => {
  * 见文件首条用例），所以 `selector === "[data-theme='default']"` 恒为假。
  * ⇒ 这里**复用文件上方的模块级 `v()`**（它按 `includes` 找默认块，是内层版的严格超集），
  * 不留两份会漂移的取值助手。差异已写进 task-3-report.md 的偏差清单。
+ *
+ * ⭐ F3（fix 轮，reviewer 的变异 (e) 实测）：**这里此前是一组散点断言**，只钉了 9 个值
+ * ⇒ 把 material 的 `--v-radius-md/lg` 与 `--v-surface-2` 三处**退回默认主题的值**，
+ * 全量 **76/76 仍全绿**。据此改成**表驱动**：四套非默认主题 × 9 个结构 token 的
+ * **字面期望值**逐字锁死（G8）。值一律照 `index.css` 那四块**抄死**，不写成
+ * "读 CSS 再比 CSS"（空守卫的经典形状）——改主题就必须**同时**改这张表，那正是"锁"的
+ * 代价，也是它的目的。
+ * ⚠️ 这张表锁的是**结构** token；变异 (e) 的第三条腿（`--v-surface-2` 是**颜色**，
+ * 退回默认值仍全绿，我复跑过）**不在这里**的覆盖面内，缺口记在 task-3-fix-report.md §6.4。
  */
-test('结构维度每套主题各给一份，且与默认**不同**（否则"五套主题"只剩标签不同）', () => {
-  expect(v('brutalism', '--v-radius-xl')).toBe('0px') // 方角是粗野主义的判据
-  expect(v('brutalism', '--v-font-sans')).toContain('monospace')
-  expect(v('brutalism', '--v-shadow-card')).not.toBe('none') // 硬阴影承担"厚边框"（E5）
-  expect(v('glass', '--v-panel-blur')).not.toBe('0px')
+const STRUCTURAL: Record<string, Record<string, string>> = {
+  material: {
+    '--v-radius-md': '0.5rem',
+    '--v-radius-lg': '0.75rem',
+    '--v-radius-xl': '0.75rem',
+    '--v-radius-full': '9999px', // R6：Material 3 的 chip 是全圆
+    '--v-shadow-card': '0 1px 2px rgba(0, 0, 0, 0.3), 0 1px 3px 1px rgba(0, 0, 0, 0.15)', // 抬升
+    '--v-header-blur': '0px',
+    '--v-panel-blur': '0px',
+    '--v-font-sans': "'Roboto', system-ui, 'Segoe UI', 'Microsoft YaHei', sans-serif",
+    '--v-tracking': 'normal',
+  },
+  brutalism: {
+    '--v-radius-md': '0px', // 方角是粗野主义的判据
+    '--v-radius-lg': '0px',
+    '--v-radius-xl': '0px',
+    '--v-radius-full': '0px', // R6：方角**到底**（此前 rounded-full 家族是字面量，5 处圆药丸漏网）
+    '--v-shadow-card': '4px 4px 0 0 #0a0a0a', // 硬阴影承担"厚边框"（E5）
+    '--v-header-blur': '0px',
+    '--v-panel-blur': '0px',
+    '--v-font-sans': "ui-monospace, 'Cascadia Mono', Consolas, 'Microsoft YaHei', monospace",
+    '--v-tracking': '0.02em',
+  },
+  vaporwave: {
+    '--v-radius-md': '0.5rem',
+    '--v-radius-lg': '0.75rem',
+    '--v-radius-xl': '1rem',
+    '--v-radius-full': '9999px', // R6
+    '--v-shadow-card':
+      '0 0 0 1px rgba(0, 229, 255, 0.28), 0 0 20px rgba(255, 52, 182, 0.35)', // 辉光收边
+    '--v-header-blur': '12px',
+    '--v-panel-blur': '6px',
+    '--v-font-sans': "system-ui, -apple-system, 'Segoe UI', 'Microsoft YaHei', sans-serif",
+    '--v-tracking': '0.02em',
+  },
+  glass: {
+    '--v-radius-md': '0.5rem',
+    '--v-radius-lg': '0.75rem',
+    '--v-radius-xl': '1rem',
+    '--v-radius-full': '9999px', // R6
+    '--v-shadow-card': '0 8px 32px rgba(12, 8, 32, 0.45)',
+    '--v-header-blur': '18px', // 大模糊 + 半透明白面板是这套主题的身份
+    '--v-panel-blur': '14px',
+    '--v-font-sans': "system-ui, -apple-system, 'Segoe UI', 'Microsoft YaHei', sans-serif",
+    '--v-tracking': 'normal',
+  },
+}
+
+/**
+ * ⚠️ 为什么这 9 个 token 要**锁死字面值**（而不是只断言"与默认不同"）：主题身份一旦被
+ * 顺手改回默认，外观主题就**名存实亡**，而肉眼看不出是哪一处退化了——圆角从 `0.5rem`
+ * 退回 `0.375rem`、面板模糊从 `12px` 退回 `0px`，都只让人"觉得有点不对"。
+ * 反过来，"与默认不同"是**太弱**的判据：把 `0.5rem` 改成 `0.6rem` 它也过，
+ * 而那是没人批准过的外观改动。
+ */
+test('结构维度每套主题各给一份，且与默认**不同**（F3：九个结构 token 的字面值表驱动锁死）', () => {
+  for (const [theme, want] of Object.entries(STRUCTURAL)) {
+    for (const [token, expected] of Object.entries(want)) {
+      expect(v(theme, token), `${theme} 的 ${token} 退化了（主题身份靠它）`).toBe(expected)
+    }
+  }
+  // 表没覆盖的两件事，单独留在这里（不是散点断言，是两条问不进表里的问题）：
+  // ① `--v-page-image` 是多行渐变，写进表里就成了"按空白逐字比"，脆且难读 ⇒ 只问形状
   expect(v('glass', '--v-page-image')).toContain('gradient')
   expect(v('vaporwave', '--v-page-image')).toContain('gradient')
-  expect(v('material', '--v-shadow-card')).not.toBe('none') // 抬升
-  expect(v('default', '--v-shadow-card')).toBe('none') // 默认主题保持今天的观感
+  // ② 默认块是 T1 冻结的基线（"默认主题 = 今天"）：这两条是"它**没有**被主题化"的抓手。
+  //    `--v-radius-full: 9999px` 同理——它是 R6 新增的、唯一进了冻结块的新 token，
+  //    值必须保持"与内置字面量同像素"（见 index.css 里 @theme inline 那条注释）。
+  expect(v('default', '--v-shadow-card')).toBe('none')
   expect(v('default', '--v-page-image')).toBe('none')
+  expect(v('default', '--v-radius-full')).toBe('9999px')
 })

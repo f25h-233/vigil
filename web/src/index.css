@@ -82,6 +82,7 @@
   --v-radius-md: 0.375rem;
   --v-radius-lg: 0.5rem;
   --v-radius-xl: 0.75rem;
+  --v-radius-full: 9999px; /* ⭐ R6：见 `@theme inline` 那条——与内置字面量同像素 */
   --v-shadow-card: none;
   --v-header-blur: 8px;
   --v-panel-blur: 0px;
@@ -129,6 +130,18 @@
   --radius-md: var(--v-radius-md);
   --radius-lg: var(--v-radius-lg);
   --radius-xl: var(--v-radius-xl);
+  /* ⭐ R6（fix 轮，controller 裁决；reviewer 已实测）——`rounded-full` 家族**是字面量**：
+     Tailwind 4.3.3 的内置 radius 刻度只到 `--radius-4xl`，`full` 来自 utilities 里的
+     `infinity * 1px`（实测产物 `.rounded-full{border-radius:2147483647px}`）⇒ 粗野主义下
+     5 处圆药丸漏网（`PersonPicker.tsx:85/119/131`、`Feed.tsx:417`、`Settings.tsx:34`）。
+     在 `@theme` 里补上 `--radius-full` 这个名字之后，**三个** utility（`rounded-full` /
+     `rounded-l-full` / `rounded-r-full`）一起变成 `var(--v-radius-full)`（4.3.3 实测）。
+     ⚠️ 五块**各自都给一份**（G3 + parity 用例逐名比 token 集合，缺一块即红）：
+     默认/material/vaporwave/glass 给 `9999px` —— 它**与今天同像素**：任何真实元素的尺寸下，
+     `9999px` 和 `2147483647px` 都会命中"半径超过半边长就整体等比缩到半边长"那条规则，
+     钳完都是半边长（默认块是冻结基线，所以这里只能给"等价"而不是"新观感"）；
+     brutalism 给 `0px`（方角，与它的 `--v-radius-md/lg/xl` 一致）。 */
+  --radius-full: var(--v-radius-full);
 
   --shadow-vigil-card: var(--v-shadow-card);
   --blur-vigil-header: var(--v-header-blur);
@@ -168,7 +181,8 @@ body {
   }
 }
 
-/* ── ④ 另外四套主题：T3 定稿的完整值（四块都是 **33 个 token 一个不少**）。
+/* ── ④ 另外四套主题：T3 定稿的完整值（四块都是 **34 个 token 一个不少**——33 是 T3 当时的
+      数；R6 之后每块都多了 `--v-radius-full`，五块一起加，parity 仍逐名相等）。
       ⚠️ 每套都**显式给全**、不靠继承（G3）：CSS 里「没写」与「想继承」长得一样，
       而继承的后果是「浅色主题里冒出默认主题的深色」——`themeTokens.test.ts`
       的 parity 测试逐名比对就是为了挡这一条。
@@ -206,6 +220,7 @@ body {
   --v-radius-md: 0.5rem;
   --v-radius-lg: 0.75rem;
   --v-radius-xl: 0.75rem;
+  --v-radius-full: 9999px; /* ⭐ R6：药丸刻度，与默认块同值（Material 3 的 chip 就是全圆） */
   --v-shadow-card: 0 1px 2px rgba(0, 0, 0, 0.3), 0 1px 3px 1px rgba(0, 0, 0, 0.15);
   --v-header-blur: 0px;
   --v-panel-blur: 0px;
@@ -244,6 +259,7 @@ body {
   --v-radius-md: 0px;
   --v-radius-lg: 0px;
   --v-radius-xl: 0px;
+  --v-radius-full: 0px; /* ⭐ R6：**方角到底**——不加这条，此主题仍有 5 处圆药丸（见 @theme inline） */
   --v-shadow-card: 4px 4px 0 0 #0a0a0a;
   --v-header-blur: 0px;
   --v-panel-blur: 0px;
@@ -283,6 +299,7 @@ body {
   --v-radius-md: 0.5rem;
   --v-radius-lg: 0.75rem;
   --v-radius-xl: 1rem;
+  --v-radius-full: 9999px; /* ⭐ R6：药丸刻度，与默认块同值 */
   --v-shadow-card: 0 0 0 1px rgba(0, 229, 255, 0.28), 0 0 20px rgba(255, 52, 182, 0.35);
   --v-header-blur: 12px;
   --v-panel-blur: 6px;
@@ -323,6 +340,7 @@ body {
   --v-radius-md: 0.5rem;
   --v-radius-lg: 0.75rem;
   --v-radius-xl: 1rem;
+  --v-radius-full: 9999px; /* ⭐ R6：药丸刻度，与默认块同值 */
   --v-shadow-card: 0 8px 32px rgba(12, 8, 32, 0.45);
   --v-header-blur: 18px;
   --v-panel-blur: 14px;
