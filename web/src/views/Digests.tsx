@@ -117,12 +117,12 @@ export default function Digests() {
                   </ul>
                 ),
                 li: ({ children }) => (
-                  <li className="text-sm leading-relaxed text-vigil-fg">
+                  <li className="text-sm leading-relaxed text-vigil-fg-2">
                     {children}
                   </li>
                 ),
                 p: ({ children }) => (
-                  <p className="my-1.5 text-sm leading-relaxed text-vigil-fg">
+                  <p className="my-1.5 text-sm leading-relaxed text-vigil-fg-2">
                     {children}
                   </p>
                 ),

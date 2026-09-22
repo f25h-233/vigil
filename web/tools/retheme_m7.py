@@ -47,7 +47,9 @@ MAPPING: dict[str, str] = {
     "text-white/90": "text-vigil-fg",
     "text-white/85": "text-vigil-fg",
     "text-white/80": "text-vigil-fg",
-    "text-white/75": "text-vigil-fg",
+    # ⚠️ R5（F2）:`/75`（≈76% 白）落 `fg`（#e6edf3，≈93%）= 全轮最大漂移（+40/通道），
+    # 且落在**日报正文**上 ⇒ 单独降一档到 `fg-2`（72%）。`/80`、`/85` 仍归 `fg`。
+    "text-white/75": "text-vigil-fg-2",
     "text-white/70": "text-vigil-fg-2",
     "text-white/60": "text-vigil-fg-2",
     "text-white/55": "text-vigil-fg-3",
