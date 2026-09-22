@@ -205,6 +205,26 @@ T3 执行期实测（报告偏差 1）：计划里那两条断言
   （那个漏的是"accent-text 单独用"，这个漏的是"壁纸层"）。
   ⇒ 加判据时要问一句：**"屏幕上这块文字后面到底有什么？"** —— 模型里缺一层，就等于没判。
 
+### E15 🔴 计划对 `registerType` 的假设是**错的**——`autoUpdate` 让 `onNeedRefresh` 编成死支
+
+计划 §Task 6 写的是「`registerType: 'autoUpdate'` 会让新 SW 立刻接管，而 `onNeedRefresh` 会被触发 ⇒ 可以提示」。
+**T6 reviewer 从插件源码证伪了它**（三层证据）：
+
+1. 配置 `registerType: 'autoUpdate'` ⇒
+2. 插件 `dist/index.js:169` 把 `__SW_AUTO_UPDATE__` 替换成 `"true"` ⇒
+3. 出厂 bundle 里那个常量是 `C=true`，而 `onNeedRefresh` 的唯一调用点 `r?.()` 落在 `if (C) { … } else { … }` 的**死支**里。
+
+**后果**：提示条**永不出现**；`updateSW(true)` 因 `C || u?.()` **连 `messageSkipWaiting` 都不发**（点了白点）；
+实际生效的是 `window.location.reload()` **自动刷新**——正是吐司 docstring 里明文拒绝的行为。
+⇒ **裁决 R9**：`registerType` 改 **`'prompt'`**（一行）。副作用如实写进配置注释：版本更新要用户**点一次**。
+
+**同轮三条读源码得出的判断（比直觉值钱，一并记下）**：
+- `registerSW` 在无 `serviceWorker` 的环境下**静默返回、不同步抛**（整个函数体在 `if ("serviceWorker" in navigator)` 里，
+  且 `register()` 是 async）⇒ **不该加 try/catch**：那会是**永不执行的空守卫**。要错误处理该用插件已给的 `onRegisterError`。
+- 实现者担心的 TDZ **不可达**：`updateSW` 只在**用户点击时**才被读（闭包延迟求值）。
+- 判"有没有二次注册"的判据：`grep registerSW.js == 0` **拦不住 `injectRegister:'inline'`**（inline 用另一个 id、不产那个文件）
+  ⇒ 更硬的判据是 **`index.html` 里不出现 `navigator.serviceWorker.register`**。
+
 ### E6 `bg-black/30` 的 12 处里有 10 处是**输入框底**，不是遮罩
 
 实测分布：`ItemCard.tsx:167`、`PersonPicker.tsx:147/153`、`Feed.tsx:302`、`Settings.tsx:532/534/536/539/579/968/991`（输入框/文本域）、`SourceList.tsx:15`（源消息条目）。**本应用没有模态遮罩**。
