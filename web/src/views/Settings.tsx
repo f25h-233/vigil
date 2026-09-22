@@ -191,14 +191,20 @@ function GroupRowView({ g, onChanged }: { g: GroupRow; onChanged: () => void }) 
       ) : g.known ? (
         // ⚠️ 这一支**只放「启用」**：想彻底删掉它的人先启用、再移除（两步、不是死路），
         // 而多一个「移除」在这里会诱导用户对"我刚停用、还想留着"的群误点删除。
+        // ⚠️ 这里是 `text-vigil-accent`（**强调色的文字动作**），不是 `text-vigil-accent-text`：
+        // 后者的合法语境**只有一个**——坐在这套主题的 `bg-vigil-accent-soft` 上。
+        // 而这两个按钮落在**白卡**（`--v-surface` / `--v-surface-2`）上，没有软底；
+        // 粗野主义的 `--v-accent-text` 是 `#ffffff` ⇒ 白字白底 = **按钮上的字看不见**
+        //（T3 的对比度判据只验了 accent-text 配 accent-soft 那一面，所以谁都没红）。
+        // 现由 `noRawPalette.test.ts` 里那条静态守卫挡死（扫描 src 下 .ts/.tsx）。
         <button disabled={busy}
                 onClick={() => act(() => api.patchGroup(g.id, { enabled: true }))}
-                className="rounded-md px-2 py-1 text-xs text-vigil-accent-text">
+                className="rounded-md px-2 py-1 text-xs text-vigil-accent">
           启用
         </button>
       ) : (
         <button disabled={busy} onClick={() => act(() => api.addGroup(g.id, g.name, 'normal'))}
-                className="rounded-md px-2 py-1 text-xs text-vigil-accent-text">
+                className="rounded-md px-2 py-1 text-xs text-vigil-accent">
           加入监视
         </button>
       )}

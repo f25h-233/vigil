@@ -51,6 +51,17 @@
   --v-bg: #0b0f14;
   --v-header: rgba(11, 15, 20, 0.9);
   --v-page-image: none;
+  /* ⭐ M7-P4 新增：**固定壁纸层**（画在 `body::before` 上，见 ③ 的注释）。
+     三层 token 与 `--v-page-image` 分工的判据只有一条：
+       **几何图形 / 落日这类"美术资产"必须钉在视口里（滚动时不跑）** ⇒ 走 `--v-wallpaper`；
+       网格 / 噪点这类"纹理"本就该跟着内容滚 ⇒ 留在 `--v-page-image`。
+     `--v-wallpaper-size` / `--v-wallpaper-pos` 是**按层序的逗号列表**（CSS 硬约束：
+     短了循环、长了作废），所以不能写死在 `body::before{}` 里——蒸汽波的落日与天空
+     要各占一条、玻璃的两个圆各占一角。
+     ⛔ 不用 `background-attachment: fixed`：那个在 iOS 上会拖影/掉帧（见 ③ 的注释）。 */
+  --v-wallpaper: none;
+  --v-wallpaper-size: auto;
+  --v-wallpaper-pos: center top;
   /* 文字四级（1 最强 → 4 最弱） */
   --v-fg: #e6edf3;
   --v-fg-2: rgba(255, 255, 255, 0.72);
@@ -148,8 +159,13 @@
   --blur-vigil-panel: var(--v-panel-blur);
 }
 
-/* ── ③ 页面层：不进 Tailwind（body 上一次用掉），因此能承载"美术资产"
-      ——渐变 / 网格纸 / 辉光都是任意 CSS，只受"每套主题各给一份"约束 ── */
+/* ── ③ 页面层：不进 Tailwind（body / body::before 上一次用掉），因此能承载"美术资产"
+      ——渐变 / 网格纸 / 辉光都是任意 CSS，只受"每套主题各给一份"约束 ──
+   ⭐ M7-P4：页面资产拆成**两层**，分工见 ① 里那几行注释。
+   * `body` 背景 = `--v-page-image`（**滚动纹理层**）：跟着内容滚。各套给的都是渐变，
+     而**渐变图层的 `auto` 尺寸 = 定位区尺寸**（整个 body）⇒ 单个平铺块本来就盖满
+     整页，尺寸/位置**不需要** token（这正是 P2 那对 `--v-page-size/pos` 被撤掉的原因）。
+   * `body::before` = `--v-wallpaper`（**固定壁纸层**）。 */
 body {
   background-color: var(--v-bg);
   background-image: var(--v-page-image);
@@ -157,6 +173,29 @@ body {
   font-family: var(--v-font-sans);
   letter-spacing: var(--v-tracking);
   min-height: 100vh;
+}
+
+/* 固定壁纸层：`position: fixed` 让它不随内容滚（几何图形/落日这类"美术资产"必须如此），
+   而**不用** `background-attachment: fixed`——那个在 iOS 上会拖影/掉帧。
+   `z-index:-1` 落在 body 内容之下、body 背景之上；`pointer-events:none` 不挡点击。
+
+   ⚠️ 叠放顺序（P4 的"两层"就是靠它成立的）：`--v-bg`（画布）→ `body` 的
+   `--v-page-image` → **`body::before` 的 `--v-wallpaper`** → 正文。即**壁纸压在纹理
+   之上**：蒸汽波的网格因此是从落日的天空"下面"透出来的（天空渐变留了透明度），
+   滚动时网格跟着动、太阳不动。
+   ⚠️ `background-repeat: no-repeat` 在这层是**必须**的：壁纸按 `--v-wallpaper-size`
+   定尺（蒸汽波是 `100% 62%`），而 `repeat` 是初值 ⇒ 不写它，每一屏都会再长出一颗
+   太阳（`100% 100%` 的玻璃两个圆看不出差别，但蒸汽波会**明显**是错的）。 */
+body::before {
+  content: '';
+  position: fixed;
+  inset: 0;
+  z-index: -1;
+  pointer-events: none;
+  background-image: var(--v-wallpaper);
+  background-size: var(--v-wallpaper-size);
+  background-position: var(--v-wallpaper-pos);
+  background-repeat: no-repeat;
 }
 
 /* ⚠️ 表单控件**不继承** font-family / letter-spacing（UA 样式给它们另设了一套）。
@@ -181,42 +220,59 @@ body {
   }
 }
 
-/* ── ④ 另外四套主题：T3 定稿的完整值（四块都是 **34 个 token 一个不少**——33 是 T3 当时的
-      数；R6 之后每块都多了 `--v-radius-full`，五块一起加，parity 仍逐名相等）。
+/* ── ④ 另外四套主题：T3 定稿的完整值（四块都是 **37 个 token 一个不少**——33 是 T3 当时的
+      数；R6 之后每块都多了 `--v-radius-full`，M7-P4 又多了 `--v-wallpaper` /
+      `--v-wallpaper-size` / `--v-wallpaper-pos`，**五块每次都是一起加**，parity 仍逐名相等）。
       ⚠️ 每套都**显式给全**、不靠继承（G3）：CSS 里「没写」与「想继承」长得一样，
       而继承的后果是「浅色主题里冒出默认主题的深色」——`themeTokens.test.ts`
       的 parity 测试逐名比对就是为了挡这一条。
-      ⚠️ 四块都**不是**「只换颜色」：圆角 / 阴影 / 模糊 / 字体 / 字距 / 页面底图
-      （`--v-page-image`）也在各自的值里，这才是「五套主题」而不只是五个色板。
+      ⚠️ 四块都**不是**「只换颜色」：圆角 / 阴影 / 模糊 / 字体 / 字距 / 页面资产
+      （`--v-page-image` 滚动纹理层，`--v-wallpaper` + `--v-wallpaper-size` /
+      `--v-wallpaper-pos` 固定壁纸层）也在各自的值里，这才是「五套主题」而不只是五个色板。
       ⚠️ 这里的字体栈是各主题的**设计值**；只有默认块受 E10 约束（`'Segoe UI'`
       必须字面第一，保基线），四套主题都有各自的字体判据（如粗野主义用等宽）。 ── */
 [data-theme='material'] {
-  /* Material 3 浅色：tonal surface + elevation + 紫系 primary */
-  --v-bg: #fdfbff;
-  --v-header: rgba(253, 251, 255, 0.88);
+  /* Material 3 浅色（**P1 修订：更素的 M3 —— 深字配浅底**）
+     ⚠️ 用户原话：「material design 不够谷歌，颜色不够素」。两处病根都在**容器色家族选错**：
+     ① `--v-accent-soft` 原来用 `#eaddff`（primary-container，**紫得发亮**）⇒ 整页最跳的
+        那块颜色出现在每个按钮上；
+     ② `--v-accent-text` / `--v-danger-text` 用的是 on-surface 一侧的**深紫/深红**没错，
+        但底是上面那个高饱和容器 ⇒ 面偏色。
+     修订：软底与容器统一改用 M3 的 **secondary-container / error-container**（`#e8def8` /
+     `#f9dedc`），文字改用它们各自的 **on-\*** （`#1d192b` / `#410e0b`，都是**深字**）——
+     这就是"深字配浅底"与原来"浅字配浅底"（默认/蒸汽波/毛玻璃那三套的方向）的分野；
+     琥珀同时去饱和（`#8b5000`/`#ffdeaa` → `#7a5900`/`#f7e7cf`，M3 的 warn 家族本就没有
+     那么亮的黄）。底 `#fdfbff` → `#fef7ff`（surface 家族的中性紫调，更接近 M3 的
+     surfaceContainerLowest）。
+     ⚠️ 结构值（radius / shadow / blur / font / tracking）**一个字没动**——P1 只换色。 */
+  --v-bg: #fef7ff;
+  --v-header: rgba(254, 247, 255, 0.92);
   --v-page-image: none;
-  --v-fg: #1c1b1f;
+  --v-wallpaper: none; /* P4：无壁纸（M3 的底就是纯色 + tonal surface） */
+  --v-wallpaper-size: auto;
+  --v-wallpaper-pos: center top;
+  --v-fg: #1d1b20;
   --v-fg-2: #49454f;
   --v-fg-3: #5f5c66;
   --v-fg-4: #79747e;
   --v-surface: #f7f2fa;
-  --v-surface-2: #e8def8;
+  --v-surface-2: #e8def8; /* M3 secondary-container */
   --v-surface-solid: #ffffff;
   --v-inset: #ece6f0;
   --v-border: #cac4d0;
   --v-border-soft: #e7e0ec;
   --v-accent: #6750a4;
-  --v-accent-soft: #eaddff;
-  --v-accent-text: #4f378b;
+  --v-accent-soft: #e8def8; /* M3 secondary-container（= --v-surface-2，软底与选中底同源） */
+  --v-accent-text: #1d192b; /* on-secondary-container：**深字** */
   --v-danger: #b3261e;
   --v-danger-soft: #f9dedc;
   --v-danger-btn: #f9dedc;
   --v-danger-btn-active: #f2b8b5;
-  --v-danger-text: #8c1d18;
-  --v-warn: #8b5000;
-  --v-warn-soft: #ffdeaa;
-  --v-warn-btn: #ffdeaa;
-  --v-warn-text: #5c3c00;
+  --v-danger-text: #410e0b; /* on-error-container：**深字** */
+  --v-warn: #7a5900;
+  --v-warn-soft: #f7e7cf;
+  --v-warn-btn: #f7e7cf;
+  --v-warn-text: #4b3600;
   --v-radius-md: 0.5rem;
   --v-radius-lg: 0.75rem;
   --v-radius-xl: 0.75rem;
@@ -234,6 +290,9 @@ body {
   --v-header: rgba(242, 240, 235, 0.96);
   --v-page-image: repeating-linear-gradient(0deg, rgba(0, 0, 0, 0.05) 0 1px, transparent 1px 24px),
     repeating-linear-gradient(90deg, rgba(0, 0, 0, 0.05) 0 1px, transparent 1px 24px);
+  --v-wallpaper: none; /* P4：无壁纸——网格纸**是纹理**（该跟着内容滚），所以留 `--v-page-image` */
+  --v-wallpaper-size: auto;
+  --v-wallpaper-pos: center top;
   --v-fg: #0a0a0a;
   --v-fg-2: #262626;
   --v-fg-3: #404040;
@@ -268,12 +327,43 @@ body {
 }
 
 [data-theme='vaporwave'] {
-  /* 深紫底 + 粉/青霓虹：软底低透明度，靠 --v-shadow-card 的辉光收边 */
-  --v-bg: #1a0b2e;
-  --v-header: rgba(26, 11, 46, 0.88);
-  --v-page-image: radial-gradient(120% 70% at 50% 110%, rgba(0, 229, 255, 0.25), transparent 60%),
-    linear-gradient(180deg, rgba(255, 52, 182, 0.22), transparent 45%),
-    repeating-linear-gradient(0deg, rgba(0, 229, 255, 0.06) 0 1px, transparent 1px 26px);
+  /* 近黑底 + 粉/青霓虹：软底低透明度，靠 --v-shadow-card 的辉光收边。
+     ── P2 修订（用户原话：「经典的夕阳西下，霓虹色 + 黑色底色网格」）──
+     `--v-bg` 从 `#1a0b2e`（紫）压到 `#0a0118`（**更近黑**），`--v-header` 同比调深
+     （`rgba(26,11,46,.88)` → `rgba(10,1,24,.82)`，透一点让霓虹网格从顶栏下透出来）。
+
+     ── P4 修订：这条分界线就是"资产 vs 纹理" ──
+       `--v-wallpaper`（**固定层**，`body::before`，不随滚动跑）：② 天空渐变 + ① 落日。
+         落日是 SVG data URI：一颗带渐变的圆 + 7 条**底色横条**切它的下半部。
+         为什么必须是 SVG：CSS 渐变做不出"被横条切开的圆"——`radial-gradient` 只有
+         同心圆环，要做出横条得靠 `repeating-linear-gradient` 去过采样再对齐圆，
+         既脆又没法保证圆的位置。SVG 里 `clipPath` + `rect` 是十来个字符的事。
+         尺寸用**百分比** `100% 62%`（不用 `px` / `vh`：手机上地址栏收起会让 vh 抖，
+         一个固定的壁纸跟着跳最扎眼）。两层都占顶部同一条，所以 pos 都是 `center top`。
+       `--v-page-image`（**滚动纹理层**，`body`，跟着内容滚）：③④ 横向 / 纵向霓虹网格。
+         两层都是渐变 ⇒ `auto` 尺寸 = 定位区尺寸（整页），**不需要** size/pos token。
+     ⇒ 两层从此**各自独立**：壁纸层的"钉在视口里"由 `position: fixed` **保证**（← 这句
+       可证）；网格层仍画在 `body` 背景上，它的滚动行为与 P2 之前**一字未改**
+       （⚠️ `body` 背景是**画布背景**——`html` 没给背景时 body 的会传播上去，
+       实际滚动表现属于浏览器行为，**无浏览器无法核实**，报告里如实列为未验证项）。
+       另外天空渐变留了透明度，网格因此能从天下透出来。
+
+     ⚠️ data URI 的转义（只有这三样是必须的，少一样就整张图**静默不显示**）：
+     `#` → `%23`（不转义的话 `#` 起 **fragment**，SVG 被从那里截断：`url(%23sg)` 的
+     颜色引用与两个 `stop-color` 都会丢）、`<` → `%3C`、`>` → `%3E`。
+     另外：整个 URI 用**单引号**包起来，里面的 `(` `)`（`url(%23sg)`）才是字符串内容
+     而不是 CSS 函数括号；`"` 一律写成 `%22`，空格一律 `%20`（不留裸空格/裸引号，
+     免得换个工具链解析就变脸）。
+     ⛔ 值里**不许出现 `;`**：`themeTokens.test.ts` 的取值助手按 `[^;]+` 截断，
+     写 `data:image/svg+xml;utf8,` 或内联 `style="a:b;c:d"` 会让它读到半截（实测过）。 */
+  --v-bg: #0a0118;
+  --v-header: rgba(10, 1, 24, 0.82);
+  --v-page-image: repeating-linear-gradient(0deg, rgba(0, 229, 255, 0.16) 0 1px, transparent 1px 30px),
+    repeating-linear-gradient(90deg, rgba(255, 52, 182, 0.14) 0 1px, transparent 1px 30px);
+  --v-wallpaper: url('data:image/svg+xml,%3Csvg%20xmlns=%22http://www.w3.org/2000/svg%22%20viewBox=%220%200%201200%20520%22%20preserveAspectRatio=%22xMidYMid%20meet%22%3E%3Cdefs%3E%3ClinearGradient%20id=%22sg%22%20x1=%220%22%20y1=%220%22%20x2=%220%22%20y2=%221%22%3E%3Cstop%20offset=%220%22%20stop-color=%22%23fff3a3%22/%3E%3Cstop%20offset=%220.35%22%20stop-color=%22%23ffb347%22/%3E%3Cstop%20offset=%220.65%22%20stop-color=%22%23ff5e8a%22/%3E%3Cstop%20offset=%221%22%20stop-color=%22%23ff2d95%22/%3E%3C/linearGradient%3E%3CclipPath%20id=%22sc%22%3E%3Ccircle%20cx=%22600%22%20cy=%22316%22%20r=%22210%22/%3E%3C/clipPath%3E%3C/defs%3E%3Ccircle%20cx=%22600%22%20cy=%22316%22%20r=%22210%22%20fill=%22url(%23sg)%22/%3E%3Cg%20clip-path=%22url(%23sc)%22%20fill=%22%230a0118%22%3E%3Crect%20x=%22380%22%20y=%22316%22%20width=%22440%22%20height=%226%22/%3E%3Crect%20x=%22380%22%20y=%22336%22%20width=%22440%22%20height=%229%22/%3E%3Crect%20x=%22380%22%20y=%22360%22%20width=%22440%22%20height=%2212%22/%3E%3Crect%20x=%22380%22%20y=%22388%22%20width=%22440%22%20height=%2216%22/%3E%3Crect%20x=%22380%22%20y=%22421%22%20width=%22440%22%20height=%2220%22/%3E%3Crect%20x=%22380%22%20y=%22459%22%20width=%22440%22%20height=%2224%22/%3E%3Crect%20x=%22380%22%20y=%22503%22%20width=%22440%22%20height=%2240%22/%3E%3C/g%3E%3C/svg%3E'),
+    linear-gradient(180deg, rgba(45, 10, 70, 0.95) 0%, rgba(122, 28, 88, 0.82) 45%, rgba(196, 45, 120, 0.62) 65%, rgba(10, 1, 24, 1) 100%);
+  --v-wallpaper-size: 100% 62%, 100% 62%;
+  --v-wallpaper-pos: center top, center top;
   --v-fg: #f6e9ff;
   --v-fg-2: #dcc4ff;
   --v-fg-3: #b78fe0;
@@ -308,23 +398,52 @@ body {
 }
 
 [data-theme='glass'] {
-  /* 深色极光底 + 半透明白面板 + 大模糊：--v-bg 取渐变中位色（对比度测试要用） */
-  --v-bg: #241447;
-  --v-header: rgba(36, 20, 71, 0.55);
-  --v-page-image: radial-gradient(90% 60% at 12% 0%, rgba(124, 58, 237, 0.55), transparent 62%),
-    radial-gradient(80% 55% at 88% 8%, rgba(236, 72, 153, 0.42), transparent 58%),
-    radial-gradient(120% 80% at 50% 105%, rgba(34, 211, 238, 0.38), transparent 62%),
-    linear-gradient(160deg, #1b1035 0%, #241447 55%, #122140 100%);
+  /* 深藏青底 + 几何图形壁纸 + **暗玻璃**面板 + 大模糊。
+     ── P5 修订（用户原话：「背景图并非简单的颜色渐变，而是…有一些有趣的几何图像…
+        现代很多手机的壁纸的设计语言」，并给了两张参考图：深藏青底 + 左上橙红大圆 +
+        右下青绿大圆；紫色层叠弧线）──
+     ① `--v-bg` `#241447`（紫）→ `#0b1020`（**深藏青**）：紫是旧身份的残留，用户点名的
+        是藏青底。
+     ② **底不再是"一片渐变"**：原来那四层极光（紫/粉/青 radial + 对角 linear）整个
+        **撤掉**，`--v-page-image` 回到 `none`；几何图形改走 `--v-wallpaper`（P4 的固定
+        层）——**大色块是"美术资产"**，滚动时跑掉就不像壁纸了。
+        写法用 `ellipse N% M% at x% y%`（**百分比，不用 vh/vmin**：手机上地址栏收起会
+        让 vh 抖一下，壁纸跟着跳）。两个圆一左上橙红、一右下青绿，与参考图同构。
+     ③ ⛔ **面板必须改成"暗玻璃"**（下面那 6 个 面/边框 token）：原来面板是
+        `rgba(255,255,255,.14)` 的**亮**玻璃——白字压在壁纸的亮橙圆上会糊成一片，
+        "玻璃"看着像雾。改成**暗色半透明**（压在亮色圆上仍然压得住 ⇒ 白字读得出来），
+        这正是这套主题从"极光底"换成"几何底"之后必须一起动的那一半。
+        ⚠️ `--v-header` 一并从紫色系 `rgba(36,20,71,.55)` 换成藏青系
+        `rgba(11,16,32,.62)`——它不在 P5 点名的清单里，但没有它，藏青底上会留一条
+        紫顶栏（同 ①的"残留"）。（如实记在 theme-revision-report.md 的偏差里。）
+     ⚠️ 对比度判据的**已知近似**（P5 之后变得更要紧）：`themePalette.test.ts` 只能拿
+        `--v-bg` 当底算字色/面板的对比度，**它不知道壁纸**。壁纸的亮橙圆（`#ffb01f`）
+        是这套主题里最亮的一块，所以真正兜底的是 ③ 那个暗面板——"白字压在亮圆上"
+        这件事**不在任何静态判据里**，归截图。 */
+  --v-bg: #0b1020;
+  --v-header: rgba(11, 16, 32, 0.62);
+  --v-page-image: none;
+  --v-wallpaper:
+    radial-gradient(ellipse 52% 40% at 4% 2%, #ffb01f 0%, #ff6a1f 34%, #ff2d78 58%, rgba(255, 45, 120, 0) 70%),
+    radial-gradient(ellipse 58% 44% at 98% 82%, #22d3ee 0%, #3b82f6 46%, #22ff88 74%, rgba(34, 255, 136, 0) 84%);
+  --v-wallpaper-size: 100% 100%, 100% 100%;
+  --v-wallpaper-pos: 0 0, 0 0;
   --v-fg: #ffffff;
   --v-fg-2: rgba(255, 255, 255, 0.82);
   --v-fg-3: rgba(255, 255, 255, 0.7);
   --v-fg-4: rgba(255, 255, 255, 0.55);
-  --v-surface: rgba(255, 255, 255, 0.14);
-  --v-surface-2: rgba(255, 255, 255, 0.26);
-  --v-surface-solid: #3a2560;
-  --v-inset: rgba(255, 255, 255, 0.1);
-  --v-border: rgba(255, 255, 255, 0.3);
-  --v-border-soft: rgba(255, 255, 255, 0.16);
+  /* ⭐ P5-③：**暗玻璃**（理由见块首注释）——亮玻璃改暗玻璃，白字才压得住背后的亮色圆。
+     ⚠️ `--v-surface` 的 alpha 从 brief 建议的 **0.42 提到 0.50**：0.42 在壁纸**最亮**的
+     那个像素（橙圆核心 `#ffb01f`）上算出来是 **4.45:1**，差 0.05 不达 4.5（`--v-surface-2`
+     给的 0.55 那档是 5.18/3.45，达标 ⇒ 不动）。判据按 brief 说的"过不去就改值，别改阈值"。
+     数表（`--v-surface` 压在 `#ffb01f` 上）：0.42 → fg 4.45 / fg-3 3.04；0.46 → 4.91/3.29；
+     **0.50 → 5.43/3.57**；0.55 → 6.17/3.96。 */
+  --v-surface: rgba(18, 22, 44, 0.5);
+  --v-surface-2: rgba(38, 44, 78, 0.55);
+  --v-surface-solid: #1b2140;
+  --v-inset: rgba(10, 14, 30, 0.5);
+  --v-border: rgba(255, 255, 255, 0.22);
+  --v-border-soft: rgba(255, 255, 255, 0.12);
   --v-accent: #a5f3fc;
   --v-accent-soft: rgba(165, 243, 252, 0.18);
   --v-accent-text: #cffafe;

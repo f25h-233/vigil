@@ -79,3 +79,92 @@ test('语义 token 不许带透明度修饰符（E3：构建期会烘死一个 f
   const hits = scan(TOKEN_WITH_ALPHA)
   expect(hits, `这些地方给 token 加了透明度：\n${hits.join('\n')}`).toEqual([])
 })
+
+/**
+ * ⭐ P0 守卫（M7 主题修订轮）：**「软底文字」这个 token 的合法语境只有一个**。
+ *
+ * `text-vigil-accent-text` 是"坐在 `bg-vigil-accent-soft` 上的字"——白卡片上的
+ * 强调色**文字动作**该用 `text-vigil-accent`（`--v-accent` 本身就是强调色）。
+ *
+ * ⚠️ 它存在的理由 = **实际发生过一次**（`Settings.tsx:196/201`，本轮修订的 P0）：
+ * 那两个按钮写的是 `text-vigil-accent-text` 而**没有**软底，落在白卡上；
+ * 粗野主义的 `--v-accent-text` 是 `#ffffff` ⇒ **白字白底，按钮上的字看不见**。
+ * 而它当时**零测试信号**——`themePalette.test.ts` 的对比度判据算的是
+ * `--v-accent-text` **配** `--v-accent-soft` 那一面（这是唯一有意义的配对），
+ * 所以这个漏网的调用点谁都不红；截图那一轮又只照了信息流，没照到这两个按钮。
+ * ⇒ 判据得落在**"它有没有软底"**这件事上，而那件事只有**看源码**才知道。
+ *
+ * ⚠️ 它**只证明"没有裸用的 accent-text"，证明不了"长得对"**：`bg-vigil-accent-soft`
+ * 是不是被 `disabled:opacity-40`、别的类名或父元素盖掉，静态扫描看不见——那部分
+ * 归对比度判据与截图。
+ *
+ * ⚠️ 判据用**字符串字面量**（`'…'` / `"…"` / `` `…` ``）而不是"同一行"：
+ * 该 token 的 12 个合法落点里有一半是三元里的 `'bg-vigil-accent-soft text-vigil-accent-text'`，
+ * 按行判会**恒真**（同一行里当然同时有两个名字）；按"同一个类名字符串"判才是
+ * 「这两个类名会一起挂到同一个元素上」的那个证据。注释里的提及一律跳过
+ * （本文件与 `Settings.tsx` 的说明性注释都写着这两个名字）。
+ */
+const ACCENT_TEXT = 'text-vigil-accent-text'
+const ACCENT_SOFT_BG = 'bg-vigil-accent-soft'
+
+type Span = [number, number]
+
+/** 扫出注释区间与字符串字面量区间（都记在**原文本**的坐标上，行号才算得对）。 */
+function spans(text: string): { comments: Span[]; strings: Span[] } {
+  const comments: Span[] = []
+  const strings: Span[] = []
+  let i = 0
+  while (i < text.length) {
+    const c = text[i]
+    if (c === '/' && text[i + 1] === '/') {
+      const e = text.indexOf('\n', i)
+      comments.push([i, e < 0 ? text.length : e])
+      i = e < 0 ? text.length : e
+      continue
+    }
+    if (c === '/' && text[i + 1] === '*') {
+      const e = text.indexOf('*/', i + 2)
+      comments.push([i, e < 0 ? text.length : e + 2])
+      i = e < 0 ? text.length : e + 2
+      continue
+    }
+    if (c === "'" || c === '"' || c === '`') {
+      let j = i + 1
+      while (j < text.length) {
+        if (text[j] === '\\') {
+          j += 2
+          continue
+        }
+        if (text[j] === c) break
+        j++
+      }
+      strings.push([i, j])
+      i = j + 1
+      continue
+    }
+    i++
+  }
+  return { comments, strings }
+}
+
+test(`${ACCENT_TEXT} 只许出现在同时含 ${ACCENT_SOFT_BG} 的字符串里（P0：白字白底那个缺陷）`, () => {
+  const hits: string[] = []
+  for (const f of walk(SRC)) {
+    const rel = relative(SRC, f).replace(/\\/g, '/')
+    if (ALLOW.has(rel)) continue
+    const text = readFileSync(f, 'utf8')
+    const { comments, strings } = spans(text)
+    for (const m of text.matchAll(new RegExp(ACCENT_TEXT, 'g'))) {
+      const at = m.index
+      if (comments.some(([a, b]) => at >= a && at < b)) continue // 注释里点名这个 token 是允许的
+      const line = text.slice(0, at).split('\n').length
+      const lit = strings.find(([a, b]) => at > a && at < b)
+      const where = lit === undefined ? '(不在任何字符串字面量里)' : text.slice(lit[0], lit[1] + 1)
+      if (!where.includes(ACCENT_SOFT_BG)) hits.push(`${rel}:${line}  ${m[0]}  ← 所在字符串 ${where}`)
+    }
+  }
+  expect(
+    hits,
+    `这些地方用了"软底文字"却没有软底（粗野主义下就是白字白底、看不见）：\n${hits.join('\n')}`,
+  ).toEqual([])
+})

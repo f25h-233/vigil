@@ -201,6 +201,20 @@ describe('表单控件规则的分层（F4 守卫）', () => {
  * 代价，也是它的目的。
  * ⚠️ 这张表锁的是**结构** token；变异 (e) 的第三条腿（`--v-surface-2` 是**颜色**，
  * 退回默认值仍全绿，我复跑过）**不在这里**的覆盖面内，缺口记在 task-3-fix-report.md §6.4。
+ *
+ * ⭐ M7-P4 换成三行：`--v-wallpaper` / `--v-wallpaper-size` / `--v-wallpaper-pos`
+ * （**固定壁纸层**的图 / 尺寸 / 定位）。为什么它们**也是结构值**：`-size` / `-pos` 决定
+ * "这套主题的壁纸占哪块地方、有几层"，与圆角/模糊是同一类东西；而 `--v-wallpaper`
+ * 本身是"这套主题**有没有**壁纸资产"的开关（`none` 与一个 data URI 是两种主题身份）。
+ * ⚠️ 四套里两套（material / brutalism）的 `--v-wallpaper` 是 `'none'`，**照样写进表**：
+ * "某套忘了给这份值"（继承 `:root`）由 parity 挡，而这里挡的是另一件事——**将来给某套
+ * 加壁纸时顺手把值写进 `body::before{}`**（那就等于把主题资产又拉回全局，而
+ * `body::before{}` 没有任何测试在比"值"）。
+ * ⚠️ `--v-wallpaper` 的**值**只在"短到能逐字比"时才进表（`'none'`）；蒸汽波是 1.4KB 的
+ * SVG data URI、玻璃是两个大 radial —— 与本文件对 `--v-page-image` 的既有处理一致
+ *（`toContain` 只问形状；理由见文件末尾那段），另外**层数**在末尾单独钉住。
+ * ⚠️ 默认块那三份值（`none` / `auto` / `center top`）在文件末尾与 `--v-shadow-card`
+ * 同一簇断言里（那里的判据是"默认主题**没有**被主题化"）。
  */
 const STRUCTURAL: Record<string, Record<string, string>> = {
   material: {
@@ -213,6 +227,9 @@ const STRUCTURAL: Record<string, Record<string, string>> = {
     '--v-panel-blur': '0px',
     '--v-font-sans': "'Roboto', system-ui, 'Segoe UI', 'Microsoft YaHei', sans-serif",
     '--v-tracking': 'normal',
+    '--v-wallpaper': 'none', // P4：M3 的底是纯色 + tonal surface，没有壁纸资产
+    '--v-wallpaper-size': 'auto',
+    '--v-wallpaper-pos': 'center top',
   },
   brutalism: {
     '--v-radius-md': '0px', // 方角是粗野主义的判据
@@ -224,6 +241,9 @@ const STRUCTURAL: Record<string, Record<string, string>> = {
     '--v-panel-blur': '0px',
     '--v-font-sans': "ui-monospace, 'Cascadia Mono', Consolas, 'Microsoft YaHei', monospace",
     '--v-tracking': '0.02em',
+    '--v-wallpaper': 'none', // P4：网格纸是**纹理**（该跟着内容滚）⇒ 留在 --v-page-image
+    '--v-wallpaper-size': 'auto',
+    '--v-wallpaper-pos': 'center top',
   },
   vaporwave: {
     '--v-radius-md': '0.5rem',
@@ -236,6 +256,12 @@ const STRUCTURAL: Record<string, Record<string, string>> = {
     '--v-panel-blur': '6px',
     '--v-font-sans': "system-ui, -apple-system, 'Segoe UI', 'Microsoft YaHei', sans-serif",
     '--v-tracking': '0.02em',
+    // ⭐ P4：壁纸层两层（落日 + 天空）**逐位对应**，都是"顶部同一条"。
+    // ⚠️ `100% 62%` 是**百分比**，不是 `520px` / `62vh`——手机上地址栏收起会让 vh 抖。
+    // ⚠️ 位序/层数错了不会报错，只会"某层尺寸被套到另一层上"——所以这里逐字锁死
+    //（层数在文件末尾与 `--v-wallpaper` 的形状断言并排钉住）。
+    '--v-wallpaper-size': '100% 62%, 100% 62%',
+    '--v-wallpaper-pos': 'center top, center top',
   },
   glass: {
     '--v-radius-md': '0.5rem',
@@ -247,6 +273,10 @@ const STRUCTURAL: Record<string, Record<string, string>> = {
     '--v-panel-blur': '14px',
     '--v-font-sans': "system-ui, -apple-system, 'Segoe UI', 'Microsoft YaHei', sans-serif",
     '--v-tracking': 'normal',
+    // ⭐ P5：壁纸是两个**大几何块**（左上橙红 / 右下青绿），各占整个视口 ⇒ `100% 100%`。
+    // 值不写进表（两行长 radial，理由同文件末尾那段），只锁尺寸/定位 + 末尾的层数。
+    '--v-wallpaper-size': '100% 100%, 100% 100%',
+    '--v-wallpaper-pos': '0 0, 0 0',
   },
 }
 
@@ -257,20 +287,33 @@ const STRUCTURAL: Record<string, Record<string, string>> = {
  * 反过来，"与默认不同"是**太弱**的判据：把 `0.5rem` 改成 `0.6rem` 它也过，
  * 而那是没人批准过的外观改动。
  */
-test('结构维度每套主题各给一份，且与默认**不同**（F3：九个结构 token 的字面值表驱动锁死）', () => {
+test('结构维度每套主题各给一份（F3 + P4：结构 token 的字面值表驱动锁死，不写死个数）', () => {
   for (const [theme, want] of Object.entries(STRUCTURAL)) {
     for (const [token, expected] of Object.entries(want)) {
       expect(v(theme, token), `${theme} 的 ${token} 退化了（主题身份靠它）`).toBe(expected)
     }
   }
-  // 表没覆盖的两件事，单独留在这里（不是散点断言，是两条问不进表里的问题）：
-  // ① `--v-page-image` 是多行渐变，写进表里就成了"按空白逐字比"，脆且难读 ⇒ 只问形状
-  expect(v('glass', '--v-page-image')).toContain('gradient')
-  expect(v('vaporwave', '--v-page-image')).toContain('gradient')
-  // ② 默认块是 T1 冻结的基线（"默认主题 = 今天"）：这两条是"它**没有**被主题化"的抓手。
+  // 表没覆盖的几件事，单独留在这里（不是散点断言，是几条问不进表里的问题）：
+  // ① `--v-page-image` / `--v-wallpaper` 是**多行**值（蒸汽波那张壁纸还是 1.4KB 的
+  //    SVG data URI），写进表里就成了"按空白逐字比"，脆且难读 ⇒ 只问**形状与层数**。
+  //    ⚠️ 层数必须问：`--v-wallpaper-size` / `-pos` 是**按层序**的逗号列表，层数与
+  //    列表长度对不上时 CSS **不报错**，只是静默错位（P2 的教训）。
+  const countOf = (s: string, w: string) => s.split(w).length - 1
+  expect(v('brutalism', '--v-page-image')).toContain('repeating-linear-gradient') // 网格纸
+  expect(v('vaporwave', '--v-page-image')).toContain('repeating-linear-gradient') // 霓虹网格
+  expect(countOf(v('vaporwave', '--v-page-image'), 'repeating-linear-gradient')).toBe(2) // 横 + 纵
+  // 落日：**必须是 SVG**（CSS 渐变做不出"被横条切开的圆"）；天空那层是唯一一个
+  // `linear-gradient`（SVG 里的 `linearGradient` 大小写不同，数不进来）。
+  expect(v('vaporwave', '--v-wallpaper')).toContain('data:image/svg+xml')
+  expect(countOf(v('vaporwave', '--v-wallpaper'), 'linear-gradient')).toBe(1)
+  // 玻璃：两个**大几何块**（左上橙红 / 右下青绿），与参考图同构。
+  expect(countOf(v('glass', '--v-wallpaper'), 'radial-gradient')).toBe(2)
+  // ② 默认块是 T1 冻结的基线（"默认主题 = 今天"）：这几条是"它**没有**被主题化"的抓手。
   //    `--v-radius-full: 9999px` 同理——它是 R6 新增的、唯一进了冻结块的新 token，
   //    值必须保持"与内置字面量同像素"（见 index.css 里 @theme inline 那条注释）。
+  //    ⭐ P4 补 `--v-wallpaper`：默认主题一旦长了壁纸，就不是"今天"了。
   expect(v('default', '--v-shadow-card')).toBe('none')
   expect(v('default', '--v-page-image')).toBe('none')
+  expect(v('default', '--v-wallpaper')).toBe('none')
   expect(v('default', '--v-radius-full')).toBe('9999px')
 })
