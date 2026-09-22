@@ -451,10 +451,26 @@ test('R10⑧：陈旧的 blob（少键 / 结构变了）不硬套：缺的键保
   const st = document.documentElement.style
   expect(st.getPropertyValue('--v-fg')).toBe(ARGUS_DEFAULT)
   expect(st.getPropertyValue('--v-border'), '旧 blob 里没有的键：保持 CSS 默认（不许瞎猜）').toBe('')
-  // ⚠️ 已知且**可接受**的一条：白名单是**形状**白名单（不是 12 个键名的清单）⇒ 形状合法的
-  // 陌生键名会被贴上。它改不动任何真实 token（没有消费者），而 `main.tsx` 的
-  // `applyTheme(readTheme())` 在 App 启动时就调 `applyArgusColor` **重写整份 blob**
-  // ⇒ 陈旧窗口只有"首帧到模块执行"这一段，这一句就是那个自愈的证据。
+  // ⚠️ 已知、**已被用户裁定接受**、但**绝不许再说成"没有影响"**的一条：
+  // 白名单是**形状**白名单（不是 12 个键名的清单）⇒ 形状合法的**陌生键名**会被贴上。
+  //
+  // ⛔ 这里原来写的是「**它改不动任何真实 token（没有消费者）**」——**那句话是错的**
+  // （T8-2 收尾自报的 Concern，本行照实改）。真相是：
+  //   ① **值**的形状确实被限死（`/^#[0-9a-f]{6}$/` 或 `/^rgba?\([0-9., %]+\)$/`）
+  //      ⇒ "往行内样式里注入任意 CSS"那个面是**关着的**（`url(...)` / `;` 夹带都过不去）；
+  //   ② 但**键名可以指向任何真实 token**：`index.css` 里光是 `var(--v-*)` 就有
+  //      **43 个不同的键名**（含 `--v-bg` / `--v-danger` / `--v-page-image` / `--v-wallpaper`；
+  //      复核：`grep -o "var(--v-[a-z0-9-]*" index.css | sort -u | wc -l` ⇒ 43，
+  //      总出现处 55）——而 `--v-bg` 落在 `body { background-color: var(--v-bg) }` 上
+  //      ⇒ 一份被**手改过**的 blob（`{"--v-bg":"#ff0000"}`）**能把整页底色换掉**，
+  //      `--v-danger` / `--v-fg` 之类同理。
+  //   ③ **影响面 = 外观**（没有任何逻辑/数据能被它改到），且**前提**是攻击者**已经能写
+  //      用户自己的 `localStorage`**——本机、单用户、`vigil.argus.vars` 不出这台机器
+  //      ⇒ 用户裁定：**接受**这个面，不改白名单（改成 12 个键名的清单会让"陈旧 blob"与
+  //      "未知 token"两类一起被拒，代价大于收益）。
+  // ⇒ 结论按 ① 的**形状**说，不按"没有消费者"说。下面那句自愈仍然是**真**的：
+  // `main.tsx` 的 `applyTheme(readTheme())` 在 App 启动时就调 `applyArgusColor`
+  // **重写整份 blob** ⇒ 陈旧窗口只有"首帧到模块执行"这一段，这一句就是那个自愈的证据。
   expect(st.getPropertyValue('--v-old-token')).toBe(ARGUS_DEFAULT)
   applyArgusColor(readArgusColor())
   expect(JSON.parse(localStorage.getItem(ARGUS_VARS_KEY)!)).toEqual(full)

@@ -42,10 +42,18 @@ afterEach(() => {
   vi.unstubAllGlobals()
 })
 
-test('品牌区三件套：徽记 + ARGUS + 小字', () => {
+/**
+ * ⚠️ **R14 的语义变更**（不是放宽断言）：字标从 `<div>ARGUS</div>`（文本节点）换成了
+ * `role="img"` + `aria-label="ARGUS"` 的**蒙版图形** ⇒ `getByText('ARGUS')` **本该**失配
+ * （图形里没有文字节点），改查 **role/label**。
+ * 判据的**强度不变**：仍然是"这一处必须能被无障碍读到名字 ARGUS"，
+ * 而且下面那条 `role=img` 的断言**同时钉住了"它是个图形"**——
+ * 若有人把它退回文本节点，`getByRole('img', {name:'ARGUS'})` 会红。
+ */
+test('品牌区三件套：徽记 + ARGUS 字标 + 小字', () => {
   render(<ArgusBrand />)
   expect(screen.getByRole('img', { name: 'ARGUS 徽记' })).toBeTruthy()
-  expect(screen.getByText('ARGUS')).toBeTruthy()
+  expect(screen.getByRole('img', { name: 'ARGUS' })).toBeTruthy()
   expect(screen.getByText('睡亦警觉，眼观六路')).toBeTruthy()
 })
 
@@ -62,16 +70,68 @@ test('⛔ 徽记必须是**纯色**（全部 currentColor/无填充色）——�
   }
 })
 
+/**
+ * ⭐⭐ R14（T8-2 收尾的美术落地）：**字标那一半的同一条「纯色」纪律**。
+ *
+ * 用户原话：「品牌区那里的"argus"就用这个吧，**但注意它要能随主题色切换而变色，
+ * 所以这个图片不能直接用**。」⇒ 落点是「**位图当蒙版**」：形状来自资产
+ * （`mask-image`），颜色来自 `currentColor`（Tailwind 的 `bg-current`）。
+ *
+ * ⚠️ 为什么非要一条判据：那个颜色来源**只是一个类名**。删掉它 ⇒ 蒙版没有背景色，
+ * 屏幕上**字标整块消失**；换成任何写死的颜色类（或干脆塞进 `<img>`）⇒ 颜色被**烤死**，
+ * `/color` 改主题色而字标**纹丝不动**。这两种情况**都没有别的东西会红**——
+ * 真浏览器里才看得出来（正是上一条注释说的同一件事）。
+ */
+test('⛔ 字标必须是**蒙版 + bg-current**（颜色随主题色走），且**不许**有写死颜色的类', () => {
+  const { container } = render(<ArgusBrand />)
+  const mark = container.querySelector<HTMLElement>('[role="img"][aria-label="ARGUS"]')
+  expect(mark, '找不到字标元素（role="img" + aria-label="ARGUS"）').toBeTruthy()
+  const cls = mark!.className
+
+  // ① 存在性：颜色来源必须是 `bg-current`（或等价地用文字色 `text-current`）
+  expect(
+    /\b(?:bg|text)-current\b/.test(cls),
+    `字标没有 bg-current/text-current ⇒ 蒙版没有颜色来源，字标会整块消失：${cls}`,
+  ).toBe(true)
+
+  // ② 全称否定（与上一条的"纯色"守卫同款）：**除了 `*-current`，不许有任何别的颜色类**。
+  // ⚠️ 写成"凡 `bg-`/`text-`/… 开头的类名都必须以 `-current` 收尾"，而不是去列举调色板名
+  // ——本仓 `noRawPalette.test.ts` 的扫描会把**本文件里**写出来的任何调色板类名字面量
+  // 当成真命中（它只豁免它自己），列举法会把自己变成一处违规。
+  const COLORISH = /^(?:bg|text|border|ring|fill|stroke|from|to|via|decoration|accent|caret)-/
+  const offenders = cls.split(/\s+/).filter((t) => COLORISH.test(t) && !/(?:bg|text)-current$/.test(t))
+  expect(offenders, `字标上有写死颜色/非 currentColor 的类（颜色会被烤死、不再随主题走）：${offenders}`).toEqual([])
+
+  // ③ 阴性对照：蒙版确实挂**在这个元素**上（否则 ①② 可以靠一个空的 `div` 混过去——
+  //    那正是本仓「全称否定必须有存在性对照」的老账）。
+  const style = mark!.getAttribute('style') ?? ''
+  expect(style, '字标元素上没有 mask-image ⇒ 它根本不是蒙版').toMatch(/mask-image\s*:/)
+  expect(style, 'mask-image 没指向那份美术资产').toContain('argus-wordmark')
+})
+
 test('阴性对照：徽记的 `stroke` 不是"恰好没写"——根元素**显式**用它，否则上一条可以靠空 svg 混过去', () => {
-  // ⚠️ 上一条是**全称否定**（"没有任何字面色值"），而空 svg / 不画线的 svg 也满足它
-  // ⇒ 没有这一条，把 `stroke="currentColor"` 删掉（或整个 svg 删空）照样全绿，
-  // 而屏幕上的徽记**是一条都看不见的空白**。这是本仓「全称否定必须有存在性对照」的老账。
+  // ⚠️ 上面那条「徽记必须是纯色」是**全称否定**（"没有任何字面色值"），
+  // 而空 svg / 不画线的 svg 也满足它 ⇒ 没有这一条，把 `stroke="currentColor"` 删掉
+  //（或整个 svg 删空）照样全绿，而屏幕上的徽记**是一条都看不见的空白**。
+  // 这是本仓「全称否定必须有存在性对照」的老账。
   const { container } = render(<ArgusBrand />)
   const svg = container.querySelector('svg')!
   expect(svg.getAttribute('stroke')).toBe('currentColor')
-  // 眼睛矩阵是 2×2：四条圆的**外圈**（`r=3.1`/`r=2.6` 两组）各自至少一个
-  expect(svg.querySelectorAll('circle').length).toBeGreaterThanOrEqual(4)
-  expect(svg.querySelectorAll('path').length).toBeGreaterThanOrEqual(2)
+  // ⚠️ 计数按 D 版（计划 R13，2026-09-22 用户定稿）改写：三个**空环** + 六条线
+  //（中干 / 两条弧线扇骨 / 三条支干），不再是旧版的 2×2 眼睛矩阵。
+  // ⭐ 上面那条是**全称否定**，这里就是它的**存在性对照**：数**精确**值而不是"至少几个"
+  // ——`toBeGreaterThanOrEqual` 挡不住"删掉两条扇骨但还剩 4 条"这种只掉一块的回归。
+  expect(svg.querySelectorAll('circle'), '三个环').toHaveLength(3)
+  expect(svg.querySelectorAll('path'), '中干+两扇骨+三支干').toHaveLength(6)
+  // ⭐ 三个环必须是**空**环（用户定稿的第③条：把球掏空成环）。
+  // ⚠️ 加这条的理由：根元素的 `fill="none"` 是**继承**下来的，而上面那条"纯色"守卫
+  // 只要求 `fill ∈ {none, currentColor}` ⇒ 给某个 circle 加一个 `fill="currentColor"`
+  // 会让它**悄悄变回实心球**（= 用户明确否掉的旧造型），而**全量一条不红**。
+  expect(svg.getAttribute('fill'), '环靠这个继承下来才是空的').toBe('none')
+  for (const c of Array.from(svg.querySelectorAll('circle'))) {
+    const f = c.getAttribute('fill')
+    expect(f === null || f === 'none', `环被填成了实心球：fill=${f}`).toBe(true)
+  }
 })
 
 /**
@@ -85,7 +145,8 @@ test('ARGUS 头部：品牌区**整体取代**「🏮 VIGIL」+ `ARGUS:~$` 提�
   installFetch()
   render(<App />)
   expect(screen.getByRole('img', { name: 'ARGUS 徽记' })).toBeTruthy()
-  expect(screen.getByText('ARGUS')).toBeTruthy()
+  // ⚠️ 字标查 role/label（R14 语义变更，见文件首条用例的注释）
+  expect(screen.getByRole('img', { name: 'ARGUS' })).toBeTruthy()
   expect(screen.getByText('睡亦警觉，眼观六路')).toBeTruthy()
   expect(screen.getByText('ARGUS:~$')).toBeTruthy()
   expect(screen.queryByText('🏮 VIGIL'), 'ARGUS 下旧品牌区必须整体让位').toBeNull()
@@ -117,6 +178,9 @@ test('阴性对照：非 ARGUS 主题下**不许**出现品牌区（它是这套
   installFetch() // 盘上没写主题 ⇒ `readTheme()` 回落 'default'
   render(<App />)
   expect(screen.queryByRole('img', { name: 'ARGUS 徽记' })).toBeNull()
+  // ⚠️ 字标也是品牌区的一件（R14 换成了图形）⇒ 它也必须在别的主题下**整体让位**；
+  // 少了这一条，字标漏到其余五套主题里不会有任何信号。
+  expect(screen.queryByRole('img', { name: 'ARGUS' })).toBeNull()
   expect(screen.queryByText('睡亦警觉，眼观六路')).toBeNull()
   expect(screen.queryByText('ARGUS:~$')).toBeNull()
   expect(screen.getByText('🏮 VIGIL')).toBeTruthy()
