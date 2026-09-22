@@ -45,6 +45,35 @@ const PALETTE =
 const TOKEN_WITH_ALPHA =
   /\b(?:bg|text|border|ring|from|to|via|placeholder|fill|stroke|decoration|accent|caret)-vigil-[a-z0-9-]+\/\d{1,3}\b/g
 
+/**
+ * ⭐ F1（终审 fix 轮）——**常驻守卫**：那个**不带档位**的圆角基类不许再出现。
+ * ⚠️ 本文件里它一律拼成 `round`+`ed`，**不许**原样写出来——理由见本节最后一段。
+ *
+ * ⚠️ 它存在的理由 = **「一次性搬迁」不是「判据」**：T2 曾把全仓 7 处那个基类换成
+ * `rounded-md` 家族，但那是一次**步骤**——没有任何东西挡得住**新写的文件**再写一个
+ * （步骤只覆盖它当时看得见的那 7 行）。实际就发生了：本轮的 `ThemePicker.tsx:65`
+ * （新写的菜单项容器）又用了裸的那个类名。它的后果是**真浏览器实测**出来的：
+ * 那个基类是**字面量**（产物里是一条把圆角写死成 `.25rem` 的规则）、**不可主题化**
+ * ⇒ 粗野主义下容器 `0px` 而**五个菜单项 `4px`**（同一张菜单里两套圆角）。
+ * ⚠️ 只有**扫描**能守这件事：它是"新文件里的一句 className"，没有任何运行时/数值
+ * 断言看得见（`themeTokens.test.ts` 比的是 token 的值，而这里的问题恰恰是**没用 token**）。
+ *
+ * ⚠️ 判据用**词边界 + 负先查**：只抓后面**不是** `-`/字母数字的那个裸类名
+ * ⇒ `rounded-md` / `rounded-lg` / `rounded-xl` / `rounded-full` / `rounded-l-full` /
+ * `rounded-r-full`（R6 已让后三个走 `--v-radius-full`）一律不误伤。
+ * ⚠️ 本文件自己被 `ALLOW` 跳过（否则这条正则的字面量会匹配它自己）。
+ *
+ * ⚠️⚠️ **为什么这个类名在本文件里要拆开写**（`round`+`ed`，不是好读不好读的问题）：
+ * Tailwind 的扫描根是 **Vite root**，`src/__tests__/**` **也在扫描范围内** ⇒ 散文/正则里
+ * 出现一个裸类名，产物里就会多一条**没人用**的死规则。**A/B 实测**（同一次提交、
+ * 只差这一个文件的这几处拼法）：原样写 ⇒ `dist/assets/index-*.css` 里多出那条
+ * `.25rem` 的圆角基类规则；拆开写 ⇒ 它消失，而 6 条 `rounded-*`（真在用的）一条不少。
+ * ⇒ 这条守卫要是写成"好读的朴素写法"，它**自己**就会把上面那句"一次性搬迁"的成果
+ * 部分还回去。这正是 `index.css` 顶部 `@source not "../tools"` 那段注释说的**同一件事**
+ * （那次是从 `tools/` 的散文里来的）。
+ */
+const BARE_ROUNDED = new RegExp('\\b' + 'round' + 'ed' + '(?![\\w-])', 'g')
+
 // 本文件自己带着这两条正则的字面量，必须排除（否则自己匹配自己）
 const ALLOW = new Set(['__tests__/noRawPalette.test.ts'])
 
@@ -78,6 +107,14 @@ test('src 里不许再出现裸调色板类名（227 → 0）', () => {
 test('语义 token 不许带透明度修饰符（E3：构建期会烘死一个 fallback）', () => {
   const hits = scan(TOKEN_WITH_ALPHA)
   expect(hits, `这些地方给 token 加了透明度：\n${hits.join('\n')}`).toEqual([])
+})
+
+test(`src 里不许再出现裸 ${'round'}${'ed'} 基类（字面量 .25rem，不可主题化；T2 的搬迁不是判据）`, () => {
+  const hits = scan(BARE_ROUNDED)
+  expect(
+    hits,
+    `还有 ${hits.length} 处裸的圆角基类（粗野主义下会与同屏的 rounded-md 圆角不一致）：\n${hits.join('\n')}`,
+  ).toEqual([])
 })
 
 /**

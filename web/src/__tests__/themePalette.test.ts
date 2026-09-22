@@ -203,7 +203,13 @@ test('面板压在壁纸的最亮像素上，正文与弱化文字仍读得清�
       const bottom = over(parse(value(id, face)), px)
       return contrast(over(parse(value(id, text)), bottom), bottom)
     }
-    for (const face of ['--v-surface', '--v-surface-2']) {
+    // ⭐ F6（终审 fix 轮）：`--v-inset` **也进来了**——它是凹槽（输入框 / 小标签的底），
+    // 与两个面是**同一件事**（屏幕上都压着同一颗壁纸像素），此前却只被"人记得"：
+    // glass 的 inset 是 R8 那轮**顺手**一起改的（`rgba(10,14,30,.5)` → `rgba(8,10,24,.55)`），
+    // 理由是"判据只点名 --v-surface / --v-surface-2" ⇒ **没人守它**，下次退化就是 0 条红。
+    // ⚠️ 阈值**一个字没动**（正文 4.5 / 弱化 3），进判据的只是"底多算一个 token"。
+    // 实测（合成到各自的最亮像素上）：glass fg 5.49 / fg-3 3.54、vaporwave fg 10.34 / fg-3 4.60。
+    for (const face of ['--v-surface', '--v-surface-2', '--v-inset']) {
       expect(
         ratio('--v-fg', face),
         `${id} 正文 / ${face} 压在壁纸最亮像素 ${brightest} 上`,

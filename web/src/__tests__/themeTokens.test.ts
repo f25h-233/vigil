@@ -18,8 +18,14 @@ const { readFileSync } = (await import(/* @vite-ignore */ NODE_FS)) as {
  *      拼错的 token 名 **Tailwind 不会报错**，它只是不生成那个类 ⇒ 元素没样式、
  *      控制台一片安静。
  *
- * ⚠️ 解析用「选择器 + 花括号体」的粗切（本文件的 CSS 值都**不含嵌套花括号**；
- * 哪天有人写 `@media` 嵌进来，这条解析会先红——那是好事，它逼你换解析器）。
+ * ⚠️ 解析用「选择器 + 花括号体」的粗切（本文件的 CSS 值都**不含嵌套花括号**）。
+ * ⛔ 这一段是**已知限制**，**不是守卫**（F4，终审 fix 轮按实测改写）——原文写的是
+ * 「哪天有人写 `@media` 嵌进来，这条解析会先红——那是好事，它逼你换解析器」，
+ * 而终审的变异 **M7**（把主题块整个包进 `@media`）实测：**0 条红**，build 也干净。
+ * 机理：这条正则**看不见嵌套层级**，内层规则被当成一个**顶层**块 ⇒ 选择器与花括号体
+ * 都还在，`v()` 照样找得到、值照样读得到、断言照样过——**它不会"先红"，它会静默错解析**。
+ * ⇒ 别把这句话当安全网；真需要嵌套时得换解析器（本文件下方 `rulesWithAncestors`
+ * 就是那个"按花括号层级切"的替代品，它连"这条规则在不在某个 `@layer` 里"都问得出来）。
  * ⚠️ **必须先剥注释再解析**：本文件顶部那段说明里就含**示例 CSS**
  * （`{…}` 与 `var(--v-probe-radius)`），不剥的话它会被当成一个选择器块，
  * 而那个 `var(--v-probe-radius)` 会进"被引用但没定义"的名单 ⇒ **假红**。
@@ -101,6 +107,33 @@ describe('token 层', () => {
     expect(referenced.length).toBeGreaterThan(20)
     const missing = [...new Set(referenced)].filter((n) => !defined.has(n))
     expect(missing, `这些 token 被引用但没有定义：${missing.join(', ')}`).toEqual([])
+  })
+
+  /**
+   * ⭐ F2（终审 fix 轮）——**`--radius-full` 的映射一行都删不得**。
+   *
+   * ⚠️ 它存在的理由 = 终审实测：把 `@theme inline` 里的
+   * `--radius-full: var(--v-radius-full);` **删掉** ⇒ **92 条全绿 + build 干净**，
+   * 而**产物**退回 `.rounded-full{border-radius:2147483647px}`（粗野主义下 5 处圆药丸
+   * 的方角修复**静默回滚**）。
+   * ⛔ 为什么别的东西拦不住：上面那条"引用完整性"是**反向**的——它查"被引用的
+   * `--v-*` 有没有定义"，删掉的是**映射**（`@theme` 一侧），不是引用（`var()` 一侧）；
+   * 而 parity / `STRUCTURAL` 表守的都是**五块主题里的值**（`--v-radius-full: 9999px/0px`），
+   * 五块照旧一个不少 ⇒ **只有"@theme 里那行还在不在"这件事没有任何东西在问**。
+   * ⇒ 判据必须落在**映射自身**上，且必须问**值**（`var(--v-radius-full)`）：写成
+   * `includes('--radius-full')` 会被注释 / 别处的 `--v-radius-full` 满足，正是要挡的假绿。
+   */
+  test('@theme inline 必须把 --radius-full 接上（删这行 = 静默回滚 R6，其余全绿）', () => {
+    const theme = ALL.find((b) => b.selector === '@theme inline')
+    expect(theme, "index.css 里找不到 '@theme inline' 块").toBeTruthy()
+    const m = theme!.body.match(/--radius-full\s*:\s*([^;]+)/)
+    expect(
+      m,
+      '@theme inline 里没有 --radius-full 映射：rounded-full 家族会退回 2147483647px 字面量',
+    ).toBeTruthy()
+    expect(m![1].trim(), '--radius-full 必须接 var(--v-radius-full)，否则五块主题的值等于没接上').toBe(
+      'var(--v-radius-full)',
+    )
   })
 
   // ⚠️ F1 的守卫**只守默认块**，而且**不守值**（parity 只比名字、不比值的同族缺口）：
@@ -199,8 +232,13 @@ describe('表单控件规则的分层（F4 守卫）', () => {
  * **字面期望值**逐字锁死（G8）。值一律照 `index.css` 那四块**抄死**，不写成
  * "读 CSS 再比 CSS"（空守卫的经典形状）——改主题就必须**同时**改这张表，那正是"锁"的
  * 代价，也是它的目的。
- * ⚠️ 这张表锁的是**结构** token；变异 (e) 的第三条腿（`--v-surface-2` 是**颜色**，
- * 退回默认值仍全绿，我复跑过）**不在这里**的覆盖面内，缺口记在 task-3-fix-report.md §6.4。
+ * ⚠️ 这张表锁的**本来只有**结构 token；变异 (e) 的第三条腿（`--v-surface-2` 是**颜色**，
+ * 退回默认值仍全绿，我复跑过）当时**不在**覆盖面内，缺口记在 task-3-fix-report.md §6.4。
+ * ⭐ F5（终审 fix 轮）：那条缺口**已按 reviewer 的裁决补上**——`--v-surface-2` 现在也在
+ * 下面这张表里（每套末尾那一行）。理由不是"它属于结构"，而是**它的值此前没有任何东西在问**：
+ * `themePalette.test.ts` 那条"面不等于默认"的用例只点名 `--v-surface` / `--v-bg`，
+ * 而两条对比度判据**只是拿它当底算数**——值退化了它们会算出一个**不同的数**，照样可能全绿
+ * （终审实测：四套一起退回默认值 = 全量 76/76 全绿）。⛔ 别把这条再挪出表外。
  *
  * ⭐ M7-P4 换成三行：`--v-wallpaper` / `--v-wallpaper-size` / `--v-wallpaper-pos`
  * （**固定壁纸层**的图 / 尺寸 / 定位）。为什么它们**也是结构值**：`-size` / `-pos` 决定
@@ -230,6 +268,7 @@ const STRUCTURAL: Record<string, Record<string, string>> = {
     '--v-wallpaper': 'none', // P4：M3 的底是纯色 + tonal surface，没有壁纸资产
     '--v-wallpaper-size': 'auto',
     '--v-wallpaper-pos': 'center top',
+    '--v-surface-2': '#e8def8', // F5：M3 secondary-container（选中态的底，= 它的 --v-accent-soft）
   },
   brutalism: {
     '--v-radius-md': '0px', // 方角是粗野主义的判据
@@ -244,6 +283,7 @@ const STRUCTURAL: Record<string, Record<string, string>> = {
     '--v-wallpaper': 'none', // P4：网格纸是**纹理**（该跟着内容滚）⇒ 留在 --v-page-image
     '--v-wallpaper-size': 'auto',
     '--v-wallpaper-pos': 'center top',
+    '--v-surface-2': '#ffe600', // F5：选中态**纯黄**（这套主题唯一的高亮色，退回默认=选中没了）
   },
   vaporwave: {
     '--v-radius-md': '0.5rem',
@@ -262,6 +302,7 @@ const STRUCTURAL: Record<string, Record<string, string>> = {
     //（层数在文件末尾与 `--v-wallpaper` 的形状断言并排钉住）。
     '--v-wallpaper-size': '100% 62%, 100% 62%',
     '--v-wallpaper-pos': 'center top, center top',
+    '--v-surface-2': 'rgba(64, 16, 82, 0.84)', // F5：R7 的暗玻璃**选中态**（alpha 是照判据定的）
   },
   glass: {
     '--v-radius-md': '0.5rem',
@@ -277,6 +318,7 @@ const STRUCTURAL: Record<string, Record<string, string>> = {
     // 值不写进表（两行长 radial，理由同文件末尾那段），只锁尺寸/定位 + 末尾的层数。
     '--v-wallpaper-size': '100% 100%, 100% 100%',
     '--v-wallpaper-pos': '0 0, 0 0',
+    '--v-surface-2': 'rgba(34, 42, 80, 0.68)', // F5：R8 的暗玻璃**选中态**（压在 #22ff88 上定的）
   },
 }
 

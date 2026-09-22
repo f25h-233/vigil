@@ -62,7 +62,7 @@ export default function ThemePicker({
                   setOpen(false)
                 }}
                 className={
-                  'w-full rounded px-2 py-1.5 text-left ' +
+                  'w-full rounded-md px-2 py-1.5 text-left ' +
                   (t.id === value
                     ? 'bg-vigil-accent-soft text-vigil-accent-text'
                     : 'text-vigil-fg-2 active:bg-vigil-surface')
