@@ -34,12 +34,11 @@ afterEach(() => {
   // 本文件新增了走 `applyTheme` 的用例（F8），它会挂 `data-theme`
   // ⇒ 用完摘掉，别把状态漏给同文件的下一条（`theme.test.ts` 同款清理）。
   document.documentElement.removeAttribute('data-theme')
-  // ⚠️ R10 的用例会让**防闪脚本**往 `:root` 上贴 `--v-*`，而它的白名单是**形状**白名单
-  // （键名不是固定那 12 个）⇒ 落在 `deriveArgusVars` 之外的键不在 `clearArgusColor`
-  // 的清理范围内，这里手工收尾。
-  for (const k of ['--v-bg', '--v-old-token', '--v-page-image', '--v-x', '--v-y']) {
-    document.documentElement.style.removeProperty(k)
-  }
+  // ⚠️ R10 的用例会让**防闪脚本**往 `:root` 上贴 `--v-*`。这里原来要手工收尾几个
+  // "形状合法但不在派生表里"的键（`--v-bg` / `--v-old-token` / …）——⭐ F-A4 把白名单
+  // 收紧成「**12 个键名** + 形状」之后，那种键**不可能**被贴上（R10⑥⑧ 各钉一半、R10⑨
+  // 机械钉住两份名单相同）⇒ 会留下的只有 `deriveArgusVars` 那 12 个，
+  // `clearArgusColor()` 已全覆盖，这里不再需要手工收尾。
 })
 
 test('具名色与十六进制都能解析（含缩写 #rgb）', () => {
@@ -318,6 +317,15 @@ test('⭐⭐ R12-c：权重互换的见证色必须是**纯红**（灰阶见证�
 const HTML = readFileSync(new URL('../../index.html', HERE), 'utf8')
 
 /**
+ * ⭐⭐ F-A1 / F-A5：**剥掉注释**之后的 `index.html`——R10④ 的静态锚点一律在这里取。
+ *
+ * ⚠️ 为什么必须剥：`index.html` 的注释里就写着 `=== 'argus'` 与 style 元素的字面量
+ * ⇒ 用**原文**取 `indexOf` 会命中注释（实测：`=== 'argus'` 在 idx **1425** 是注释、
+ * **1608** 才是真分支）⇒ 锚点变成**空守卫**、`grep` 也会得到假阳性（本仓"分母要对"的老账）。
+ */
+const CODE = HTML.replace(/<!--[\s\S]*?-->/g, '').replace(/\/\*[\s\S]*?\*\//g, '')
+
+/**
  * 取 `index.html` 里那段**内联**防闪脚本并**真跑一遍**。
  *
  * ⚠️ 这是本文件里唯一能直接验防闪脚本的办法（jsdom 不会去加载 `index.html`）。
@@ -362,27 +370,95 @@ test('⛔ R10③：防闪脚本里**没有**第二份颜色数学（复制 = 两
   }
 })
 
-test('⭐ R10④ **静态钉子**：白名单的三条正则字面量与键名都在 index.html 里（防闪脚本无法被单测执行）', () => {
-  // ⚠️ 这条钉的是"**白名单没被删 / 键名没漂 / 它嵌在 argus 分支里**"——**不是**"白名单生效"。
-  // 生效由下面 ⑤⑥⑦ 三条**真跑那段脚本**的用例证明（读 index.html 原文 + `new Function`）。
-  // ⚠️ 正则一律按**实际写在 index.html 里的字面量**钉（写法改了，这里跟着改）。
-  expect(HTML).toContain('vigil.argus.vars')
-  expect(HTML).toContain('/^--v-[a-z0-9-]+$/')
-  expect(HTML).toContain('/^#[0-9a-f]{6}$/')
-  expect(HTML).toContain('/^rgba?\\([0-9., %]+\\)$/')
+/**
+ * ⭐ R10④ **静态钉子**：白名单的三条正则字面量 + **12 键名单**都在 `index.html` 里、
+ * 且它嵌在 argus 分支**内**（防闪脚本无法被单测执行 ⇒ 只能静态钉）。
+ *
+ * ⚠️ 这条钉的是"**白名单没被删 / 键名没漂 / 它在分支里**"——**不是**"白名单生效"。
+ * 生效由下面 ⑤⑥⑦ 三条**真跑那段脚本**的用例证明（读 index.html 原文 + `new Function`）。
+ * ⚠️ 正则一律按**实际写在 index.html 里的字面量**钉（写法改了，这里跟着改）。
+ *
+ * ⭐⭐ F-A1（T8-2 复审的 Important：一条**空守卫**）：锚点**必须**在**剥掉注释**的文本
+ * （`CODE`）上取。实测（2026-09-22 复审）：用原文的 `HTML.indexOf("=== 'argus'")` 命中的是
+ * **注释**里那处（idx **1425**：`<!-- … 整段嵌在 `=== 'argus'` 分支内 … -->`），
+ * **真分支**在 idx **1608** ⇒ 把 `if (t === 'argus')` 改成 `if (true)` 时这条断言**照样绿**
+ * （唯一红的是 R10⑦）＝它根本没验它声称的那件事。
+ * ⇒ 修法：锚点改在 `CODE` 上取，并**正面钉住**"`=== 'argus'` 在 `CODE` 里恰好出现一次"
+ * ——将来有人再往注释外的地方写一处，这条会红。
+ * ⚠️ 剥注释同时是 **F-A5** 的出路：注释里的 `<style>` / `=== 'argus'` 这类**字面量**
+ * 会把 `grep`、也会把自己写的锚点一起带偏。
+ * ⚠️ 并且："**在分支内**"要按它字面的意思判——字面量必须落在 `if (t === 'argus') { … }`
+ * **那一对**大括号之间。只判"在锚点之后"是不够的：把整段挪到分支**外**（但仍在锚点之后）
+ * 照样过，那又成了"断言比它声称的弱"（同一条 F-A1 的形态）。
+ */
+test('⭐ R10④ **静态钉子**：白名单的三条正则 + 12 键名单都在 index.html 里，且嵌在 argus 分支内', () => {
+  expect(CODE).toContain('vigil.argus.vars')
+  expect(CODE).toContain('/^--v-[a-z0-9-]+$/')
+  expect(CODE).toContain('/^#[0-9a-f]{6}$/')
+  expect(CODE).toContain('/^rgba?\\([0-9., %]+\\)$/')
   // 必须在 `ALLOWED` 判定为 argus 的**分支内**（不是"任何主题都贴一份行内样式"）
-  const branch = HTML.indexOf("=== 'argus'")
-  expect(branch, "防闪脚本里没有 `=== 'argus'` 分支").toBeGreaterThan(-1)
+  const hits = [...CODE.matchAll(/=== 'argus'/g)].map((m) => m.index!)
+  expect(
+    hits,
+    `剥注释后 \`=== 'argus'\` 该**恰好一次**（实际 ${hits.length} 处：${hits.join(', ')}）——多出来的是新的注释陷阱或第二处判定`,
+  ).toHaveLength(1)
+  const branch = CODE.indexOf("if (t === 'argus')")
+  expect(branch, "防闪脚本里没有 `if (t === 'argus')` 分支").toBeGreaterThan(-1)
+  // "在分支内"的**机械含义**：落在那一对**大括号**之间（不是"在锚点之后"就算——
+  // 见文件头 F-A1 的注：把整段挪到分支外但留在锚点之后，那种弱判据照样绿）。
+  // ⚠️ 大括号用**裸计数**：若将来看这段脚本里有"含大括号的字符串/模板"，这里会失准
+  //（本段目前没有：`/^#[0-9a-f]{6}$/` 里的 `{6}` 是配对的、字符串里没有大括号）。
+  const open = CODE.indexOf('{', branch)
+  let depth = 0
+  let close = -1
+  for (let i = open; i < CODE.length; i += 1) {
+    const ch = CODE[i]
+    if (ch === '{') depth += 1
+    if (ch === '}') {
+      depth -= 1
+      if (depth === 0) {
+        close = i
+        break
+      }
+    }
+  }
+  expect(close, 'argus 分支的闭合大括号没找到（脚本写法变了？）').toBeGreaterThan(branch)
   for (const s of [
     'vigil.argus.vars',
     '/^--v-[a-z0-9-]+$/',
     '/^#[0-9a-f]{6}$/',
     '/^rgba?\\([0-9., %]+\\)$/',
   ]) {
-    expect(HTML.indexOf(s), `${s} 出现在 argus 分支之前 ⇒ 不在分支内`).toBeGreaterThan(branch)
+    const at = CODE.indexOf(s)
+    expect(at, `${s} 出现在 argus 分支之前 ⇒ 不在分支内`).toBeGreaterThan(branch)
+    expect(at, `${s} 越过了 argus 分支的闭合大括号 ⇒ 不在分支内`).toBeLessThan(close)
   }
   // 与"设 `data-theme`"那个 try **分开**（blob 读炸了不该把主题也带下水 ⇒ 两个 try）
-  expect((HTML.match(/try \{/g) ?? []).length).toBeGreaterThanOrEqual(2)
+  expect((CODE.match(/try \{/g) ?? []).length).toBeGreaterThanOrEqual(2)
+})
+
+/**
+ * ⭐⭐ R10⑨（F-A4，T8-2 复审的 Important）：防闪脚本里那份**键名名单** ≡ `deriveArgusVars` 的 12 个键。
+ *
+ * **语义**：脚本里那份名单是**手写副本**（第一份真相在 `src/argusColor.ts` 的 `deriveArgusVars`）
+ * ⇒ 必须与 JS 侧**机械对上**。与 `theme.test.ts` 那条"`ALLOWED` 不许与 `THEMES` 漂移"同款，
+ * 理由也一样：两份必然漂移，所以钉一条机械比对——它红的时候改哪一份都对，但不能只有一份对。
+ *
+ * ⚠️ 必须是**集合相同**（不是"包含"）：
+ *   - **多一个** ⇒ 那个**陌生键名**会被贴成行内、而 `clearArgusColor()` 清不掉它
+ *     ⇒ §0.1 那个"行内顶掉别的主题"换个入口重演（**F-A4 的洞本身**）；
+ *   - **少一个** ⇒ 该键的用户色**首帧**贴不上（防闪失效半格），而写侧仍在写它、清它
+ *     ⇒ 又一处"写侧认、读侧不认"的错位。
+ */
+test('⭐⭐ R10⑨（F-A4）：防闪脚本的 12 键名单 ≡ `Object.keys(deriveArgusVars(ARGUS_DEFAULT))`', () => {
+  const m = CODE.match(/var KNOWN = \[([\s\S]*?)\]/)
+  expect(m, 'index.html 的防闪脚本里找不到 `var KNOWN = [...]` 键名名单').toBeTruthy()
+  const names = [...m![1].matchAll(/'([^']+)'/g)].map((x) => x[1])
+  expect(names, '名单里读不出 12 个键名（写法变了？这条判据跟着改）').toHaveLength(12)
+  expect(new Set(names).size, '名单里有重复的键名').toBe(names.length)
+  expect([...names].sort(), '脚本里那份键名名单与 JS 侧的派生表漂了').toEqual(
+    Object.keys(deriveArgusVars(ARGUS_DEFAULT)).sort(),
+  )
 })
 
 test('⭐ R10⑤：盘上有 vars + 主题是 argus ⇒ **首帧**就是用户色（不是默认绿）', () => {
@@ -444,34 +520,31 @@ test('R10⑧：陈旧的 blob（少键 / 结构变了）不硬套：缺的键保
       '--v-fg': full['--v-fg'],
       '--v-fg-2': full['--v-fg-2'],
       '--v-fg-3': full['--v-fg-3'],
-      '--v-old-token': full['--v-fg'], // 旧版本留下的键名（形状合法 ⇒ 会贴上）
+      '--v-old-token': full['--v-fg'], // 旧版本留下的键名（形状合法，但不在 12 键名单里 ⇒ 现在**不贴**，见下）
     }),
   )
   runPreflash()
   const st = document.documentElement.style
   expect(st.getPropertyValue('--v-fg')).toBe(ARGUS_DEFAULT)
   expect(st.getPropertyValue('--v-border'), '旧 blob 里没有的键：保持 CSS 默认（不许瞎猜）').toBe('')
-  // ⚠️ 已知、**已被用户裁定接受**、但**绝不许再说成"没有影响"**的一条：
-  // 白名单是**形状**白名单（不是 12 个键名的清单）⇒ 形状合法的**陌生键名**会被贴上。
+  // ⭐⭐ F-A4（T8-2 复审的 Important ⇒ 这是一条**行为变更**，不是放宽）：
+  // `--v-old-token` 是"**形状合法但不在 12 键名单里**"的陌生键名 ⇒ 现在**不贴**了。
+  // ⚠️ 下面这条断言原来写的是 `toBe(ARGUS_DEFAULT)`（贴上了）——那时白名单**只看形状**。
   //
-  // ⛔ 这里原来写的是「**它改不动任何真实 token（没有消费者）**」——**那句话是错的**
-  // （T8-2 收尾自报的 Concern，本行照实改）。真相是：
-  //   ① **值**的形状确实被限死（`/^#[0-9a-f]{6}$/` 或 `/^rgba?\([0-9., %]+\)$/`）
-  //      ⇒ "往行内样式里注入任意 CSS"那个面是**关着的**（`url(...)` / `;` 夹带都过不去）；
-  //   ② 但**键名可以指向任何真实 token**：`index.css` 里光是 `var(--v-*)` 就有
-  //      **43 个不同的键名**（含 `--v-bg` / `--v-danger` / `--v-page-image` / `--v-wallpaper`；
-  //      复核：`grep -o "var(--v-[a-z0-9-]*" index.css | sort -u | wc -l` ⇒ 43，
-  //      总出现处 55）——而 `--v-bg` 落在 `body { background-color: var(--v-bg) }` 上
-  //      ⇒ 一份被**手改过**的 blob（`{"--v-bg":"#ff0000"}`）**能把整页底色换掉**，
-  //      `--v-danger` / `--v-fg` 之类同理。
-  //   ③ **影响面 = 外观**（没有任何逻辑/数据能被它改到），且**前提**是攻击者**已经能写
-  //      用户自己的 `localStorage`**——本机、单用户、`vigil.argus.vars` 不出这台机器
-  //      ⇒ 用户裁定：**接受**这个面，不改白名单（改成 12 个键名的清单会让"陈旧 blob"与
-  //      "未知 token"两类一起被拒，代价大于收益）。
-  // ⇒ 结论按 ① 的**形状**说，不按"没有消费者"说。下面那句自愈仍然是**真**的：
-  // `main.tsx` 的 `applyTheme(readTheme())` 在 App 启动时就调 `applyArgusColor`
-  // **重写整份 blob** ⇒ 陈旧窗口只有"首帧到模块执行"这一段，这一句就是那个自愈的证据。
-  expect(st.getPropertyValue('--v-old-token')).toBe(ARGUS_DEFAULT)
+  // 为什么必须改：形状白名单放行陌生键名，而 `clearArgusColor()` 只清 `deriveArgusVars()`
+  // 那 12 个 ⇒ 那种键**首帧被贴上、切到别的主题时清不掉**（行内赢过任何选择器）
+  // ＝ §0.1 那个"行内顶掉别的主题"的缺陷**换个入口**重演（复审实测：
+  // `{"--v-bg":"#ff0000"}` 能把整页底色换掉——`--v-bg` 落在 `body{background-color:
+  // var(--v-bg)}` 上）。⇒ 读侧收紧成「**12 个键名** + 形状」，与写侧 `clearArgusColor`
+  // 的 12 个键**对齐**；R10⑨ 机械钉住"两份名单相同"。
+  //
+  // ⚠️ 一条**仍然成立**的相邻事实（别删，它是上面那句的边界）：**值**域始终被字符集限死
+  //（`/^#[0-9a-f]{6}$/` 或 `/^rgba?\([0-9., %]+\)$/`）⇒ "往行内样式里注入任意 CSS"
+  // 那个面是**关着的**（`url(...)` / `;` 夹带都过不去，R10⑥ 钉着）——F-A4 修的是**键名**
+  // 那一半，不是这一半。
+  // ⚠️ 下面那句自愈仍然是**真**的：`main.tsx` 的 `applyTheme(readTheme())` 在 App 启动时
+  // 就调 `applyArgusColor` **重写整份 blob** ⇒ 陈旧窗口只有"首帧到模块执行"这一段。
+  expect(st.getPropertyValue('--v-old-token'), '陌生键名（不在 12 键名单里）不许再被贴上').toBe('')
   applyArgusColor(readArgusColor())
   expect(JSON.parse(localStorage.getItem(ARGUS_VARS_KEY)!)).toEqual(full)
 })

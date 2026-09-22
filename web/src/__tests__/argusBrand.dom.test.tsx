@@ -88,10 +88,19 @@ test('⛔ 字标必须是**蒙版 + bg-current**（颜色随主题色走），�
   expect(mark, '找不到字标元素（role="img" + aria-label="ARGUS"）').toBeTruthy()
   const cls = mark!.className
 
-  // ① 存在性：颜色来源必须是 `bg-current`（或等价地用文字色 `text-current`）
+  // ① 存在性：颜色来源必须是 **`bg-current`**，⛔ **不认 `text-current`**（F-B1）。
+  //    ⭐⭐ 实测（T8-2 复审，2026-09-22）：把 `bg-current` 换成 `text-current`
+  //    ⇒ **19 files / 141 tests 全绿**，而真浏览器里字标会**整块消失**：
+  //    `text-current` 只设 `color`，而蒙版读的是 `background-color`
+  //    （这个 div 里没有文字节点，`color` 等于没设）⇒ 备选那条**放行了一个看不见的实现**。
+  //    ⚠️ "无效"只是描述，"**无效但全绿**"才是危害——它让这条**唯一**守着"字标看得见"的
+  //    判据变成一条假绿通道。所以备选删掉，只留 `bg-current`。
+  //    ⚠️ 误伤面≈0：本判据只查 `[role="img"][aria-label="ARGUS"]` 这**一个**元素；
+  //    ③ 已强制该元素必须是蒙版 ⇒ 将来若有人改成内联 `background-color: currentColor`，
+  //    那是**有意的实现变更**，本就该回来改判据。
   expect(
-    /\b(?:bg|text)-current\b/.test(cls),
-    `字标没有 bg-current/text-current ⇒ 蒙版没有颜色来源，字标会整块消失：${cls}`,
+    /\bbg-current\b/.test(cls),
+    `字标没有 bg-current ⇒ 蒙版没有颜色来源，字标会整块消失（text-current 只设 color，不算）：${cls}`,
   ).toBe(true)
 
   // ② 全称否定（与上一条的"纯色"守卫同款）：**除了 `*-current`，不许有任何别的颜色类**。

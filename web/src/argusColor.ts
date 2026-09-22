@@ -141,7 +141,12 @@ export function applyArgusColor(input: string): ArgusColorResult {
     localStorage.setItem(ARGUS_COLOR_KEY, parsed.value)
     // ⭐ R10：盘上再存一份**派生结果的 JSON**——`index.html` 的防闪脚本靠它把用户色
     // 赶在首帧之前贴上去（它能读盘，但加载不了任何模块、也不许自己算）。
-    // ⚠️ 同一句 try：两份都是"下次还记得"，存不下就两份都不动（不留"基色新、变量旧"的错位）。
+    // ⚠️ 同一句 try 保证的是**失败不外溢**（存不下不该让这次切换失败），
+    // ⛔ 而**不是**"两份都不动"——`setItem` 之间**没有原子性**：第一条成功、第二条因
+    // 配额/被策略挡而抛，落盘的正是"**基色新、变量旧**"的错位（T8-2 复审 F-A3：原注释
+    // 把 try 当成了事务，那是错的论证）。后果仅一帧旧色：`main.tsx` 启动时
+    // `applyTheme(readTheme())` 会**整份重写**变量、把错位自愈。
+    // ⇒ 要真正消除错位得把两条合成**一个** key（`{base, vars}`，代价是读侧解析变复杂）。
     localStorage.setItem(ARGUS_VARS_KEY, argusVarsJson(parsed.value))
   } catch {
     // 存不下只影响"下次还记得"（含防闪），不该让这次切换失败
