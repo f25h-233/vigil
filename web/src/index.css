@@ -168,151 +168,164 @@ body {
   }
 }
 
-/* ── ④ 另外四套主题：**颜色与默认逐字相同**（机制先跑通）。
-      ⚠️ 但**字体栈已经不同**：T1 的 fix 之后默认块是 `'Segoe UI'` 打头，这四套
-      仍是 `system-ui` 打头 ⇒ 「逐字等于默认」这句已作废，照实改。
-      T3 把它们换成各自的值——注意 T3 换的是**整块 33 个 token**，
-      不是"只改颜色那几行"。 ── */
+/* ── ④ 另外四套主题：T3 定稿的完整值（四块都是 **33 个 token 一个不少**）。
+      ⚠️ 每套都**显式给全**、不靠继承（G3）：CSS 里「没写」与「想继承」长得一样，
+      而继承的后果是「浅色主题里冒出默认主题的深色」——`themeTokens.test.ts`
+      的 parity 测试逐名比对就是为了挡这一条。
+      ⚠️ 四块都**不是**「只换颜色」：圆角 / 阴影 / 模糊 / 字体 / 字距 / 页面底图
+      （`--v-page-image`）也在各自的值里，这才是「五套主题」而不只是五个色板。
+      ⚠️ 这里的字体栈是各主题的**设计值**；只有默认块受 E10 约束（`'Segoe UI'`
+      必须字面第一，保基线），四套主题都有各自的字体判据（如粗野主义用等宽）。 ── */
 [data-theme='material'] {
-  --v-bg: #0b0f14;
-  --v-header: rgba(11, 15, 20, 0.9);
+  /* Material 3 浅色：tonal surface + elevation + 紫系 primary */
+  --v-bg: #fdfbff;
+  --v-header: rgba(253, 251, 255, 0.88);
   --v-page-image: none;
-  --v-fg: #e6edf3;
-  --v-fg-2: rgba(255, 255, 255, 0.72);
-  --v-fg-3: rgba(255, 255, 255, 0.55);
-  --v-fg-4: rgba(255, 255, 255, 0.4);
-  --v-surface: rgba(255, 255, 255, 0.05);
-  --v-surface-2: rgba(255, 255, 255, 0.1);
-  --v-surface-solid: #141a22;
-  --v-inset: rgba(0, 0, 0, 0.3);
-  --v-border: rgba(255, 255, 255, 0.1);
-  --v-border-soft: rgba(255, 255, 255, 0.05);
-  --v-accent: #38bdf8;
-  --v-accent-soft: rgba(56, 189, 248, 0.2);
-  --v-accent-text: #bae6fd;
-  --v-danger: #f87171;
-  --v-danger-soft: rgba(239, 68, 68, 0.1);
-  --v-danger-btn: rgba(239, 68, 68, 0.15);
-  --v-danger-btn-active: rgba(239, 68, 68, 0.25);
-  --v-danger-text: #fecaca;
-  --v-warn: #fbbf24;
-  --v-warn-soft: rgba(245, 158, 11, 0.1);
-  --v-warn-btn: rgba(245, 158, 11, 0.2);
-  --v-warn-text: #fde68a;
-  --v-radius-md: 0.375rem;
-  --v-radius-lg: 0.5rem;
+  --v-fg: #1c1b1f;
+  --v-fg-2: #49454f;
+  --v-fg-3: #5f5c66;
+  --v-fg-4: #79747e;
+  --v-surface: #f7f2fa;
+  --v-surface-2: #e8def8;
+  --v-surface-solid: #ffffff;
+  --v-inset: #ece6f0;
+  --v-border: #cac4d0;
+  --v-border-soft: #e7e0ec;
+  --v-accent: #6750a4;
+  --v-accent-soft: #eaddff;
+  --v-accent-text: #4f378b;
+  --v-danger: #b3261e;
+  --v-danger-soft: #f9dedc;
+  --v-danger-btn: #f9dedc;
+  --v-danger-btn-active: #f2b8b5;
+  --v-danger-text: #8c1d18;
+  --v-warn: #8b5000;
+  --v-warn-soft: #ffdeaa;
+  --v-warn-btn: #ffdeaa;
+  --v-warn-text: #5c3c00;
+  --v-radius-md: 0.5rem;
+  --v-radius-lg: 0.75rem;
   --v-radius-xl: 0.75rem;
-  --v-shadow-card: none;
-  --v-header-blur: 8px;
+  --v-shadow-card: 0 1px 2px rgba(0, 0, 0, 0.3), 0 1px 3px 1px rgba(0, 0, 0, 0.15);
+  --v-header-blur: 0px;
   --v-panel-blur: 0px;
-  --v-font-sans: system-ui, -apple-system, 'Segoe UI', 'Microsoft YaHei', sans-serif;
+  --v-font-sans: 'Roboto', system-ui, 'Segoe UI', 'Microsoft YaHei', sans-serif;
   --v-tracking: normal;
 }
 
 [data-theme='brutalism'] {
-  --v-bg: #0b0f14;
-  --v-header: rgba(11, 15, 20, 0.9);
-  --v-page-image: none;
-  --v-fg: #e6edf3;
-  --v-fg-2: rgba(255, 255, 255, 0.72);
-  --v-fg-3: rgba(255, 255, 255, 0.55);
-  --v-fg-4: rgba(255, 255, 255, 0.4);
-  --v-surface: rgba(255, 255, 255, 0.05);
-  --v-surface-2: rgba(255, 255, 255, 0.1);
-  --v-surface-solid: #141a22;
-  --v-inset: rgba(0, 0, 0, 0.3);
-  --v-border: rgba(255, 255, 255, 0.1);
-  --v-border-soft: rgba(255, 255, 255, 0.05);
-  --v-accent: #38bdf8;
-  --v-accent-soft: rgba(56, 189, 248, 0.2);
-  --v-accent-text: #bae6fd;
-  --v-danger: #f87171;
-  --v-danger-soft: rgba(239, 68, 68, 0.1);
-  --v-danger-btn: rgba(239, 68, 68, 0.15);
-  --v-danger-btn-active: rgba(239, 68, 68, 0.25);
-  --v-danger-text: #fecaca;
-  --v-warn: #fbbf24;
-  --v-warn-soft: rgba(245, 158, 11, 0.1);
-  --v-warn-btn: rgba(245, 158, 11, 0.2);
-  --v-warn-text: #fde68a;
-  --v-radius-md: 0.375rem;
-  --v-radius-lg: 0.5rem;
-  --v-radius-xl: 0.75rem;
-  --v-shadow-card: none;
-  --v-header-blur: 8px;
+  /* 高对比 + 硬阴影 + 方角 + 等宽：选中态纯黄，按钮纯黑底白字 */
+  --v-bg: #f2f0eb;
+  --v-header: rgba(242, 240, 235, 0.96);
+  --v-page-image: repeating-linear-gradient(0deg, rgba(0, 0, 0, 0.05) 0 1px, transparent 1px 24px),
+    repeating-linear-gradient(90deg, rgba(0, 0, 0, 0.05) 0 1px, transparent 1px 24px);
+  --v-fg: #0a0a0a;
+  --v-fg-2: #262626;
+  --v-fg-3: #404040;
+  --v-fg-4: #5c5c5c;
+  --v-surface: #ffffff;
+  --v-surface-2: #ffe600;
+  --v-surface-solid: #ffffff;
+  --v-inset: #ffffff;
+  --v-border: #0a0a0a;
+  --v-border-soft: #9a9a9a;
+  --v-accent: #0a0a0a;
+  --v-accent-soft: #0a0a0a;
+  --v-accent-text: #ffffff;
+  --v-danger: #d40000;
+  --v-danger-soft: #ffd9d9;
+  --v-danger-btn: #d40000;
+  --v-danger-btn-active: #8f0000;
+  --v-danger-text: #ffffff;
+  --v-warn: #7a5c00;
+  --v-warn-soft: #ffe600;
+  --v-warn-btn: #ffe600;
+  --v-warn-text: #4a3800;
+  --v-radius-md: 0px;
+  --v-radius-lg: 0px;
+  --v-radius-xl: 0px;
+  --v-shadow-card: 4px 4px 0 0 #0a0a0a;
+  --v-header-blur: 0px;
   --v-panel-blur: 0px;
-  --v-font-sans: system-ui, -apple-system, 'Segoe UI', 'Microsoft YaHei', sans-serif;
-  --v-tracking: normal;
+  --v-font-sans: ui-monospace, 'Cascadia Mono', Consolas, 'Microsoft YaHei', monospace;
+  --v-tracking: 0.02em;
 }
 
 [data-theme='vaporwave'] {
-  --v-bg: #0b0f14;
-  --v-header: rgba(11, 15, 20, 0.9);
-  --v-page-image: none;
-  --v-fg: #e6edf3;
-  --v-fg-2: rgba(255, 255, 255, 0.72);
-  --v-fg-3: rgba(255, 255, 255, 0.55);
-  --v-fg-4: rgba(255, 255, 255, 0.4);
-  --v-surface: rgba(255, 255, 255, 0.05);
-  --v-surface-2: rgba(255, 255, 255, 0.1);
-  --v-surface-solid: #141a22;
-  --v-inset: rgba(0, 0, 0, 0.3);
-  --v-border: rgba(255, 255, 255, 0.1);
-  --v-border-soft: rgba(255, 255, 255, 0.05);
-  --v-accent: #38bdf8;
-  --v-accent-soft: rgba(56, 189, 248, 0.2);
-  --v-accent-text: #bae6fd;
-  --v-danger: #f87171;
-  --v-danger-soft: rgba(239, 68, 68, 0.1);
-  --v-danger-btn: rgba(239, 68, 68, 0.15);
-  --v-danger-btn-active: rgba(239, 68, 68, 0.25);
-  --v-danger-text: #fecaca;
-  --v-warn: #fbbf24;
-  --v-warn-soft: rgba(245, 158, 11, 0.1);
-  --v-warn-btn: rgba(245, 158, 11, 0.2);
-  --v-warn-text: #fde68a;
-  --v-radius-md: 0.375rem;
-  --v-radius-lg: 0.5rem;
-  --v-radius-xl: 0.75rem;
-  --v-shadow-card: none;
-  --v-header-blur: 8px;
-  --v-panel-blur: 0px;
+  /* 深紫底 + 粉/青霓虹：软底低透明度，靠 --v-shadow-card 的辉光收边 */
+  --v-bg: #1a0b2e;
+  --v-header: rgba(26, 11, 46, 0.88);
+  --v-page-image: radial-gradient(120% 70% at 50% 110%, rgba(0, 229, 255, 0.25), transparent 60%),
+    linear-gradient(180deg, rgba(255, 52, 182, 0.22), transparent 45%),
+    repeating-linear-gradient(0deg, rgba(0, 229, 255, 0.06) 0 1px, transparent 1px 26px);
+  --v-fg: #f6e9ff;
+  --v-fg-2: #dcc4ff;
+  --v-fg-3: #b78fe0;
+  --v-fg-4: #8f6cb5;
+  --v-surface: rgba(255, 255, 255, 0.06);
+  --v-surface-2: rgba(255, 52, 182, 0.22);
+  --v-surface-solid: #241040;
+  --v-inset: rgba(0, 0, 0, 0.35);
+  --v-border: rgba(0, 229, 255, 0.45);
+  --v-border-soft: rgba(0, 229, 255, 0.22);
+  --v-accent: #00e5ff;
+  --v-accent-soft: rgba(0, 229, 255, 0.18);
+  --v-accent-text: #b3f7ff;
+  --v-danger: #ff5c8a;
+  --v-danger-soft: rgba(255, 92, 138, 0.16);
+  --v-danger-btn: rgba(255, 92, 138, 0.22);
+  --v-danger-btn-active: rgba(255, 92, 138, 0.34);
+  --v-danger-text: #ffd0dd;
+  --v-warn: #ffd166;
+  --v-warn-soft: rgba(255, 209, 102, 0.16);
+  --v-warn-btn: rgba(255, 209, 102, 0.24);
+  --v-warn-text: #fff0c2;
+  --v-radius-md: 0.5rem;
+  --v-radius-lg: 0.75rem;
+  --v-radius-xl: 1rem;
+  --v-shadow-card: 0 0 0 1px rgba(0, 229, 255, 0.28), 0 0 20px rgba(255, 52, 182, 0.35);
+  --v-header-blur: 12px;
+  --v-panel-blur: 6px;
   --v-font-sans: system-ui, -apple-system, 'Segoe UI', 'Microsoft YaHei', sans-serif;
-  --v-tracking: normal;
+  --v-tracking: 0.02em;
 }
 
 [data-theme='glass'] {
-  --v-bg: #0b0f14;
-  --v-header: rgba(11, 15, 20, 0.9);
-  --v-page-image: none;
-  --v-fg: #e6edf3;
-  --v-fg-2: rgba(255, 255, 255, 0.72);
-  --v-fg-3: rgba(255, 255, 255, 0.55);
-  --v-fg-4: rgba(255, 255, 255, 0.4);
-  --v-surface: rgba(255, 255, 255, 0.05);
-  --v-surface-2: rgba(255, 255, 255, 0.1);
-  --v-surface-solid: #141a22;
-  --v-inset: rgba(0, 0, 0, 0.3);
-  --v-border: rgba(255, 255, 255, 0.1);
-  --v-border-soft: rgba(255, 255, 255, 0.05);
-  --v-accent: #38bdf8;
-  --v-accent-soft: rgba(56, 189, 248, 0.2);
-  --v-accent-text: #bae6fd;
-  --v-danger: #f87171;
-  --v-danger-soft: rgba(239, 68, 68, 0.1);
-  --v-danger-btn: rgba(239, 68, 68, 0.15);
-  --v-danger-btn-active: rgba(239, 68, 68, 0.25);
-  --v-danger-text: #fecaca;
-  --v-warn: #fbbf24;
-  --v-warn-soft: rgba(245, 158, 11, 0.1);
-  --v-warn-btn: rgba(245, 158, 11, 0.2);
-  --v-warn-text: #fde68a;
-  --v-radius-md: 0.375rem;
-  --v-radius-lg: 0.5rem;
-  --v-radius-xl: 0.75rem;
-  --v-shadow-card: none;
-  --v-header-blur: 8px;
-  --v-panel-blur: 0px;
+  /* 深色极光底 + 半透明白面板 + 大模糊：--v-bg 取渐变中位色（对比度测试要用） */
+  --v-bg: #241447;
+  --v-header: rgba(36, 20, 71, 0.55);
+  --v-page-image: radial-gradient(90% 60% at 12% 0%, rgba(124, 58, 237, 0.55), transparent 62%),
+    radial-gradient(80% 55% at 88% 8%, rgba(236, 72, 153, 0.42), transparent 58%),
+    radial-gradient(120% 80% at 50% 105%, rgba(34, 211, 238, 0.38), transparent 62%),
+    linear-gradient(160deg, #1b1035 0%, #241447 55%, #122140 100%);
+  --v-fg: #ffffff;
+  --v-fg-2: rgba(255, 255, 255, 0.82);
+  --v-fg-3: rgba(255, 255, 255, 0.7);
+  --v-fg-4: rgba(255, 255, 255, 0.55);
+  --v-surface: rgba(255, 255, 255, 0.14);
+  --v-surface-2: rgba(255, 255, 255, 0.26);
+  --v-surface-solid: #3a2560;
+  --v-inset: rgba(255, 255, 255, 0.1);
+  --v-border: rgba(255, 255, 255, 0.3);
+  --v-border-soft: rgba(255, 255, 255, 0.16);
+  --v-accent: #a5f3fc;
+  --v-accent-soft: rgba(165, 243, 252, 0.18);
+  --v-accent-text: #cffafe;
+  --v-danger: #ffa8b8;
+  --v-danger-soft: rgba(255, 128, 149, 0.18);
+  --v-danger-btn: rgba(255, 128, 149, 0.28);
+  --v-danger-btn-active: rgba(255, 128, 149, 0.42);
+  --v-danger-text: #ffffff;
+  --v-warn: #ffe08a;
+  --v-warn-soft: rgba(255, 224, 138, 0.18);
+  --v-warn-btn: rgba(255, 224, 138, 0.26);
+  --v-warn-text: #fff6da;
+  --v-radius-md: 0.5rem;
+  --v-radius-lg: 0.75rem;
+  --v-radius-xl: 1rem;
+  --v-shadow-card: 0 8px 32px rgba(12, 8, 32, 0.45);
+  --v-header-blur: 18px;
+  --v-panel-blur: 14px;
   --v-font-sans: system-ui, -apple-system, 'Segoe UI', 'Microsoft YaHei', sans-serif;
   --v-tracking: normal;
 }

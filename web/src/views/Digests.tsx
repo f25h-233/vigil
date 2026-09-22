@@ -83,7 +83,7 @@ export default function Digests() {
           ‹ 返回日报列表
         </button>
 
-        <article className="rounded-xl bg-vigil-surface p-4">
+        <article className="rounded-xl bg-vigil-surface p-4 shadow-vigil-card backdrop-blur-vigil-panel">
           {/* 这一天由数据层给出，是页面唯一的标题 */}
           <h1 className="text-lg font-semibold">{cur.day} 日报</h1>
           <div className="mt-3">
@@ -194,7 +194,7 @@ export default function Digests() {
             <li key={d.digest_id}>
               <button
                 onClick={() => open(d.digest_id)}
-                className="w-full rounded-xl bg-vigil-surface p-4 text-left transition-colors active:bg-vigil-surface-2"
+                className="w-full rounded-xl bg-vigil-surface p-4 text-left transition-colors active:bg-vigil-surface-2 shadow-vigil-card backdrop-blur-vigil-panel"
               >
                 <div className="font-medium">{d.day}</div>
                 <div className="mt-0.5 text-xs text-vigil-fg-3">

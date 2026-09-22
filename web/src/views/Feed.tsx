@@ -259,7 +259,7 @@ export default function Feed({
         value={input}
         onChange={(e) => setInput(e.target.value)}
         placeholder="搜标题或详情（两个字也能搜）"
-        className="w-full rounded-xl bg-vigil-surface px-3 py-2.5 text-sm outline-none placeholder:text-vigil-fg-4 focus:bg-vigil-surface-2"
+        className="w-full rounded-xl bg-vigil-surface px-3 py-2.5 text-sm outline-none placeholder:text-vigil-fg-4 focus:bg-vigil-surface-2 shadow-vigil-card backdrop-blur-vigil-panel"
       />
 
       {/* 类目是**多选**：点一下切换，不是替换。选中的多个之间是并集。 */}
@@ -390,7 +390,7 @@ export default function Feed({
           <button
             onClick={loadMore}
             disabled={loading}
-            className="mt-4 w-full rounded-xl bg-vigil-surface py-2.5 text-sm text-vigil-fg-2 active:bg-vigil-surface-2 disabled:opacity-40"
+            className="mt-4 w-full rounded-xl bg-vigil-surface py-2.5 text-sm text-vigil-fg-2 active:bg-vigil-surface-2 disabled:opacity-40 shadow-vigil-card backdrop-blur-vigil-panel"
           >
             {loading
               ? '读取中…'

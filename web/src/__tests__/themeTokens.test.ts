@@ -180,3 +180,27 @@ describe('表单控件规则的分层（F4 守卫）', () => {
     ).toMatch(/^@layer\s+base\b/)
   })
 })
+
+/**
+ * 结构维度的守卫：形状 / 字体 / 阴影 / 模糊 / 页面底图**也随主题走**。
+ * 只换颜色的四套主题在这里会红——那正是这条断言存在的理由。
+ *
+ * ⚠️ brief（T3 Step 1）这段自带一个**内层** `const v = …`，它要求存在一个选择器
+ * **恰好等于** `[data-theme='default']` 的块。**实测它解析不了 `'default'`**
+ * （brief 原文照抄跑出来的红：「缺 [data-theme='default'] 块」，2026-09-22）：
+ * 本设计里默认主题与 `:root` **共用一块**（选择器是 `:root,\n[data-theme='default']`，
+ * 见文件首条用例），所以 `selector === "[data-theme='default']"` 恒为假。
+ * ⇒ 这里**复用文件上方的模块级 `v()`**（它按 `includes` 找默认块，是内层版的严格超集），
+ * 不留两份会漂移的取值助手。差异已写进 task-3-report.md 的偏差清单。
+ */
+test('结构维度每套主题各给一份，且与默认**不同**（否则"五套主题"只剩标签不同）', () => {
+  expect(v('brutalism', '--v-radius-xl')).toBe('0px') // 方角是粗野主义的判据
+  expect(v('brutalism', '--v-font-sans')).toContain('monospace')
+  expect(v('brutalism', '--v-shadow-card')).not.toBe('none') // 硬阴影承担"厚边框"（E5）
+  expect(v('glass', '--v-panel-blur')).not.toBe('0px')
+  expect(v('glass', '--v-page-image')).toContain('gradient')
+  expect(v('vaporwave', '--v-page-image')).toContain('gradient')
+  expect(v('material', '--v-shadow-card')).not.toBe('none') // 抬升
+  expect(v('default', '--v-shadow-card')).toBe('none') // 默认主题保持今天的观感
+  expect(v('default', '--v-page-image')).toBe('none')
+})

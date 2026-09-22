@@ -89,7 +89,7 @@ export default function PersonPicker({
       </button>
 
       {open && (
-        <div className="mt-2 rounded-xl bg-vigil-surface p-3">
+        <div className="mt-2 rounded-xl bg-vigil-surface p-3 shadow-vigil-card backdrop-blur-vigil-panel">
           {err !== null && (
             <p className="mb-2 text-xs text-vigil-danger">{err}</p>
           )}

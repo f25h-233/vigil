@@ -76,7 +76,7 @@ export default function Categories({
               <button
                 key={c.slug}
                 onClick={() => onPick(c.slug)}
-                className="rounded-xl bg-vigil-surface p-4 text-left transition-colors active:bg-vigil-surface-2"
+                className="rounded-xl bg-vigil-surface p-4 text-left transition-colors active:bg-vigil-surface-2 shadow-vigil-card backdrop-blur-vigil-panel"
               >
                 <div className="text-2xl">{c.icon}</div>
                 <div className="mt-1 font-medium">{c.label}</div>

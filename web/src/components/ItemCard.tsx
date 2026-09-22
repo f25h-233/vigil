@@ -97,7 +97,7 @@ export default function ItemCard({
   }
 
   return (
-    <li className="rounded-xl bg-vigil-surface p-3">
+    <li className="rounded-xl bg-vigil-surface p-3 shadow-vigil-card backdrop-blur-vigil-panel">
       <div className="flex items-start gap-2">
         {/* ⚠️ 多选框**必须在外层 button 之外**：HTML 不允许 `<button>` 里嵌交互
             元素（`<input>` 也是），浏览器会把内层踢出来、点击行为变得不可预测
