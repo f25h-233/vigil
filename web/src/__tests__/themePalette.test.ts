@@ -161,3 +161,57 @@ test('正文与弱化文字在面板上都读得清（WCAG：正文 ≥4.5 / 弱
     ).toBeGreaterThanOrEqual(4.5)
   }
 })
+
+/**
+ * ⭐ R8（= 计划 **E14** 的落地）——**判据的"语境模型"漏了整个图层，就等于没判**。
+ *
+ * 上面那条把面合成到 `--v-bg`（不透明的基色）上，于是它对"面板压在**壁纸**上"这件事
+ * 一无所知：有壁纸的主题里，卡片真正压着的是壁纸**最亮的那块像素**。实测（glass，
+ * R8 之前）：压在最亮像素上正文 **4.32**、弱化文字 **2.93** —— 屏幕上已经读不出来，
+ * 而断言 8/8 全绿。这不是值写错了，是**判据的语境少了一个图层**。
+ * 这条把那个图层补进语境：面合成到最亮像素上，再算 4.5 / 3（阈值一个字没动）。
+ */
+// 各"有壁纸"主题的**最亮像素**（人肉从 `--v-wallpaper` 的渐变栈里找的最亮 stop）：
+//   vaporwave 的 `#fff3a3` 是落日中心；glass 的 `#22ff88` 是右下绿圆最亮的 stop。
+// ⚠️ **改壁纸必须回来改这张表**（并把渲染轮重跑一遍）——否则它就是一条会过期的判据：
+//    壁纸变更亮而表没更新 ⇒ 判据仍然全绿，而屏幕上的字已经糊了。
+// ⚠️ "最亮"是**逐个算过**的，不是看着挑的——P5 就栽在这一步：当时挑的是橙圆的 `#ffb01f`
+//    （"壁纸最亮的一块"），而 WCAG 相对亮度 `#ffb01f` = **0.524** < `#22ff88` = **0.736**。
+//    全部 stop 的 L（哪个最大一目了然）：
+//      vaporwave 落日：`#fff3a3` **0.880** / `#ffb347` 0.540 / `#ff5e8a` 0.311 / `#ff2d95` 0.253
+//      glass 橙红圆：`#ffb01f` 0.524 / `#ff6a1f` 0.317 / `#ff2d78` 0.245
+//      glass 青绿圆：`#22d3ee` 0.531 / `#3b82f6` 0.236 / `#22ff88` **0.736** ← 全表最大
+const WALLPAPER_BRIGHTEST: Record<string, string> = { vaporwave: '#fff3a3', glass: '#22ff88' }
+
+test('面板压在壁纸的最亮像素上，正文与弱化文字仍读得清（R8 / E14）', () => {
+  // ⚠️ 先堵住这张表**自己**的过期形态：表是手写的，而"整张表被悄悄挖空"与"全绿"
+  // 长得一模一样（空守卫的经典形状）。有壁纸的主题一个都不能漏。
+  for (const t of THEMES) {
+    if (value(t.id, '--v-wallpaper') !== 'none') {
+      expect(
+        Object.keys(WALLPAPER_BRIGHTEST),
+        `${t.id} 有壁纸，却不在 WALLPAPER_BRIGHTEST 里——表漏了它，这条判据就没守它`,
+      ).toContain(t.id)
+    }
+  }
+
+  for (const [id, brightest] of Object.entries(WALLPAPER_BRIGHTEST)) {
+    const px = parse(brightest)
+    // ⚠️ 这里**不**先把面叠到 `--v-bg` 上：卡片压住的就是那颗壁纸像素本身。
+    // 文字侧照上面同一条写法 `over()` 合成（半透明字色不合成 = 数字虚高，见 F2b）。
+    const ratio = (text: string, face: string) => {
+      const bottom = over(parse(value(id, face)), px)
+      return contrast(over(parse(value(id, text)), bottom), bottom)
+    }
+    for (const face of ['--v-surface', '--v-surface-2']) {
+      expect(
+        ratio('--v-fg', face),
+        `${id} 正文 / ${face} 压在壁纸最亮像素 ${brightest} 上`,
+      ).toBeGreaterThanOrEqual(4.5)
+      expect(
+        ratio('--v-fg-3', face),
+        `${id} 弱化文字 / ${face} 压在壁纸最亮像素 ${brightest} 上`,
+      ).toBeGreaterThanOrEqual(3)
+    }
+  }
+})
