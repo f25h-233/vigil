@@ -47,9 +47,6 @@
 /* ── ① 原始变量：默认主题（`:root` 与显式 `[data-theme='default']` 共用一块） ── */
 :root,
 [data-theme='default'] {
-  /* ⭐ T8-1：**只有 ARGUS 主题消费它**——其余五块这份是"名册占位"（`themeTokens.test.ts`
-     的 parity 逐名比六块的 token 集合，缺一块即红）。值 = 本套主题的强调色字面值。 */
-  --v-argus: #38bdf8;
   /* 页面与浮层底 */
   --v-bg: #0b0f14;
   --v-header: rgba(11, 15, 20, 0.9);
@@ -356,21 +353,22 @@ body::before {
   }
 }
 
-/* ── ④ 另外四套主题：T3 定稿的完整值（**五块各 42 个 token 一个不少**——37 是 T7 之前的
-      数（`--v-radius-full` 与 M7-P4 的三个壁纸 token 都算在 37 里，再早的 33 是 T3 当时的
-      数）；T7 又加了 `--v-motion-dur` / `--v-motion-ease` / `--v-ripple` /
-      `--v-press-scale` 四条，T7 fix 轮再加 `--v-ripple-dur` 一条 = 42。
-      **五块每次都是一起加**，parity 仍逐名相等）。
-      ⚠️ 上面这个数**每次加 token 都要跟着改**（随手写死的数字会烂）：`themeTokens.test.ts`
-      的 parity 用例逐名比 token 集合，缺一块即红——但"注释里的数"没人守，只能靠这条自律。
+/* ── ④ 另外五套主题：T3 定稿的完整值（**六块各给全同一套 token、一个不少**——T7 又加了
+      `--v-motion-dur` / `--v-motion-ease` / `--v-ripple` / `--v-press-scale` 四条，
+      T7 fix 轮再加 `--v-ripple-dur` 一条；**六块每次都是一起加**，parity 仍逐名相等）。
+      ⛔ **本行起不再写"每块有几个 token"**：那个数已经烂过一次（T8-1 给六块各加了
+      `--v-argus` 而没改它），而它**没有任何判据**——注释里的数是唯一没人守的真相。
+      要这个数就**现数**（`themeTokens.test.ts` 的 parity 用例逐名比六块的 token 集合，
+      缺一块即红；或剥掉注释后数 `--v-[a-z0-9-]+\s*:` 的出现次数）。
+      历史（只作考古，别当现值）：T3 时 33、T7 前 37、T7 fix 轮后 42。
       ⚠️ 每套都**显式给全**、不靠继承（G3）：CSS 里「没写」与「想继承」长得一样，
       而继承的后果是「浅色主题里冒出默认主题的深色」——`themeTokens.test.ts`
       的 parity 测试逐名比对就是为了挡这一条。
-      ⚠️ 四块都**不是**「只换颜色」：圆角 / 阴影 / 模糊 / 字体 / 字距 / 页面资产
+      ⚠️ 六块都**不是**「只换颜色」：圆角 / 阴影 / 模糊 / 字体 / 字距 / 页面资产
       （`--v-page-image` 滚动纹理层，`--v-wallpaper` + `--v-wallpaper-size` /
-      `--v-wallpaper-pos` 固定壁纸层）也在各自的值里，这才是「五套主题」而不只是五个色板。
+      `--v-wallpaper-pos` 固定壁纸层）也在各自的值里，这才是「六套主题」而不只是六个色板。
       ⚠️ 这里的字体栈是各主题的**设计值**；只有默认块受 E10 约束（`'Segoe UI'`
-      必须字面第一，保基线），四套主题都有各自的字体判据（如粗野主义用等宽）。 ── */
+      必须字面第一，保基线），**其余各套**都有各自的字体判据（如粗野主义 / ARGUS 用等宽）。 ── */
 [data-theme='material'] {
   /* Material 3 浅色（**P1 修订：更素的 M3 —— 深字配浅底**）
      ⚠️ 用户原话：「material design 不够谷歌，颜色不够素」。两处病根都在**容器色家族选错**：
@@ -385,8 +383,6 @@ body::before {
      那么亮的黄）。底 `#fdfbff` → `#fef7ff`（surface 家族的中性紫调，更接近 M3 的
      surfaceContainerLowest）。
      ⚠️ 结构值（radius / shadow / blur / font / tracking）**一个字没动**——P1 只换色。 */
-  /* ⭐ T8-1：**只有 ARGUS 主题消费它**（其余五块这份是"名册占位"——parity 逐名比六块的 token 集合）。 */
-  --v-argus: #6750a4;
   --v-bg: #fef7ff;
   --v-header: rgba(254, 247, 255, 0.92);
   --v-page-image: none;
@@ -434,8 +430,6 @@ body::before {
 
 [data-theme='brutalism'] {
   /* 高对比 + 硬阴影 + 方角 + 等宽：选中态纯黄，按钮纯黑底白字 */
-  /* ⭐ T8-1：**只有 ARGUS 主题消费它**（其余五块这份是"名册占位"——parity 逐名比六块的 token 集合）。 */
-  --v-argus: #0a0a0a;
   --v-bg: #f2f0eb;
   --v-header: rgba(242, 240, 235, 0.96);
   --v-page-image: repeating-linear-gradient(0deg, rgba(0, 0, 0, 0.05) 0 1px, transparent 1px 24px),
@@ -513,8 +507,6 @@ body::before {
      免得换个工具链解析就变脸）。
      ⛔ 值里**不许出现 `;`**：`themeTokens.test.ts` 的取值助手按 `[^;]+` 截断，
      写 `data:image/svg+xml;utf8,` 或内联 `style="a:b;c:d"` 会让它读到半截（实测过）。 */
-  /* ⭐ T8-1：**只有 ARGUS 主题消费它**（其余五块这份是"名册占位"——parity 逐名比六块的 token 集合）。 */
-  --v-argus: #00e5ff;
   --v-bg: #0a0118;
   --v-header: rgba(10, 1, 24, 0.82);
   --v-page-image: repeating-linear-gradient(0deg, rgba(0, 229, 255, 0.16) 0 1px, transparent 1px 30px),
@@ -613,8 +605,6 @@ body::before {
         主题里最亮的一块"——**不是**。WCAG 相对亮度：亮橙 **0.524**、右下青绿圆的 stop
         `#22ff88` **0.736**。⇒ "最亮像素"这半个语境判错了，照它定出来的 alpha 自然
         不达标（实测见 ③ 那几条）。表里 glass 记的最亮像素是 `#22ff88`。 */
-  /* ⭐ T8-1：**只有 ARGUS 主题消费它**（其余五块这份是"名册占位"——parity 逐名比六块的 token 集合）。 */
-  --v-argus: #a5f3fc;
   --v-bg: #0b1020;
   --v-header: rgba(11, 16, 32, 0.62);
   --v-page-image: none;
@@ -698,9 +688,15 @@ body::before {
      首帧、以及 `clearArgusColor()` 之后，屏幕上的字色就是这里这份；② `themePalette.test.ts`
      的对比度判据**只读这张块**（它不跑 JS）⇒ 这里少给一个，判据就变成"验的是不存在的值"。
 
-     ⚠️ **token 集合与其余五块逐名相等**（parity 会逐字比）——包括下面那个 `--v-argus`
-     （六块都有，但**只有这一份被消费**）。 */
-  --v-argus: #00ff9c;
+     ⚠️ **token 集合与其余五块逐名相等**（parity 会逐字比）。
+     ⭐ **本块那 12 个颜色值与 `deriveArgusVars(ARGUS_DEFAULT)` 的逐字一致有判据**：
+     `--v-fg` / `--v-fg-2` / `--v-fg-3` / `--v-fg-4` / `--v-surface` / `--v-surface-2` /
+     `--v-inset` / `--v-border` / `--v-border-soft` / `--v-accent` / `--v-accent-soft` /
+     `--v-accent-text`（**恰好这 12 个**——⚠️ **不含** `--v-surface-solid`：它是"浮层必须
+     不透明"那条的，函数算出来的是半透明，两边**故意不同**，别把它塞进那张表）。
+     `argusColor.test.ts` 的「CSS 的 argus 块 ≡ deriveArgusVars(ARGUS_DEFAULT)」那条
+     会读本块并与函数输出**逐字比**（两处真相必须机械对上：本块只在首帧与
+     `themePalette.test.ts` 里出现，稳态值恒来自函数）。改这里的值就要同改那边。 */
   /* 纯黑底 + 几乎不透明的顶栏：**任何一点灰都会破坏"这是终端"**（用 `#000000` 而不是
      "很深的灰"，是因为 `/color` 的亮度判据 `MIN_LUMINANCE` 就是**对纯黑底**反推的：
      底一变，那个阈值与 `themePalette.test.ts` 的对比度数字就都不作数了）。 */

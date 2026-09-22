@@ -96,6 +96,15 @@ export function deriveArgusVars(base: string): Record<string, string> {
   }
 }
 
+/**
+ * 基色 → 写 `:root` 行内变量 + 落盘。**它只负责"写变量"，不负责"判断该不该写"**。
+ *
+ * ⚠️ F7（T8-1 fix 轮）：这里**没有**"当前主题必须是 argus"的前置条件——按本仓纪律，
+ * 引擎保持纯（可单测、无环境依赖），**门放在调用点**：`theme.ts` 的 `syncArgusColor()`
+ * **只在 `id === 'argus'` 时**才调它，其余主题走 `clearArgusColor()`。
+ * ⇒ 任何新调用点：要么经由 `applyTheme`（推荐），要么自己承担这个判断；直接调它
+ * 而在非 argus 主题下就是 §0.1 那个"行内覆盖顶掉别的主题"的缺陷换个入口重演。
+ */
 export function applyArgusColor(input: string): ArgusColorResult {
   const parsed = parseArgusColor(input)
   if (!parsed.ok) return parsed
