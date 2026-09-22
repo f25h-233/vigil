@@ -95,6 +95,47 @@ T4 原写「375px 下现有单行 ≈ 426px > 375 ⇒ `overflow-x:hidden` 会静
 ① T4 的验收**不许**用"没有控件被裁"——**修前就已满足**，那是不会失败的判据；
 ② 改用「导航 tab 宽 ≥ 56px 且标签文字只占一行」（修前实测 48px / 两行 ⇒ **必红**）。
 
+### E9 ⚠️ 两条**只有实测才发现**的墙：Node 内置模块的 import 写法、`new URL` 的基准
+
+T1 执行期实测（报告 §4 偏差 4/5），**T2/T3 的测试会撞上同一对**：
+
+```
+src/__tests__/theme.test.ts(1,30): error TS2307: Cannot find module 'node:fs' or its corresponding type declarations.
+2 new URL('../../index.html', import.meta.url) → http://localhost:3000/index.html     ← ⛔ jsdom 的 document base
+1 const HERE = import.meta.url; new URL('../../index.html', HERE) → file:///D:/github/VIGIL/web/index.html   ← ✅
+```
+
+- ① 本仓**没有 `@types/node`**，而 `tsc -b`（`npm run build` 里）**会编译测试文件** ⇒
+  `import { readFileSync } from 'node:fs'` 让构建直接失败。
+- ② `new URL(x, import.meta.url)` 的第二个参数写成**字面量**时，Vite 的
+  asset-import-meta-url 变换会接管它，把基准换成 jsdom 的 document base。
+  加一层 `const HERE = import.meta.url` 就绕开（同一文件同一行，只差一个间接层）。
+- **惯例（T2/T3 直接照抄）**：具名变量说明符 + `as` 写死类型，**不用 `@ts-expect-error`**
+  （将来真装了 `@types/node` 会变成 TS2578，又把构建搞坏一次）。
+- **裁决 R3：不装 `@types/node`**（`web/package.json` + `web/tsconfig.json` 是共享配置，
+  改动影响面未知；而这条惯用写法只有 3 行、且已附理由注释）。
+
+### E3-补 ⚠️ 实测收窄：`var()` 形态下**不**烘 hex —— 但禁用透明度修饰符仍是**设计决定**
+
+T1 执行期实测（报告 §4 偏差 1）：把 `--color-vigil-bg` 从字面量改成 `var(--v-bg)` 之后，
+产物里那条**构建期烘死的** `#0b0f14e6` **消失了**，只剩 `color-mix(...)`（解析值与它逐字节相同）。
+
+⇒ E3 原来的理由（"会烘死"）**只对"值是字面量"那一支成立**，不是普适结论。
+⇒ **G2 照旧**，但理由要照实写：① 透明度是**主题资产**（该由 token 值决定，不该出现在调用点）；
+② `var()` 那一支的 color-mix 行为**只在一个类上验过**，而我们只需要这 23 个 token ⇒ 把未完全验证的路径关掉。
+
+### E10 ⭐ 默认主题的字体栈必须 `'Segoe UI'` 打头（保住"默认主题 = 基线"）
+
+T1 执行期实测（报告 §4 发现 B）：`'AaBbGg123 !@#'` 的宽度指纹 —— `"Segoe UI"` 单独用 = **146.221**
+= Tailwind 旧栈（**相同**）⇒ **今天渲染拉丁文的就是 Segoe UI**；而 `system-ui` 在本机
+（zh-CN Windows）解析到雅黑（**158.857**），后果：拉丁串 +8.6% 宽、整页 +5px、
+**4.983% 像素不同**（纯 CJK 不变）。
+
+⇒ **默认主题**（`:root, [data-theme='default']`）的 `--v-font-sans` 必须写成
+`'Segoe UI', system-ui, -apple-system, 'Microsoft YaHei', sans-serif`——
+T1 自己写的目标是「默认主题与今天**逐像素相同**」，字体栈是唯一残留差异。
+⇒ **另外四套主题不受此限**（它们本来就该长得不一样；T3 的 `system-ui` / `Roboto` / 等宽栈照旧）。
+
 ### E6 `bg-black/30` 的 12 处里有 10 处是**输入框底**，不是遮罩
 
 实测分布：`ItemCard.tsx:167`、`PersonPicker.tsx:147/153`、`Feed.tsx:302`、`Settings.tsx:532/534/536/539/579/968/991`（输入框/文本域）、`SourceList.tsx:15`（源消息条目）。**本应用没有模态遮罩**。
@@ -653,10 +694,34 @@ cd web && npm run build   # 期望成功（tsc -b 也在里面）
 **1) 先写守卫测试** `web/src/__tests__/noRawPalette.test.ts`：
 
 ```ts
-import { readdirSync, readFileSync } from 'node:fs'
-import { join, relative } from 'node:path'
-import { fileURLToPath } from 'node:url'
 import { expect, test } from 'vitest'
+
+/**
+ * ⚠️ Node 内置模块在本仓**必须**用「具名变量说明符」动态 import——两条实测出来的墙
+ * （T1 报告 §4 偏差 4/5；M7 勘误 E9）：
+ *   ① 本仓没有 `@types/node`，而 `tsc -b`（`npm run build` 会跑）**会编译测试文件**
+ *      ⇒ `import { readFileSync } from 'node:fs'` 直接 TS2307 让构建失败；
+ *   ② `new URL('..', import.meta.url)` 第二个参数写成**字面量**时，Vite 的
+ *      asset-import-meta-url 变换会接管，基准被换成 jsdom 的 document base
+ *      （实测 → `http://localhost:3000/index.html`）；先取 `const HERE = import.meta.url` 再传就正常。
+ * 故意**不用** `// @ts-expect-error`：将来真装了 @types/node 会变成 TS2578，又把构建搞坏一次。
+ */
+const NODE_FS = 'node:' + 'fs'
+const NODE_PATH = 'node:' + 'path'
+const NODE_URL = 'node:' + 'url'
+const HERE = import.meta.url
+
+const { readdirSync, readFileSync } = (await import(/* @vite-ignore */ NODE_FS)) as {
+  readdirSync: (p: string, o: { withFileTypes: true }) => { name: string; isDirectory(): boolean }[]
+  readFileSync: (p: string, enc: string) => string
+}
+const { join, relative } = (await import(/* @vite-ignore */ NODE_PATH)) as {
+  join: (...p: string[]) => string
+  relative: (a: string, b: string) => string
+}
+const { fileURLToPath } = (await import(/* @vite-ignore */ NODE_URL)) as {
+  fileURLToPath: (u: URL) => string
+}
 
 /**
  * ⭐ 出口判据 4（浅色主题下无「深色残留」）的**入口守卫**：
@@ -666,7 +731,7 @@ import { expect, test } from 'vitest'
  * ⚠️ 它**只证明"没有残留"，证明不了"映射对不对"**。映射的正确性由
  * `web/tools/retheme_m7.py` 的映射表（可审查）+ T3 的主题值 + 冒烟截图承担。
  */
-const SRC = fileURLToPath(new URL('..', import.meta.url))
+const SRC = fileURLToPath(new URL('..', HERE))
 
 // 与 codemod 的 --check 用**同一条**正则（两份副本；漂移由本测试兜底：它说了算）
 const PALETTE =
@@ -845,7 +910,10 @@ if __name__ == "__main__":
   （页面底由 `body` 提供；留着 `bg-vigil-bg` 会让根 div 盖住 `--v-page-image` 的渐变——玻璃/粗野主义会看不见）。
 - `src/App.tsx:47`：`... bg-vigil-header backdrop-blur` → `... bg-vigil-header backdrop-blur-vigil-header`
   （裸 `backdrop-blur` 是 8px 字面量；换成语义类后由 `--v-header-blur` 主题化，默认值 8px ⇒ 观感不变。T4 会重排这一行，本轮只改类名。）
-- `src/index.css`：删掉 `@theme inline` 里的 `--color-vigil-bg`（它最后一个用户是 App 根 div，已删）。**保留** `--v-bg`（`body` 与 `theme.ts` 的 `theme-color` 同步要用）。
+- `src/index.css`：删掉 `@theme inline` 里的 `--color-vigil-bg`（它最后一个用户是 App 根 div，已删）。
+  **保留** `--v-bg`（`body` 与 `theme.ts` 的 `theme-color` 同步要用）。
+  ⚠️ T1 执行期把它**补回来过**（当时 App.tsx 还在用 `bg-vigil-bg`，删了顶栏底色会整条消失——
+  见 T1 报告偏差 1）；只有在本任务删掉它的最后一个用户**之后**，删映射才是对的。
 
 **6) 验证与提交**
 
@@ -899,9 +967,15 @@ test('结构维度每套主题各给一份，且与默认**不同**（否则"五
 `web/src/__tests__/themePalette.test.ts`（新文件，完整）：
 
 ```ts
-import { readFileSync } from 'node:fs'
 import { expect, test } from 'vitest'
 import { THEMES } from '../theme.ts'
+
+// ⚠️ Node 内置模块的写法与理由见 `noRawPalette.test.ts` 顶部那段（M7 勘误 E9 的两条墙）
+const NODE_FS = 'node:' + 'fs'
+const HERE = import.meta.url
+const { readFileSync } = (await import(/* @vite-ignore */ NODE_FS)) as {
+  readFileSync: (p: URL, enc: string) => string
+}
 
 /**
  * ⭐ 调色板的**可读性守卫**。它回答两个肉眼会漏的问题：
@@ -913,7 +987,7 @@ import { THEMES } from '../theme.ts'
  *    ⇒ 故 `--v-bg` 取渐变中位色。这条近似**写在这里**，不许被说成"渐变也验过了"。
  * ⚠️ 剥注释再解析（理由同 `themeTokens.test.ts`：注释里含示例 CSS）。
  */
-const CSS = readFileSync(new URL('../index.css', import.meta.url), 'utf8').replace(
+const CSS = readFileSync(new URL('../index.css', HERE), 'utf8').replace(
   /\/\*[\s\S]*?\*\//g,
   '',
 )
