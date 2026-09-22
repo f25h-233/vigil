@@ -118,6 +118,7 @@
   --v-motion-dur: 150ms;
   --v-motion-ease: cubic-bezier(0.2, 0, 0, 1);
   --v-ripple: transparent;   /* transparent = 这套不要涟漪（RippleLayer 的整条机制因此自关） */
+  --v-ripple-dur: 300ms;     /* = 2 × --v-motion-dur：涟漪比状态过渡慢一档（各套同一条规则） */
   --v-press-scale: 1;        /* 1 = 按下不缩放（恒等变换，零视觉影响） */
 }
 
@@ -262,13 +263,55 @@ body::before {
     transform: scale(var(--v-press-scale));
   }
 
-  /* ④ 涟漪本体（由 `RippleLayer.tsx` 命令式插进按钮里；它不是 React 的子节点）。
-     尺寸 / 落点 / 颜色由那个组件内联写在这三个属性之外的 style 上。 */
-  .vigil-ripple {
+  /* ④ 涟漪本体：**伪元素**，不是插进 DOM 的 `<span>`。
+     ⚠️ 为什么必须改成伪元素（reviewer 的 Important-1，第 0 步已复现）：
+     `RippleLayer.tsx` 此前是 `el.appendChild(span)`——那个 span 是**命令式插进
+     React 管的 DOM** 的，于是 React 的任何一次写入都可能把它抹掉。**实测**：
+     React 19.3.0 的 `setTextContent`（`react-dom-client.development.js:2834`）
+     只在「唯一的子节点是个文本节点」（`firstChild === lastChild && nodeType === 3`）
+     时才走 `firstChild.nodeValue = text` 的快路径，**否则落到 `node.textContent = text`
+     （:2846）**——那是一次性清空所有子节点 ⇒ 按钮文案一变，活着的涟漪 span 当场消失
+     （复现：`<button>按我<span class="vigil-ripple"></span></button>` → rerender 成
+     别的文案 → `<button>换个文案</button>`，span 计数 1 → 0；捕获到的写入栈正是
+     `at setTextContent (…react-dom-client.development.js:2846:24)`）。
+     ⚠️ 伪元素不在 DOM 里 ⇒ 上述写入**碰不到它**；而它的三个几何量走自定义属性，
+     React 的 `style` diff 只管它自己 props 里的键 ⇒ 也碰不到。
+
+     ⚠️ 落点/尺寸给的是**中心点**（`left/top` = 触点相对按钮的坐标），靠两个负 margin
+     回正——`RippleLayer.tsx` 因此只写 `--ripple-x/y/size` 三个 px 字面量，不做减法。
+     ⚠️ `overflow: hidden`（上面 ②）照旧负责裁切，`border-radius: 50%` 给出圆形。
+     ⚠️ 时长是**它自己**的 token `--v-ripple-dur`（涟漪比状态过渡慢一档：
+     `2 × --v-motion-dur`），不是 `--v-motion-dur`——否则粗野主义那套的"别动"
+     会把涟漪与过渡绑死成同一个开关。 */
+  button.vigil-rippling::after {
+    content: '';
     position: absolute;
+    left: var(--ripple-x);
+    top: var(--ripple-y);
+    width: var(--ripple-size);
+    height: var(--ripple-size);
+    margin-left: calc(var(--ripple-size) / -2);
+    margin-top: calc(var(--ripple-size) / -2);
     border-radius: 50%;
+    background: var(--v-ripple);
     pointer-events: none;
-    will-change: transform, opacity;
+    animation: vigil-ripple var(--v-ripple-dur) var(--v-motion-ease) forwards;
+  }
+
+  /* ⚠️ `@keyframes` 与上面那条规则**同层**：`animation-name` 本身不受层影响，
+     放一起只是为了让"改类名却忘改动画名"这类漂移一眼可见。
+     ⚠️ `animationend` 的委托监听器靠**类名**（`.vigil-rippling`）认人，**不是**靠
+     `animationName`——理由写在 `RippleLayer.tsx`。
+     ⚠️ 关键帧只动 `transform` / `opacity`（合成器属性）⇒ 不触发布局。 */
+  @keyframes vigil-ripple {
+    from {
+      transform: scale(0);
+      opacity: 0.9;
+    }
+    to {
+      transform: scale(1);
+      opacity: 0;
+    }
   }
 
   /* ⑤ 系统里关了动效 ⇒ 一律不做。**这条不是可选项**（无障碍）。 */
@@ -282,9 +325,13 @@ body::before {
   }
 }
 
-/* ── ④ 另外四套主题：T3 定稿的完整值（四块都是 **37 个 token 一个不少**——33 是 T3 当时的
-      数；R6 之后每块都多了 `--v-radius-full`，M7-P4 又多了 `--v-wallpaper` /
-      `--v-wallpaper-size` / `--v-wallpaper-pos`，**五块每次都是一起加**，parity 仍逐名相等）。
+/* ── ④ 另外四套主题：T3 定稿的完整值（**五块各 42 个 token 一个不少**——37 是 T7 之前的
+      数（`--v-radius-full` 与 M7-P4 的三个壁纸 token 都算在 37 里，再早的 33 是 T3 当时的
+      数）；T7 又加了 `--v-motion-dur` / `--v-motion-ease` / `--v-ripple` /
+      `--v-press-scale` 四条，T7 fix 轮再加 `--v-ripple-dur` 一条 = 42。
+      **五块每次都是一起加**，parity 仍逐名相等）。
+      ⚠️ 上面这个数**每次加 token 都要跟着改**（随手写死的数字会烂）：`themeTokens.test.ts`
+      的 parity 用例逐名比 token 集合，缺一块即红——但"注释里的数"没人守，只能靠这条自律。
       ⚠️ 每套都**显式给全**、不靠继承（G3）：CSS 里「没写」与「想继承」长得一样，
       而继承的后果是「浅色主题里冒出默认主题的深色」——`themeTokens.test.ts`
       的 parity 测试逐名比对就是为了挡这一条。
@@ -348,6 +395,7 @@ body::before {
   --v-motion-dur: 180ms;
   --v-motion-ease: cubic-bezier(0.2, 0, 0, 1);
   --v-ripple: rgba(103, 80, 164, 0.22); /* M3 primary 的 22%，与 --v-accent 同源 */
+  --v-ripple-dur: 360ms; /* = 2 × 180ms */
   --v-press-scale: 1;
 }
 
@@ -395,6 +443,7 @@ body::before {
   --v-motion-dur: 0ms;
   --v-motion-ease: linear;
   --v-ripple: transparent;
+  --v-ripple-dur: 0ms; /* = 2 × 0ms：这套连"慢一档"都没有对象（涟漪本身就没开） */
   --v-press-scale: 1;
 }
 
@@ -497,6 +546,7 @@ body::before {
   --v-motion-dur: 320ms;
   --v-motion-ease: cubic-bezier(0.34, 1.2, 0.64, 1);
   --v-ripple: rgba(0, 229, 255, 0.28); /* 与 --v-accent 同一个青 */
+  --v-ripple-dur: 640ms; /* = 2 × 320ms */
   --v-press-scale: 0.98;
 }
 
@@ -594,6 +644,7 @@ body::before {
   --v-motion-dur: 240ms;
   --v-motion-ease: cubic-bezier(0.2, 0, 0, 1);
   --v-ripple: rgba(255, 255, 255, 0.25);
+  --v-ripple-dur: 480ms; /* = 2 × 240ms */
   --v-press-scale: 0.98;
 }
 

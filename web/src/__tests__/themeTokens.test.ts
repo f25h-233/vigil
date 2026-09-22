@@ -270,10 +270,11 @@ const STRUCTURAL: Record<string, Record<string, string>> = {
     '--v-wallpaper-pos': 'center top',
     '--v-surface-2': '#e8def8', // F5：M3 secondary-container（选中态的底，= 它的 --v-accent-soft）
     // ⭐ T7：动效 token 也进这张表——它们是**主题身份**（180ms vs 0ms vs 320ms 是三种性格），
-    // 不只是"能跑就行"的实现细节。四套 × 4 = 16 条，表驱动写法不变。
+    // 不只是"能跑就行"的实现细节。四套 × 5 = 20 条，表驱动写法不变。
     '--v-motion-dur': '180ms',
     '--v-motion-ease': 'cubic-bezier(0.2, 0, 0, 1)',
     '--v-ripple': 'rgba(103, 80, 164, 0.22)',
+    '--v-ripple-dur': '360ms', // T7 fix：伪元素涟漪的时长（= 2 × 180ms）
     '--v-press-scale': '1',
   },
   brutalism: {
@@ -295,6 +296,9 @@ const STRUCTURAL: Record<string, Record<string, string>> = {
     '--v-motion-dur': '0ms',
     '--v-motion-ease': 'linear',
     '--v-ripple': 'transparent',
+    // ⭐ T7 fix：0ms（= 2 × 0ms）。这套主题的涟漪本来就关着，但**值必须给**
+    //——parity 只比名字；而"给了 0ms 还是继承默认的 300ms"这件事只有这张表看得见。
+    '--v-ripple-dur': '0ms',
     '--v-press-scale': '1',
   },
   vaporwave: {
@@ -319,6 +323,7 @@ const STRUCTURAL: Record<string, Record<string, string>> = {
     '--v-motion-dur': '320ms',
     '--v-motion-ease': 'cubic-bezier(0.34, 1.2, 0.64, 1)',
     '--v-ripple': 'rgba(0, 229, 255, 0.28)',
+    '--v-ripple-dur': '640ms', // T7 fix：= 2 × 320ms
     '--v-press-scale': '0.98',
   },
   glass: {
@@ -340,6 +345,7 @@ const STRUCTURAL: Record<string, Record<string, string>> = {
     '--v-motion-dur': '240ms',
     '--v-motion-ease': 'cubic-bezier(0.2, 0, 0, 1)',
     '--v-ripple': 'rgba(255, 255, 255, 0.25)',
+    '--v-ripple-dur': '480ms', // T7 fix：= 2 × 240ms
     '--v-press-scale': '0.98',
   },
 }
@@ -380,4 +386,12 @@ test('结构维度每套主题各给一份（F3 + P4：结构 token 的字面值
   expect(v('default', '--v-page-image')).toBe('none')
   expect(v('default', '--v-wallpaper')).toBe('none')
   expect(v('default', '--v-radius-full')).toBe('9999px')
+  // ③ ⭐ T7 fix 补：**默认块**的 `--v-ripple-dur`。
+  //    为什么非要单独锁一份：上面那张 `STRUCTURAL` 表**只覆盖四套非默认主题**
+  //    （默认块与 `:root` 共用一块，见文件首条用例），而 parity **只比名字、不比值**
+  //    ⇒ 默认这份的值此前**没有任何东西在问**：把它写成 `500ms`、或误抄成
+  //    `--v-motion-dur` 的 `150ms`，全量照样全绿。而默认主题是全站份额最大的一套，
+  //    "克制那一档"的手感就靠这个数。
+  //    值 = 2 × `--v-motion-dur`(150ms)，与另外四套同一条规则（各套值见上表）。
+  expect(v('default', '--v-ripple-dur')).toBe('300ms')
 })
