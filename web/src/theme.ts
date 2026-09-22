@@ -10,7 +10,9 @@
  * 而 `index.html` 的防闪脚本已经证明这种重复必然漂移（那条白名单有测试钉着）。
  */
 
-export type ThemeId = 'default' | 'material' | 'brutalism' | 'vaporwave' | 'glass'
+import { applyArgusColor, clearArgusColor, readArgusColor } from './argusColor.ts'
+
+export type ThemeId = 'default' | 'material' | 'brutalism' | 'vaporwave' | 'glass' | 'argus'
 
 export const THEMES: { id: ThemeId; label: string }[] = [
   { id: 'default', label: '默认' },
@@ -18,7 +20,20 @@ export const THEMES: { id: ThemeId; label: string }[] = [
   { id: 'brutalism', label: '粗野主义' },
   { id: 'vaporwave', label: '蒸汽波' },
   { id: 'glass', label: '毛玻璃' },
+  { id: 'argus', label: 'Project ARGUS' },   // ⚠️ 它在菜单里由 `ArgusLabel` 渲染成"先乱码后显名"（Task 3）
 ]
+
+/**
+ * 主题生效的**唯一入口**（`applyTheme` 内部调它）：ARGUS 要带上它的颜色覆盖，别的主题要清干净。
+ *
+ * ⚠️ **为什么"切走时要清"不是可选项**：ARGUS 的颜色写在 `:root` 的**行内**自定义属性上，
+ * 而行内赢过**任何**选择器（包括 `[data-theme='material']`）⇒ 不清的话，材料的字色会被
+ * 上一次 ARGUS 的颜色残留顶掉（`data-theme` 明明是 material，屏幕上却是荧光绿）。
+ */
+function syncArgusColor(id: ThemeId): void {
+  if (id === 'argus') applyArgusColor(readArgusColor())
+  else clearArgusColor()
+}
 
 export const THEME_STORAGE_KEY = 'vigil.theme'
 
@@ -45,6 +60,11 @@ export function applyTheme(id: ThemeId): void {
   if (typeof document === 'undefined') return
   const root = document.documentElement
   root.setAttribute('data-theme', id)
+  // ⚠️ 照计划放在 `setAttribute` **之后**（顺序本身不是判据：行内变量赢过选择器是 CSS
+  // 层的事，与这两行的先后无关）。**真正 load-bearing 的是"每次 `applyTheme` 都必须调它"**
+  // ——ARGUS 的颜色是 `:root` 行内变量，没有这一步，切到 material 时上一条 ARGUS 的颜色
+  // 会继续压着材料的字色（`data-theme` 已是 material，屏幕上却是荧光绿）。
+  syncArgusColor(id)
   try {
     localStorage.setItem(THEME_STORAGE_KEY, id)
   } catch {

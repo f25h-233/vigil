@@ -351,6 +351,35 @@ const STRUCTURAL: Record<string, Record<string, string>> = {
     '--v-ripple-dur': '480ms', // T7 fix：= 2 × 240ms
     '--v-press-scale': '0.98',
   },
+  // ⭐ T8-1（Project ARGUS，第六套）：值是照 `index.css` 那张块**抄死**的，不写成"读 CSS 再比 CSS"。
+  // ⚠️ 这一套有两处**故意偏离**另外几套的形态，别当成抄错：
+  //   ① `--v-radius-full: 2px` —— 不是 9999px：终端没有药丸，四档圆角一律 2px；
+  //   ② `--v-ripple-dur: 0ms` —— **不守**"= 2 × --v-motion-dur"那条规律（那会算出 180ms），
+  //      因为这套主题的涟漪整个关掉了（`--v-ripple: transparent`），时长自然归零。
+  //      （粗野主义也是 0ms，但那里的 0ms 是"动效本来就 0"的副产品，两种理由不同。）
+  argus: {
+    '--v-radius-md': '2px',
+    '--v-radius-lg': '2px',
+    '--v-radius-xl': '2px',
+    '--v-radius-full': '2px',
+    '--v-shadow-card': '0 0 0 1px rgba(0, 255, 156, 0.18)', // 终端不投影，改用一圈细描边
+    '--v-header-blur': '0px',
+    '--v-panel-blur': '0px',
+    '--v-font-sans': "ui-monospace, 'Cascadia Mono', Consolas, 'Microsoft YaHei', monospace",
+    '--v-tracking': '0.02em',
+    '--v-wallpaper': 'none', // P4：终端不要美术资产（三件套都是"无"）
+    '--v-wallpaper-size': 'auto',
+    '--v-wallpaper-pos': 'center top',
+    // ⚠️ 这份值与 `argusColor.ts` 的 `deriveArgusVars()` 对同一个基色算出来的**逐位相同**
+    //（alpha 0.14）——不同的话，"没跑过 /color"与"/color 成同一个色"会长得不一样，
+    // 而这种差异**只有真浏览器里并排看**才看得出来（没有别的东西会红）。
+    '--v-surface-2': 'rgba(0, 255, 156, 0.14)',
+    '--v-motion-dur': '90ms', // 终端那一档：短 + 分步跳变
+    '--v-motion-ease': 'steps(2, end)',
+    '--v-ripple': 'transparent',
+    '--v-ripple-dur': '0ms', // 见上：这套不守 2× 规则
+    '--v-press-scale': '1',
+  },
 }
 
 /**

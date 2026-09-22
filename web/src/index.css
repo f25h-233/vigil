@@ -47,6 +47,9 @@
 /* ── ① 原始变量：默认主题（`:root` 与显式 `[data-theme='default']` 共用一块） ── */
 :root,
 [data-theme='default'] {
+  /* ⭐ T8-1：**只有 ARGUS 主题消费它**——其余五块这份是"名册占位"（`themeTokens.test.ts`
+     的 parity 逐名比六块的 token 集合，缺一块即红）。值 = 本套主题的强调色字面值。 */
+  --v-argus: #38bdf8;
   /* 页面与浮层底 */
   --v-bg: #0b0f14;
   --v-header: rgba(11, 15, 20, 0.9);
@@ -382,6 +385,8 @@ body::before {
      那么亮的黄）。底 `#fdfbff` → `#fef7ff`（surface 家族的中性紫调，更接近 M3 的
      surfaceContainerLowest）。
      ⚠️ 结构值（radius / shadow / blur / font / tracking）**一个字没动**——P1 只换色。 */
+  /* ⭐ T8-1：**只有 ARGUS 主题消费它**（其余五块这份是"名册占位"——parity 逐名比六块的 token 集合）。 */
+  --v-argus: #6750a4;
   --v-bg: #fef7ff;
   --v-header: rgba(254, 247, 255, 0.92);
   --v-page-image: none;
@@ -429,6 +434,8 @@ body::before {
 
 [data-theme='brutalism'] {
   /* 高对比 + 硬阴影 + 方角 + 等宽：选中态纯黄，按钮纯黑底白字 */
+  /* ⭐ T8-1：**只有 ARGUS 主题消费它**（其余五块这份是"名册占位"——parity 逐名比六块的 token 集合）。 */
+  --v-argus: #0a0a0a;
   --v-bg: #f2f0eb;
   --v-header: rgba(242, 240, 235, 0.96);
   --v-page-image: repeating-linear-gradient(0deg, rgba(0, 0, 0, 0.05) 0 1px, transparent 1px 24px),
@@ -506,6 +513,8 @@ body::before {
      免得换个工具链解析就变脸）。
      ⛔ 值里**不许出现 `;`**：`themeTokens.test.ts` 的取值助手按 `[^;]+` 截断，
      写 `data:image/svg+xml;utf8,` 或内联 `style="a:b;c:d"` 会让它读到半截（实测过）。 */
+  /* ⭐ T8-1：**只有 ARGUS 主题消费它**（其余五块这份是"名册占位"——parity 逐名比六块的 token 集合）。 */
+  --v-argus: #00e5ff;
   --v-bg: #0a0118;
   --v-header: rgba(10, 1, 24, 0.82);
   --v-page-image: repeating-linear-gradient(0deg, rgba(0, 229, 255, 0.16) 0 1px, transparent 1px 30px),
@@ -604,6 +613,8 @@ body::before {
         主题里最亮的一块"——**不是**。WCAG 相对亮度：亮橙 **0.524**、右下青绿圆的 stop
         `#22ff88` **0.736**。⇒ "最亮像素"这半个语境判错了，照它定出来的 alpha 自然
         不达标（实测见 ③ 那几条）。表里 glass 记的最亮像素是 `#22ff88`。 */
+  /* ⭐ T8-1：**只有 ARGUS 主题消费它**（其余五块这份是"名册占位"——parity 逐名比六块的 token 集合）。 */
+  --v-argus: #a5f3fc;
   --v-bg: #0b1020;
   --v-header: rgba(11, 16, 32, 0.62);
   --v-page-image: none;
@@ -674,6 +685,86 @@ body::before {
   --v-ripple: rgba(255, 255, 255, 0.25);
   --v-ripple-dur: 480ms; /* = 2 × 240ms */
   --v-press-scale: 0.98;
+}
+
+[data-theme='argus'] {
+  /* ═══ Project ARGUS（T8-1）：**终端**那一档 ═══
+     用户原话：「加上看起来像终端一样的主题（纯黑为底色…一定要大变样…但功能不能少）」。
+     这张块只负责**默认色**（荧光绿）；`/color` 改色时由 `src/argusColor.ts` 把全套
+     `--v-fg*` / `--v-surface*` / `--v-border*` / `--v-accent*` 算成字面 `rgba()` 写到
+     `:root` 的**行内**变量上（行内赢过本块 ⇒ 这才改得动主题）。
+
+     ⚠️ **为什么默认值也要在这块里给全**（而不是"反正会被行内覆盖"）：① `/color` 之前的
+     首帧、以及 `clearArgusColor()` 之后，屏幕上的字色就是这里这份；② `themePalette.test.ts`
+     的对比度判据**只读这张块**（它不跑 JS）⇒ 这里少给一个，判据就变成"验的是不存在的值"。
+
+     ⚠️ **token 集合与其余五块逐名相等**（parity 会逐字比）——包括下面那个 `--v-argus`
+     （六块都有，但**只有这一份被消费**）。 */
+  --v-argus: #00ff9c;
+  /* 纯黑底 + 几乎不透明的顶栏：**任何一点灰都会破坏"这是终端"**（用 `#000000` 而不是
+     "很深的灰"，是因为 `/color` 的亮度判据 `MIN_LUMINANCE` 就是**对纯黑底**反推的：
+     底一变，那个阈值与 `themePalette.test.ts` 的对比度数字就都不作数了）。 */
+  --v-bg: #000000;
+  --v-header: rgba(0, 0, 0, 0.92);
+  --v-page-image: none;
+  /* 壁纸三件套（P4 的固定层）：终端不要美术资产 ⇒ 三份都是"无"。 */
+  --v-wallpaper: none;
+  --v-wallpaper-size: auto;
+  --v-wallpaper-pos: center top;
+  /* 字色**就是**主题色（`/color` 覆盖的就是这一族）；四级仍靠降透明拉开层次。
+     ⚠️ 这里写死的四级值必须与 `deriveArgusVars()` 的 alpha 逐位一致
+     （0.78 / 0.58 / 0.38）——不一致的话，"没 /color 过"与"/color 成同一个色"会长得不一样。 */
+  --v-fg: #00ff9c;
+  --v-fg-2: rgba(0, 255, 156, 0.78);
+  --v-fg-3: rgba(0, 255, 156, 0.58);
+  --v-fg-4: rgba(0, 255, 156, 0.38);
+  /* 面：终端没有"卡片浮起来"这回事，面只是极淡的一层辉光（alpha 与派生表一致：0.06/0.14）。 */
+  --v-surface: rgba(0, 255, 156, 0.06);
+  --v-surface-2: rgba(0, 255, 156, 0.14);
+  /* ⚠️ 浮层**必须不透明**（菜单背后不许透出正文）——`#050b09` 是"黑里带一点绿"，
+     不是 `--v-bg` 的纯黑：菜单压在纯黑上时，靠这一点点色差才分得开。 */
+  --v-surface-solid: #050b09;
+  --v-inset: rgba(0, 255, 156, 0.03);
+  --v-border: rgba(0, 255, 156, 0.45);
+  --v-border-soft: rgba(0, 255, 156, 0.22);
+  --v-accent: #00ff9c;
+  --v-accent-soft: rgba(0, 255, 156, 0.18);
+  --v-accent-text: #00ff9c;
+  /* 危险 / 提醒：终端色板——`--v-danger` 就是 `ARGUS_NAMED.red` 的字面值，
+     于是"用 /color red"与"看错误提示"是同一个红。这张纯黑底上的对比度由
+     `themePalette.test.ts` 逐套跑（它遍历 `THEMES` ⇒ argus 自动在内）。 */
+  --v-danger: #ff5f56;
+  --v-danger-soft: rgba(255, 95, 86, 0.12);
+  --v-danger-btn: rgba(255, 95, 86, 0.18);
+  --v-danger-btn-active: rgba(255, 95, 86, 0.3);
+  --v-danger-text: #ffb3ae;
+  --v-warn: #ffbd2e;
+  --v-warn-soft: rgba(255, 189, 46, 0.12);
+  --v-warn-btn: rgba(255, 189, 46, 0.18);
+  --v-warn-text: #ffe0a3;
+  /* 结构：**四档全 2px**（终端里没有圆角这一说，但完全 0 会让焦点框糊在分界上）
+     ——`--v-radius-full` 尤其关键：不给就是字面量 2147483647px，药丸按钮会与其它方角打架。 */
+  --v-radius-md: 2px;
+  --v-radius-lg: 2px;
+  --v-radius-xl: 2px;
+  --v-radius-full: 2px;
+  /* 阴影改成"一圈细描边"：终端不投影，靠亮线分块（与 `--v-border` 同色系但更淡）。 */
+  --v-shadow-card: 0 0 0 1px rgba(0, 255, 156, 0.18);
+  --v-header-blur: 0px; /* 终端**不许**有毛玻璃：糊掉的字形与等宽字体天生不合 */
+  --v-panel-blur: 0px;
+  --v-font-sans: ui-monospace, 'Cascadia Mono', Consolas, 'Microsoft YaHei', monospace;
+  --v-tracking: 0.02em;
+  /* ⭐ T7 动效：终端那一档——**短 + 分步跳变**（`steps(2, end)` 是"光标式"的跳，
+     不是平滑过渡）。⚠️ `--v-motion-dur: 90ms` 与 `--v-ripple-dur: 0ms` 不是同一个数：
+     状态过渡要有、涟漪要没有（渲染层读到 `transparent` 涟漪本来就自关，
+     而 `0ms` 是第二道保险——命令式写的时长不归 CSS 管）。 */
+  --v-motion-dur: 90ms;
+  --v-motion-ease: steps(2, end);   /* 终端风：分步跳变，不是平滑过渡 */
+  --v-ripple: transparent;          /* 终端不要涟漪 */
+  --v-ripple-dur: 0ms;              /* ⚠️ 这套**不守**"= 2 × --v-motion-dur"那条规律（那会算出
+                                         180ms）：涟漪整套关掉了，时长自然归零（与粗野主义不同：
+                                         那一套是"0ms 的动效 + 0ms 的涟漪"，恰好同值） */
+  --v-press-scale: 1;
 }
 
 html {

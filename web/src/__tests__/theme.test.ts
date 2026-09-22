@@ -47,8 +47,11 @@ test('⚠️ 存了非法值 ⇒ 回落默认，不许把垃圾挂到 DOM 上', 
   expect(readTheme()).toBe('default')
 })
 
-test('isThemeId 认五套、拒其余', () => {
-  expect(THEMES).toHaveLength(5)
+test('isThemeId 认六套、拒其余', () => {
+  // ⭐ T8-1：5 → **6**（Project ARGUS）。这是**设计变更**，不是"把断言放宽到能过"——
+  // 数字本身没变松，多出来的那套在 `index.css` 有块、在 `index.html` 白名单里有名
+  //（下一条用例逐字比对两者）。
+  expect(THEMES).toHaveLength(6)
   for (const t of THEMES) expect(isThemeId(t.id)).toBe(true)
   expect(isThemeId('dark')).toBe(false)
   expect(isThemeId(null)).toBe(false)

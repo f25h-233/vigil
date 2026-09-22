@@ -34,11 +34,14 @@ function installFetch() {
   )
 }
 
-test('默认关闭；点 🎨 展开五套，当前那套被标为选中', async () => {
+test('默认关闭；点 🎨 展开六套，当前那套被标为选中', async () => {
   render(<ThemePicker value="material" onChange={() => {}} />)
   expect(screen.queryByRole('menu')).toBeNull()
   await userEvent.click(screen.getByRole('button', { name: '切换主题' }))
-  expect(screen.getAllByRole('menuitemradio')).toHaveLength(5)
+  // ⭐ T8-1：5 → **6**（Project ARGUS）。与 `theme.test.ts` 那条同性质：**设计变更**，
+  // 不是"把断言放宽到能过"——菜单项直接来自 `THEMES`，多一套就多一项，这条数字就是
+  // "菜单渲染了几项"的唯一判据（漏渲染某一套时它必红）。
+  expect(screen.getAllByRole('menuitemradio')).toHaveLength(6)
   // ⚠️ 本仓**没有** `@testing-library/jest-dom`（devDependencies 里没有、test-setup 也没引）
   // ⇒ `toHaveAttribute` 会以「Invalid Chai property」失败——那条失败与被测行为无关。
   // 按本仓既有写法（theme.test.ts:69/71/86）用 `getAttribute(...) + toBe(...)`，
