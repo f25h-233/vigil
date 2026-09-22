@@ -24,6 +24,20 @@
    默认色 = **荧光绿**（`/color white` 可换）。
 - **controller 替用户先定（可推翻）**：这块品牌区**只在 ARGUS 主题下出现**（其余五套仍是「🏮 VIGIL」）。
 
+## 0.2 ⚠️ 执行前必读：T7 那四个坑在本卷的**投影**（同一个作者，同一个毛病）
+
+T7 执行期实测：**我手写的测试替身/断言有 4 处与本仓真实契约不符**（计划 §2.9 勘误 EMA–EMD）。
+本卷的测试代码是**同一支笔**写的 ⇒ 先按这四条自查，别重蹈：
+
+| 坑 | 本卷会不会撞 | 处置 |
+|---|---|---|
+| `vi.spyOn(window, 'matchMedia')` ⇒ `can only spy on a function`（**jsdom@30.1.0 整个 lib 里 0 处**） | **不会**（本卷没有需要 matchMedia 的用例） | ⛔ 也别**引入**它 |
+| `.resolves.toBeUndefined()` 与实际兑现值不符（userEvent 的 `directApi.js:32` 兑现 System 实例） | 已在 T7 删掉 | 本卷断言"不抛"时用 `await`，别 `.resolves.toBe…` |
+| `closest<HTMLElement>` ⇒ `tsc -b` **直接失败**（TS2339 `.disabled`） | **不会**（本卷无 closest） | 类型窄化宁可显式写 `HTMLButtonElement` |
+| `{finished: Promise.resolve()}` 在微任务就兑现 ⇒ 断言"还没插就被移除" | **不会**（本卷不用 WAAPI） | 若将来用动画，替身必须**可控兑现** |
+| ⭐ **假定时器 + `userEvent` 会互相咬** | **会**（ArgusLabel 的乱码测试原本要用两者） | **已改**：把 `ms` 调小 + 真实计时器（见 Task 3 的测试） |
+| 命令式往 React 管的 DOM 里插节点（T7 的 span 被 `textContent` 快路径抹掉） | **不会**（本卷全是 React 渲染） | 若哪天要插：用**伪元素 + 自定义属性**，别插节点 |
+
 ## 0.1 ⭐ 一条技术判断：**颜色派生放在 JS 里，不放 CSS**
 
 `/color` 看起来最省事的写法是"只设一个基色变量，其余层级用 `color-mix()` 派生"。**不行**：
@@ -545,26 +559,30 @@ test('空行 Enter ⇒ 什么都不做（不报错、不写盘）', async () => 
 ```tsx
 import { act, render, screen } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
-import { afterEach, beforeEach, expect, test, vi } from 'vitest'
+import { expect, test, vi } from 'vitest'
 import ArgusLabel from '../components/ArgusLabel.tsx'
 
-beforeEach(() => vi.useFakeTimers())
-afterEach(() => vi.useRealTimers())
+/**
+ * ⚠️ **不用假定时器**（执行前必读，T7 的教训）：`vi.useFakeTimers()` 与 `userEvent` 是已知会互相咬的组合
+ * （userEvent 内部要推进计时器，默认配置下点击会卡住）。这里的做法是**把 `ms` 调小 + 用真实计时器**：
+ * 一样确定性、零配置陷阱。
+ * ⚠️ 另：jsdom 里**没有 `matchMedia`**（T7 grep 实证：jsdom@30.1.0 整个 lib 里 0 处）⇒ 别 `vi.spyOn(window, 'matchMedia')`
+ * （会报 `can only spy on a function`）；本组件也不需要它。
+ */
 
-test('挂载时**不是**真名（乱码），2.5 秒后显名', () => {
-  render(<ArgusLabel />)
+test('挂载时**不是**真名（乱码），到时后显名', async () => {
+  render(<ArgusLabel ms={60} />)
   expect(screen.queryByText('Project ARGUS')).toBeNull()
   const garbled = screen.getByTestId('argus-label').textContent ?? ''
   expect(garbled.length).toBe('Project ARGUS'.length) // 长度先对齐，避免布局跳
-  act(() => vi.advanceTimersByTime(2600))
-  expect(screen.getByText('Project ARGUS')).toBeTruthy()
+  expect(await screen.findByText('Project ARGUS', undefined, { timeout: 2000 })).toBeTruthy()
 })
 
 test('⭐ 乱码期间点一下 ⇒ 立即显名，而且**不冒泡**（不能顺手把主题选了）', async () => {
   const onParent = vi.fn()
   render(
     <div onClick={onParent}>
-      <ArgusLabel />
+      <ArgusLabel ms={10000} />   {/* 长到"不会自己揭晓"，于是这次揭晓只能来自点击 */}
     </div>,
   )
   await userEvent.click(screen.getByTestId('argus-label'))
@@ -572,12 +590,16 @@ test('⭐ 乱码期间点一下 ⇒ 立即显名，而且**不冒泡**（不能�
   expect(onParent).not.toHaveBeenCalled()
 })
 
-test('显名之后乱码定时器必须停（不许留着定时器）', () => {
-  render(<ArgusLabel />)
-  act(() => vi.advanceTimersByTime(2600))
-  expect(vi.getTimerCount()).toBe(0)
+test('揭晓之后**不再有定时器在跑**（不许留着）', async () => {
+  vi.spyOn(globalThis, 'clearInterval')
+  render(<ArgusLabel ms={60} />)
+  await screen.findByText('Project ARGUS', undefined, { timeout: 2000 })
+  expect(vi.mocked(globalThis.clearInterval).mock.calls.length).toBeGreaterThan(0)
+  vi.restoreAllMocks()
 })
 ```
+> 第三条把"定时器必须清"从"数 `vi.getTimerCount()`"（需要假定时器）换成"**观察 `clearInterval` 被调用**"——
+> 这样三条用例都在真实计时器下跑，判据仍指向同一件事（显名后不留定时器）。
 
 **2) 写 `ArgusLabel.tsx`**（全文见下），并把它接进 `ThemePicker` 的菜单项：
 ```tsx
