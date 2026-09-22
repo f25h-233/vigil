@@ -1,5 +1,7 @@
 import { useState } from 'react'
 import { undoLast } from './api.ts'
+import ThemePicker from './components/ThemePicker.tsx'
+import { applyTheme, readTheme, type ThemeId } from './theme.ts'
 import Categories from './views/Categories.tsx'
 import Digests from './views/Digests.tsx'
 import Feed from './views/Feed.tsx'
@@ -30,6 +32,15 @@ export default function App() {
   // 用户会以为撤销没生效，于是再点一次，把上一步也撤掉）。
   const [dataTick, setDataTick] = useState(0)
 
+  // 主题：值放在 App（应用级状态），ThemePicker 只是它的一个**视图**
+  // （两处各持一份就会出现「菜单说材质、页面是蒸汽波」）。
+  // ⚠️ `readTheme` 传的是**函数引用** ⇒ React 当惰性初始化用，挂载时读一次盘。
+  const [theme, setTheme] = useState<ThemeId>(readTheme)
+  function pickTheme(id: ThemeId) {
+    setTheme(id)
+    applyTheme(id) // 落盘 + 挂属性 + 同步 theme-color，一处做完
+  }
+
   async function undo() {
     setUndoMsg(null)
     try {
@@ -44,8 +55,12 @@ export default function App() {
 
   return (
     <div className="min-h-screen text-vigil-fg">
+      {/* ⚠️ 头部**两行**（品牌+动作 / tab）不是审美选择：375×667 下仪器实测
+          （计划 §0 E8）——单行时顶栏 77px、tab 被 flex 挤到 48px 宽、标签折成**两行**，
+          而**没有任何元素被裁**（右侧余 16px）⇒ 这不是「修溢出」，是「别把标签挤扁」；
+          再加一个 🎨 只会更扁。第二行留 `overflow-x-auto`：宁可横向滚，也别再压扁。 */}
       <header className="sticky top-0 z-10 border-b border-vigil-border bg-vigil-header backdrop-blur-vigil-header">
-        <div className="mx-auto flex max-w-3xl items-center gap-2 px-4 py-3">
+        <div className="mx-auto flex max-w-3xl items-center gap-1.5 px-4 pt-2">
           <span className="text-base font-semibold tracking-wide">🏮 VIGIL</span>
           {/* ⚠️ `ml-auto` 原来挂在 `nav` 上；撤销按钮插到它前面之后必须**挪过来**
               （同一行里只有一个 `ml-auto` 起作用，两个都在会变成两段式布局）。 */}
@@ -56,25 +71,26 @@ export default function App() {
             ↶ 撤销
           </button>
           {undoMsg !== null && (
-            <span className="text-xs text-vigil-fg-4">{undoMsg}</span>
+            <span className="max-w-[9rem] truncate text-xs text-vigil-fg-4">{undoMsg}</span>
           )}
-          <nav className="flex gap-1 text-sm">
-            {TABS.map((t) => (
-              <button
-                key={t.key}
-                onClick={() => setTab(t.key)}
-                className={
-                  'rounded-lg px-3 py-1.5 transition-colors ' +
-                  (tab === t.key
-                    ? 'bg-vigil-surface-2 text-vigil-fg'
-                    : 'text-vigil-fg-3 active:bg-vigil-surface')
-                }
-              >
-                {t.label}
-              </button>
-            ))}
-          </nav>
+          <ThemePicker value={theme} onChange={pickTheme} />
         </div>
+        <nav className="mx-auto flex max-w-3xl gap-1 overflow-x-auto px-4 pb-2 pt-1 text-sm">
+          {TABS.map((t) => (
+            <button
+              key={t.key}
+              onClick={() => setTab(t.key)}
+              className={
+                'shrink-0 rounded-lg px-3 py-1.5 transition-colors ' +
+                (tab === t.key
+                  ? 'bg-vigil-surface-2 text-vigil-fg'
+                  : 'text-vigil-fg-3 active:bg-vigil-surface')
+              }
+            >
+              {t.label}
+            </button>
+          ))}
+        </nav>
       </header>
 
       <main className="mx-auto max-w-3xl px-4 py-4 pb-24">
