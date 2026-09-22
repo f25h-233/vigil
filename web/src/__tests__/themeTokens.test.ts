@@ -274,7 +274,10 @@ const STRUCTURAL: Record<string, Record<string, string>> = {
     '--v-motion-dur': '180ms',
     '--v-motion-ease': 'cubic-bezier(0.2, 0, 0, 1)',
     '--v-ripple': 'rgba(103, 80, 164, 0.22)',
-    '--v-ripple-dur': '360ms', // T7 fix：伪元素涟漪的时长（= 2 × 180ms）
+    // T7 fix2：涟漪的时长（= 2 × 180ms）。⚠️ 它**不只是给 CSS 用的**——v3 机制下
+    // `RippleLayer.tsx` 把它读出来当 WAAPI 的 `duration`（载体已搬到 `document.body` 的图层上，
+    // 不再是 v2 那个 `button.vigil-rippling::after` 伪元素，注释里的"伪元素"二字随之作废）。
+    '--v-ripple-dur': '360ms',
     '--v-press-scale': '1',
   },
   brutalism: {
