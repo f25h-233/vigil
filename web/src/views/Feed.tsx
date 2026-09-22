@@ -259,7 +259,7 @@ export default function Feed({
         value={input}
         onChange={(e) => setInput(e.target.value)}
         placeholder="搜标题或详情（两个字也能搜）"
-        className="w-full rounded-xl bg-white/5 px-3 py-2.5 text-sm outline-none placeholder:text-white/30 focus:bg-white/10"
+        className="w-full rounded-xl bg-vigil-surface px-3 py-2.5 text-sm outline-none placeholder:text-vigil-fg-4 focus:bg-vigil-surface-2"
       />
 
       {/* 类目是**多选**：点一下切换，不是替换。选中的多个之间是并集。 */}
@@ -287,19 +287,19 @@ export default function Feed({
       <PersonPicker selected={persons} onChange={onPersons} />
 
       {/* 说清「这句话覆盖的是什么」：带上筛选条件，别让一个数字看起来像全部 */}
-      <p className="mt-3 text-xs text-white/40">{countLine}</p>
+      <p className="mt-3 text-xs text-vigil-fg-4">{countLine}</p>
 
       {/* ── 多选批量改（选中之后才出现）────────────────────────────────
           条数写在这儿而不是写成"几条被改了"：`selected` 可能包含**翻页前**
           选中的条目（这是刻意保留的），说清"已选几条"才对得上用户手里的事实。 */}
       {selected.size > 0 && (
-        <div className="mt-3 flex flex-wrap items-center gap-2 rounded-lg bg-white/5 p-2.5 text-xs">
-          <span className="text-white/60">已选 {selected.size} 条</span>
+        <div className="mt-3 flex flex-wrap items-center gap-2 rounded-lg bg-vigil-surface p-2.5 text-xs">
+          <span className="text-vigil-fg-2">已选 {selected.size} 条</span>
           <select
             value={bulkKind}
             onChange={(e) => setBulkKind(e.target.value)}
             aria-label="批量改成的类目"
-            className="rounded-lg bg-black/30 px-2 py-1 text-xs text-white/70 outline-none"
+            className="rounded-lg bg-vigil-inset px-2 py-1 text-xs text-vigil-fg-2 outline-none"
           >
             <option value="">— 改成哪个类目 —</option>
             {cats.map((c) => (
@@ -311,13 +311,13 @@ export default function Feed({
           <button
             onClick={applyBulk}
             disabled={bulkBusy || bulkKind === ''}
-            className="rounded-lg bg-sky-500/20 px-3 py-1 text-xs text-sky-200 disabled:opacity-40"
+            className="rounded-lg bg-vigil-accent-soft px-3 py-1 text-xs text-vigil-accent-text disabled:opacity-40"
           >
             改类目
           </button>
           <button
             onClick={() => setSelected(new Set())}
-            className="rounded-lg bg-white/5 px-2 py-1 text-xs text-white/55"
+            className="rounded-lg bg-vigil-surface px-2 py-1 text-xs text-vigil-fg-3"
           >
             清空选择
           </button>
@@ -329,26 +329,26 @@ export default function Feed({
           <button
             onClick={undoBulk}
             disabled={bulkBusy}
-            className="rounded-lg bg-white/5 px-3 py-1.5 text-white/60 disabled:opacity-40"
+            className="rounded-lg bg-vigil-surface px-3 py-1.5 text-vigil-fg-2 disabled:opacity-40"
           >
             ↶ 撤销这次批量改（{bulkCount} 条）
           </button>
           {/* ⚠️ 说清这个按钮的**范围**：它只拿着最近一批的键，再改一批就换掉了。 */}
-          <span className="text-white/40">
+          <span className="text-vigil-fg-4">
             它只认最近这一批；再改一批，这一批就撤不回来了。
           </span>
         </div>
       )}
-      {bulkMsg !== null && <p className="mt-2 text-xs text-white/60">{bulkMsg}</p>}
+      {bulkMsg !== null && <p className="mt-2 text-xs text-vigil-fg-2">{bulkMsg}</p>}
 
       {err !== null && (
-        <div className="mt-3 rounded-lg bg-red-500/10 p-3 text-sm text-red-400">
+        <div className="mt-3 rounded-lg bg-vigil-danger-soft p-3 text-sm text-vigil-danger">
           <p>读取失败：{err}</p>
           {/* 显式的恢复入口：首屏失败时列表为空，分页按钮不渲染，
               没有这个按钮用户就只能靠「切走再切回」这类隐性绕路 */}
           <button
             onClick={retry}
-            className="mt-2 rounded-lg bg-red-500/15 px-3 py-1.5 text-xs text-red-200 active:bg-red-500/25"
+            className="mt-2 rounded-lg bg-vigil-danger-btn px-3 py-1.5 text-xs text-vigil-danger-text active:bg-vigil-danger-btn-active"
           >
             重试
           </button>
@@ -359,7 +359,7 @@ export default function Feed({
         err === null &&
         shown !== null &&
         shown.items.length === 0 && (
-          <p className="mt-6 text-center text-sm text-white/40">
+          <p className="mt-6 text-center text-sm text-vigil-fg-4">
             {/* 空结果必须说清「搜索范围」，否则会被读成「库里就没有这件事」。
                 ⚠️ 多选之后不能只报一个类目名：说出来的范围必须与上面那句
                 计数行描述的是同一件事（类目 ∧ 人物 ∧ 关键词）。 */}
@@ -390,7 +390,7 @@ export default function Feed({
           <button
             onClick={loadMore}
             disabled={loading}
-            className="mt-4 w-full rounded-xl bg-white/5 py-2.5 text-sm text-white/70 active:bg-white/10 disabled:opacity-40"
+            className="mt-4 w-full rounded-xl bg-vigil-surface py-2.5 text-sm text-vigil-fg-2 active:bg-vigil-surface-2 disabled:opacity-40"
           >
             {loading
               ? '读取中…'
@@ -415,7 +415,7 @@ function Chip({
       onClick={onClick}
       className={
         'rounded-full px-3 py-1 text-xs whitespace-nowrap transition-colors ' +
-        (active ? 'bg-sky-500/20 text-sky-300' : 'bg-white/5 text-white/55')
+        (active ? 'bg-vigil-accent-soft text-vigil-accent-text' : 'bg-vigil-surface text-vigil-fg-3')
       }
     >
       {children}

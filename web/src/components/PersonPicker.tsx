@@ -82,22 +82,22 @@ export default function PersonPicker({
     <div className="mt-2">
       <button
         onClick={() => setOpen((v) => !v)}
-        className="rounded-full bg-white/5 px-3 py-1 text-xs text-white/55"
+        className="rounded-full bg-vigil-surface px-3 py-1 text-xs text-vigil-fg-3"
       >
         👤 按人物筛选
         {selected.length > 0 ? `（已选 ${selected.length}）` : ''}
       </button>
 
       {open && (
-        <div className="mt-2 rounded-xl bg-white/5 p-3">
+        <div className="mt-2 rounded-xl bg-vigil-surface p-3">
           {err !== null && (
-            <p className="mb-2 text-xs text-red-400">{err}</p>
+            <p className="mb-2 text-xs text-vigil-danger">{err}</p>
           )}
           {people === null && err === null && (
-            <p className="text-xs text-white/40">读取中…</p>
+            <p className="text-xs text-vigil-fg-4">读取中…</p>
           )}
           {people !== null && people.length === 0 && (
-            <p className="text-xs text-white/40">
+            <p className="text-xs text-vigil-fg-4">
               还没有监视任何人。在下面加一个 QQ 号。
             </p>
           )}
@@ -118,8 +118,8 @@ export default function PersonPicker({
                       className={
                         'rounded-l-full px-3 py-1 text-xs ' +
                         (on
-                          ? 'bg-sky-500/20 text-sky-300'
-                          : 'bg-white/5 text-white/55')
+                          ? 'bg-vigil-accent-soft text-vigil-accent-text'
+                          : 'bg-vigil-surface text-vigil-fg-3')
                       }
                     >
                       {p.label}（{p.count}）
@@ -128,7 +128,7 @@ export default function PersonPicker({
                       onClick={() => drop(p.uin)}
                       disabled={busy}
                       title={`不再监视 ${p.uin}`}
-                      className="rounded-r-full bg-white/5 px-2 py-1 text-xs text-white/35 active:bg-white/10"
+                      className="rounded-r-full bg-vigil-surface px-2 py-1 text-xs text-vigil-fg-4 active:bg-vigil-surface-2"
                     >
                       ×
                     </button>
@@ -144,18 +144,18 @@ export default function PersonPicker({
               onChange={(e) => setUin(e.target.value)}
               inputMode="numeric"
               placeholder="QQ 号"
-              className="w-28 rounded-lg bg-black/30 px-2 py-1 text-xs outline-none placeholder:text-white/30"
+              className="w-28 rounded-lg bg-vigil-inset px-2 py-1 text-xs outline-none placeholder:text-vigil-fg-4"
             />
             <input
               value={label}
               onChange={(e) => setLabel(e.target.value)}
               placeholder="名字（辅导员某辅导员）"
-              className="flex-1 rounded-lg bg-black/30 px-2 py-1 text-xs outline-none placeholder:text-white/30"
+              className="flex-1 rounded-lg bg-vigil-inset px-2 py-1 text-xs outline-none placeholder:text-vigil-fg-4"
             />
             <button
               onClick={add}
               disabled={busy}
-              className="rounded-lg bg-sky-500/20 px-3 py-1 text-xs text-sky-300 disabled:opacity-40"
+              className="rounded-lg bg-vigil-accent-soft px-3 py-1 text-xs text-vigil-accent-text disabled:opacity-40"
             >
               新增
             </button>

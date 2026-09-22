@@ -89,15 +89,9 @@
 
 /* ── ② 映射层 ── */
 @theme inline {
-  /* ⚠️ 偏差 1（见 task-1-report.md）：brief 的 Step 4 全文里**没有**这一行，
-     但今天 `App.tsx:46/47` 还在用 `bg-vigil-bg` 与 `bg-vigil-bg/90`，而这两处
-     不在 T1 的 Interfaces 里（不许改）⇒ 少了它，产物里 `.bg-vigil-bg\/90`
-     整条规则消失（实测：`grep 'bg-vigil-bg' dist/assets/*.css` 零命中），
-     粘性顶栏就**没有任何底色**了——与 T1 的「默认主题观感与今天逐像素相同」
-     直接冲突。T2 的 codemod 会把调用点换成 `bg-vigil-header`（值同为
-     rgba(11,15,20,0.9)）、并从 App 根 div 上摘掉 `bg-vigil-bg`，
-     **到那时再由 T2 删掉这一行**（计划 §Task 2 步骤 5 就是这么写的）。 */
-  --color-vigil-bg: var(--v-bg);
+  /* ⚠️ 这里**没有** `--color-vigil-bg`：T1 曾按偏差 1 补过一条，T2 已删——
+     它的两个用户（`bg-vigil-bg/90` 与 App 根 div 的 `bg-vigil-bg`）都没了。
+     `--v-bg` 保留：`body` 与 `theme.ts` 的 `theme-color` 同步还要用。 */
   --color-vigil-fg: var(--v-fg);
   --color-vigil-fg-2: var(--v-fg-2);
   --color-vigil-fg-3: var(--v-fg-3);

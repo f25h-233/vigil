@@ -32,7 +32,7 @@ export default function Settings() {
             onClick={() => setSection(s.key)}
             className={
               'rounded-full px-3 py-1 text-xs ' +
-              (section === s.key ? 'bg-sky-500/20 text-sky-300' : 'bg-white/5 text-white/55')
+              (section === s.key ? 'bg-vigil-accent-soft text-vigil-accent-text' : 'bg-vigil-surface text-vigil-fg-3')
             }
           >
             {s.label}
@@ -106,14 +106,14 @@ function GroupsSection() {
     }
   }
 
-  if (err !== null) return <p className="text-sm text-red-400">读取失败：{err}</p>
-  if (data === null) return <p className="text-sm text-white/40">读取中…</p>
+  if (err !== null) return <p className="text-sm text-vigil-danger">读取失败：{err}</p>
+  if (data === null) return <p className="text-sm text-vigil-fg-4">读取中…</p>
 
   // ⚠️ **没有快照时明说**，绝不画一张空表：空表会被读成
   // 「你的 QQ 库里一个群都没有」——一句假话（与后端 `available:false` 同一条判据）。
   if (!data.available) {
     return (
-      <div className="rounded-lg bg-amber-500/10 p-3 text-sm text-amber-200">
+      <div className="rounded-lg bg-vigil-warn-soft p-3 text-sm text-vigil-warn-text">
         <p>{data.reason}</p>
       </div>
     )
@@ -121,7 +121,7 @@ function GroupsSection() {
 
   return (
     <div>
-      <p className="text-xs text-white/40">
+      <p className="text-xs text-vigil-fg-4">
         清单来自 {new Date(data.generated_at! * 1000).toLocaleString('zh-CN')} 的快照
         （由 vigil export 生成）。刚加进 QQ 的群要等下次 export 才看得见。
       </p>
@@ -132,15 +132,15 @@ function GroupsSection() {
       </ul>
       <div className="mt-4 flex flex-wrap gap-2">
         <input value={id} onChange={(e) => setId(e.target.value)} placeholder="群号"
-               className="w-32 rounded-lg bg-white/5 px-2 py-1.5 text-sm" />
+               className="w-32 rounded-lg bg-vigil-surface px-2 py-1.5 text-sm" />
         <input value={name} onChange={(e) => setName(e.target.value)} placeholder="群名"
-               className="flex-1 rounded-lg bg-white/5 px-2 py-1.5 text-sm" />
+               className="flex-1 rounded-lg bg-vigil-surface px-2 py-1.5 text-sm" />
         <button onClick={submit} disabled={busy}
-                className="rounded-lg bg-sky-500/20 px-3 py-1.5 text-sm text-sky-200 disabled:opacity-40">
+                className="rounded-lg bg-vigil-accent-soft px-3 py-1.5 text-sm text-vigil-accent-text disabled:opacity-40">
           加入监视
         </button>
       </div>
-      {msg !== null && <p className="mt-2 text-xs text-white/60">{msg}</p>}
+      {msg !== null && <p className="mt-2 text-xs text-vigil-fg-2">{msg}</p>}
     </div>
   )
 }
@@ -171,20 +171,20 @@ function GroupRowView({ g, onChanged }: { g: GroupRow; onChanged: () => void }) 
   }
 
   return (
-    <li className="flex items-center gap-2 rounded-lg bg-white/5 px-3 py-2 text-sm">
+    <li className="flex items-center gap-2 rounded-lg bg-vigil-surface px-3 py-2 text-sm">
       <span className="flex-1 truncate">
-        {g.name || '(无名)'} <span className="text-white/40">{g.id}</span>
-        <span className="ml-2 text-xs text-white/40">{g.messages.toLocaleString()} 条</span>
+        {g.name || '(无名)'} <span className="text-vigil-fg-4">{g.id}</span>
+        <span className="ml-2 text-xs text-vigil-fg-4">{g.messages.toLocaleString()} 条</span>
       </span>
       {g.watched ? (
         <>
           <button disabled={busy}
                   onClick={() => act(() => api.patchGroup(g.id, { enabled: false }))}
-                  className="rounded px-2 py-1 text-xs text-white/50">
+                  className="rounded-md px-2 py-1 text-xs text-vigil-fg-3">
             停用
           </button>
           <button disabled={busy} onClick={() => act(() => api.removeGroup(g.id))}
-                  className="rounded px-2 py-1 text-xs text-red-300">
+                  className="rounded-md px-2 py-1 text-xs text-vigil-danger">
             移除
           </button>
         </>
@@ -193,16 +193,16 @@ function GroupRowView({ g, onChanged }: { g: GroupRow; onChanged: () => void }) 
         // 而多一个「移除」在这里会诱导用户对"我刚停用、还想留着"的群误点删除。
         <button disabled={busy}
                 onClick={() => act(() => api.patchGroup(g.id, { enabled: true }))}
-                className="rounded px-2 py-1 text-xs text-sky-300">
+                className="rounded-md px-2 py-1 text-xs text-vigil-accent-text">
           启用
         </button>
       ) : (
         <button disabled={busy} onClick={() => act(() => api.addGroup(g.id, g.name, 'normal'))}
-                className="rounded px-2 py-1 text-xs text-sky-300">
+                className="rounded-md px-2 py-1 text-xs text-vigil-accent-text">
           加入监视
         </button>
       )}
-      {err !== null && <span className="text-xs text-red-400">{err}</span>}
+      {err !== null && <span className="text-xs text-vigil-danger">{err}</span>}
     </li>
   )
 }
@@ -284,20 +284,20 @@ function PersonsSection() {
 
   return (
     <div>
-      {err !== null && <p className="mb-2 text-xs text-red-400">{err}</p>}
-      {people === null && err === null && <p className="text-sm text-white/40">读取中…</p>}
+      {err !== null && <p className="mb-2 text-xs text-vigil-danger">{err}</p>}
+      {people === null && err === null && <p className="text-sm text-vigil-fg-4">读取中…</p>}
       {people !== null && people.length === 0 && (
-        <p className="text-sm text-white/40">还没有监视任何人。在下面加一个 QQ 号。</p>
+        <p className="text-sm text-vigil-fg-4">还没有监视任何人。在下面加一个 QQ 号。</p>
       )}
       <ul className="space-y-1">
         {(people ?? []).map((p) => (
-          <li key={p.uin} className="flex items-center gap-2 rounded-lg bg-white/5 px-3 py-2 text-sm">
+          <li key={p.uin} className="flex items-center gap-2 rounded-lg bg-vigil-surface px-3 py-2 text-sm">
             <span className="flex-1 truncate">
-              {p.label} <span className="text-white/40">{p.uin}</span>
-              <span className="ml-2 text-xs text-white/40">{p.count} 条</span>
+              {p.label} <span className="text-vigil-fg-4">{p.uin}</span>
+              <span className="ml-2 text-xs text-vigil-fg-4">{p.count} 条</span>
             </span>
             <button disabled={busy} onClick={() => drop(p.uin)}
-                    className="rounded px-2 py-1 text-xs text-red-300">
+                    className="rounded-md px-2 py-1 text-xs text-vigil-danger">
               移除
             </button>
           </li>
@@ -306,16 +306,16 @@ function PersonsSection() {
       <div className="mt-4 flex flex-wrap gap-2">
         <input value={uin} onChange={(e) => setUin(e.target.value)} inputMode="numeric"
                placeholder="QQ 号"
-               className="w-32 rounded-lg bg-white/5 px-2 py-1.5 text-sm" />
+               className="w-32 rounded-lg bg-vigil-surface px-2 py-1.5 text-sm" />
         <input value={label} onChange={(e) => setLabel(e.target.value)}
                placeholder="名字（辅导员某辅导员）"
-               className="flex-1 rounded-lg bg-white/5 px-2 py-1.5 text-sm" />
+               className="flex-1 rounded-lg bg-vigil-surface px-2 py-1.5 text-sm" />
         <button onClick={add} disabled={busy}
-                className="rounded-lg bg-sky-500/20 px-3 py-1.5 text-sm text-sky-200 disabled:opacity-40">
+                className="rounded-lg bg-vigil-accent-soft px-3 py-1.5 text-sm text-vigil-accent-text disabled:opacity-40">
           新增
         </button>
       </div>
-      {msg !== null && <p className="mt-2 text-xs text-white/60">{msg}</p>}
+      {msg !== null && <p className="mt-2 text-xs text-vigil-fg-2">{msg}</p>}
     </div>
   )
 }
@@ -394,35 +394,35 @@ function LlmSection() {
   return (
     <div className="space-y-3">
       <label className="block">
-        <span className="text-xs text-white/55">端点（base_url）</span>
+        <span className="text-xs text-vigil-fg-3">端点（base_url）</span>
         <input value={baseUrl} onChange={(e) => setBaseUrl(e.target.value)}
                placeholder="https://api.siliconflow.cn/v1/chat/completions"
-               className="mt-1 w-full rounded-lg bg-white/5 px-2 py-1.5 text-sm" />
+               className="mt-1 w-full rounded-lg bg-vigil-surface px-2 py-1.5 text-sm" />
       </label>
       <label className="block">
-        <span className="text-xs text-white/55">模型</span>
+        <span className="text-xs text-vigil-fg-3">模型</span>
         <input value={model} onChange={(e) => setModel(e.target.value)}
                placeholder="Qwen/Qwen3.5-35B-A3B"
-               className="mt-1 w-full rounded-lg bg-white/5 px-2 py-1.5 text-sm" />
+               className="mt-1 w-full rounded-lg bg-vigil-surface px-2 py-1.5 text-sm" />
       </label>
       <label className="block">
-        <span className="text-xs text-white/55">enable_thinking</span>
+        <span className="text-xs text-vigil-fg-3">enable_thinking</span>
         <select value={thinking} onChange={(e) => setThinking(e.target.value as ThinkingChoice)}
-                className="mt-1 w-full rounded-lg bg-white/5 px-2 py-1.5 text-sm">
+                className="mt-1 w-full rounded-lg bg-vigil-surface px-2 py-1.5 text-sm">
           {THINKING_CHOICES.map((c) => (
             <option key={c.value} value={c.value}>{c.label}</option>
           ))}
         </select>
       </label>
-      <p className="text-xs text-white/40">
+      <p className="text-xs text-vigil-fg-4">
         ⚠️ 密钥不在这份配置里（它走仓库根的 <code>.env</code>），所以这里也没有它的输入框。
       </p>
       <button onClick={save} disabled={busy}
-              className="rounded-lg bg-sky-500/20 px-3 py-1.5 text-sm text-sky-200 disabled:opacity-40">
+              className="rounded-lg bg-vigil-accent-soft px-3 py-1.5 text-sm text-vigil-accent-text disabled:opacity-40">
         保存
       </button>
-      {err !== null && <p className="text-xs text-red-400">{err}</p>}
-      {msg !== null && <p className="text-xs text-white/60">{msg}</p>}
+      {err !== null && <p className="text-xs text-vigil-danger">{err}</p>}
+      {msg !== null && <p className="text-xs text-vigil-fg-2">{msg}</p>}
     </div>
   )
 }
@@ -503,17 +503,17 @@ function CategoriesSection() {
     <div>
       <ul className="space-y-1">
         {cats.map((c) => (
-          <li key={c.slug} className="flex items-center gap-2 rounded-lg bg-white/5 px-3 py-2 text-sm">
+          <li key={c.slug} className="flex items-center gap-2 rounded-lg bg-vigil-surface px-3 py-2 text-sm">
             <span>{c.icon} {c.label}</span>
-            <span className="text-xs text-white/40">{c.slug} · {c.count} 条</span>
-            <button className="ml-auto rounded px-2 py-1 text-xs text-white/50"
+            <span className="text-xs text-vigil-fg-4">{c.slug} · {c.count} 条</span>
+            <button className="ml-auto rounded-md px-2 py-1 text-xs text-vigil-fg-3"
                     onClick={() => {
                       setEditing(c.slug)
                       setEditDraft({ slug: c.slug, label: c.label, desc: c.desc, icon: c.icon })
                     }}>
               编辑
             </button>
-            <button className="rounded px-2 py-1 text-xs text-white/50"
+            <button className="rounded-md px-2 py-1 text-xs text-vigil-fg-3"
                     onClick={() => { setPending(c); setMigrateTo('') }}>
               删除
             </button>
@@ -522,61 +522,61 @@ function CategoriesSection() {
       </ul>
 
       {editing !== null && (
-        <div className="mt-3 rounded-lg bg-white/5 p-3">
-          <p className="text-xs text-white/55">
+        <div className="mt-3 rounded-lg bg-vigil-surface p-3">
+          <p className="text-xs text-vigil-fg-3">
             编辑「{editing}」——改 slug 等于改名：旧名字下的条目不改 id，
             从此按新名字显示（这条映射会留在下面的「改过名的类目」里）。
           </p>
           <div className="mt-2 grid gap-1.5">
             <input value={editDraft.icon} onChange={(e) => setEditDraft({ ...editDraft, icon: e.target.value })}
-                   placeholder="图标（emoji）" className="rounded-lg bg-black/30 px-2 py-1 text-xs" />
+                   placeholder="图标（emoji）" className="rounded-lg bg-vigil-inset px-2 py-1 text-xs" />
             <input value={editDraft.label} onChange={(e) => setEditDraft({ ...editDraft, label: e.target.value })}
-                   placeholder="中文名" className="rounded-lg bg-black/30 px-2 py-1 text-xs" />
+                   placeholder="中文名" className="rounded-lg bg-vigil-inset px-2 py-1 text-xs" />
             <input value={editDraft.slug} onChange={(e) => setEditDraft({ ...editDraft, slug: e.target.value })}
-                   placeholder="slug（英文/数字/-）" className="rounded-lg bg-black/30 px-2 py-1 text-xs" />
+                   placeholder="slug（英文/数字/-）" className="rounded-lg bg-vigil-inset px-2 py-1 text-xs" />
             <textarea value={editDraft.desc} onChange={(e) => setEditDraft({ ...editDraft, desc: e.target.value })}
                       rows={2} placeholder="判据（会逐字进 LLM 提示词）"
-                      className="rounded-lg bg-black/30 px-2 py-1 text-xs" />
+                      className="rounded-lg bg-vigil-inset px-2 py-1 text-xs" />
           </div>
           <div className="mt-2 flex gap-2">
             <button onClick={() => doEdit(editing)}
-                    className="rounded-lg bg-sky-500/20 px-3 py-1 text-xs text-sky-200">
+                    className="rounded-lg bg-vigil-accent-soft px-3 py-1 text-xs text-vigil-accent-text">
               保存
             </button>
             <button onClick={() => setEditing(null)}
-                    className="rounded-lg bg-white/5 px-3 py-1 text-xs text-white/60">
+                    className="rounded-lg bg-vigil-surface px-3 py-1 text-xs text-vigil-fg-2">
               取消
             </button>
           </div>
         </div>
       )}
 
-      <div className="mt-4 border-t border-white/10 pt-3">
-        <p className="text-xs text-white/55">新增类目</p>
+      <div className="mt-4 border-t border-vigil-border pt-3">
+        <p className="text-xs text-vigil-fg-3">新增类目</p>
         <div className="mt-1 flex flex-wrap gap-1.5">
           <input value={draft.icon} onChange={(e) => setDraft({ ...draft, icon: e.target.value })}
-                 placeholder="图标" className="w-16 rounded-lg bg-white/5 px-2 py-1 text-xs" />
+                 placeholder="图标" className="w-16 rounded-lg bg-vigil-surface px-2 py-1 text-xs" />
           <input value={draft.label} onChange={(e) => setDraft({ ...draft, label: e.target.value })}
-                 placeholder="中文名" className="w-28 rounded-lg bg-white/5 px-2 py-1 text-xs" />
+                 placeholder="中文名" className="w-28 rounded-lg bg-vigil-surface px-2 py-1 text-xs" />
           <input value={draft.slug} onChange={(e) => setDraft({ ...draft, slug: e.target.value })}
-                 placeholder="slug" className="w-28 rounded-lg bg-white/5 px-2 py-1 text-xs" />
+                 placeholder="slug" className="w-28 rounded-lg bg-vigil-surface px-2 py-1 text-xs" />
           <input value={draft.desc} onChange={(e) => setDraft({ ...draft, desc: e.target.value })}
                  placeholder="判据（会逐字进 LLM 提示词）"
-                 className="flex-1 rounded-lg bg-white/5 px-2 py-1 text-xs" />
+                 className="flex-1 rounded-lg bg-vigil-surface px-2 py-1 text-xs" />
           <button onClick={doAdd} disabled={!draft.slug.trim() || !draft.label.trim()}
-                  className="rounded-lg bg-sky-500/20 px-3 py-1 text-xs text-sky-200 disabled:opacity-40">
+                  className="rounded-lg bg-vigil-accent-soft px-3 py-1 text-xs text-vigil-accent-text disabled:opacity-40">
             新增
           </button>
         </div>
       </div>
 
       {pending !== null && (
-        <div className="mt-3 rounded-lg bg-amber-500/10 p-3 text-sm text-amber-100">
+        <div className="mt-3 rounded-lg bg-vigil-warn-soft p-3 text-sm text-vigil-warn-text">
           {pending.count > 0 ? (
             <>
               <p>⚠️ 「{pending.label}」还有 {pending.count} 条条目指着它。删之前必须选一个迁移目标——否则那些条目会指向一个不存在的类目。</p>
               <select value={migrateTo} onChange={(e) => setMigrateTo(e.target.value)}
-                      className="mt-2 rounded-lg bg-black/30 px-2 py-1 text-sm">
+                      className="mt-2 rounded-lg bg-vigil-inset px-2 py-1 text-sm">
                 <option value="">— 选一个 —</option>
                 {cats.filter((c) => c.slug !== pending.slug).map((c) => (
                   <option key={c.slug} value={c.slug}>{c.icon} {c.label}</option>
@@ -588,11 +588,11 @@ function CategoriesSection() {
           )}
           <div className="mt-2 flex gap-2">
             <button onClick={doDelete} disabled={pending.count > 0 && !migrateTo}
-                    className="rounded-lg bg-red-500/20 px-3 py-1 text-xs text-red-200 disabled:opacity-40">
+                    className="rounded-lg bg-vigil-danger-btn px-3 py-1 text-xs text-vigil-danger-text disabled:opacity-40">
               确认删除
             </button>
             <button onClick={() => setPending(null)}
-                    className="rounded-lg bg-white/5 px-3 py-1 text-xs text-white/60">
+                    className="rounded-lg bg-vigil-surface px-3 py-1 text-xs text-vigil-fg-2">
               取消
             </button>
           </div>
@@ -600,7 +600,7 @@ function CategoriesSection() {
       )}
 
       {Object.keys(aliases).length > 0 && (
-        <p className="mt-3 text-xs text-white/40">
+        <p className="mt-3 text-xs text-vigil-fg-4">
           改过名的类目：{Object.entries(aliases).map(([o, n]) => `${o} → ${n}`).join('、')}
         </p>
       )}
@@ -637,11 +637,11 @@ function CategoriesSection() {
             })
             .catch((e) => setMsg(e instanceof Error ? e.message : String(e)))
         }
-        className="mt-3 rounded-lg bg-white/5 px-3 py-1.5 text-xs text-white/60"
+        className="mt-3 rounded-lg bg-vigil-surface px-3 py-1.5 text-xs text-vigil-fg-2"
       >
         ↶ 撤销上一次类目改动
       </button>
-      {msg !== null && <p className="mt-2 text-xs text-white/60">{msg}</p>}
+      {msg !== null && <p className="mt-2 text-xs text-vigil-fg-2">{msg}</p>}
     </div>
   )
 }
@@ -812,7 +812,7 @@ function ReorderSection() {
 
   return (
     <div className="space-y-3">
-      <p className="text-xs text-white/40">
+      <p className="text-xs text-vigil-fg-4">
         重排 = 让 LLM 按当前类目定义重判已有条目。它只写 overlay，条目的{' '}
         <code>item_id</code> 前后不变（D16），所以一整批改错了可以一次退回。
       </p>
@@ -821,14 +821,14 @@ function ReorderSection() {
         <button
           onClick={start}
           disabled={busy}
-          className="rounded-lg bg-sky-500/20 px-3 py-1.5 text-sm text-sky-200 disabled:opacity-40"
+          className="rounded-lg bg-vigil-accent-soft px-3 py-1.5 text-sm text-vigil-accent-text disabled:opacity-40"
         >
           开始重排
         </button>
         {job !== null && job.state === 'running' && (
           <button
             onClick={cancel}
-            className="rounded-lg bg-white/5 px-3 py-1.5 text-sm text-white/60"
+            className="rounded-lg bg-vigil-surface px-3 py-1.5 text-sm text-vigil-fg-2"
           >
             取消重排
           </button>
@@ -836,7 +836,7 @@ function ReorderSection() {
         {job !== null && job.state !== 'running' && job.actor !== '' && undoable && (
           <button
             onClick={undo}
-            className="rounded-lg bg-white/5 px-3 py-1.5 text-sm text-white/60"
+            className="rounded-lg bg-vigil-surface px-3 py-1.5 text-sm text-vigil-fg-2"
           >
             ↶ 撤销这次重排
           </button>
@@ -844,7 +844,7 @@ function ReorderSection() {
         {job !== null && job.state !== 'running' && (
           <button
             onClick={clear}
-            className="rounded-lg bg-white/5 px-3 py-1.5 text-sm text-white/40"
+            className="rounded-lg bg-vigil-surface px-3 py-1.5 text-sm text-vigil-fg-4"
           >
             清除
           </button>
@@ -852,8 +852,8 @@ function ReorderSection() {
       </div>
 
       {job !== null && (
-        <div className="rounded-lg bg-white/5 p-3">
-          <p className="text-xs text-white/55">
+        <div className="rounded-lg bg-vigil-surface p-3">
+          <p className="text-xs text-vigil-fg-3">
             任务 {job.job_id} · {JOB_STATE_LABEL[job.state]}
             {/* ⚠️ `done` 是「**最后一条成功批次**的序号」，不是"已完成批次数"
                 （后端 docstring 原话）。照实显示，**别自己加一**——那会变成
@@ -864,16 +864,16 @@ function ReorderSection() {
                 : ' · 等待第一批进度…')}
           </p>
           {job.message !== '' && (
-            <p className="mt-1 text-xs text-white/70">{job.message}</p>
+            <p className="mt-1 text-xs text-vigil-fg-2">{job.message}</p>
           )}
           {job.error !== '' && (
-            <p className="mt-1 text-xs text-red-400">{job.error}</p>
+            <p className="mt-1 text-xs text-vigil-danger">{job.error}</p>
           )}
         </div>
       )}
 
-      {err !== null && <p className="text-xs text-red-400">{err}</p>}
-      {msg !== null && <p className="text-xs text-white/60">{msg}</p>}
+      {err !== null && <p className="text-xs text-vigil-danger">{err}</p>}
+      {msg !== null && <p className="text-xs text-vigil-fg-2">{msg}</p>}
     </div>
   )
 }
@@ -961,60 +961,60 @@ function PackSection() {
   return (
     <div className="space-y-4">
       <div>
-        <p className="text-xs text-white/55">
+        <p className="text-xs text-vigil-fg-3">
           导出（不含密钥——密钥走 <code>.env</code>，不在这三份配置里）
         </p>
         <textarea readOnly value={toml ?? ''} rows={10}
-                  className="mt-1 w-full rounded-lg bg-black/30 p-2 font-mono text-xs text-white/70" />
+                  className="mt-1 w-full rounded-lg bg-vigil-inset p-2 font-mono text-xs text-vigil-fg-2" />
         <div className="mt-2 flex gap-2">
           <button onClick={refresh}
-                  className="rounded-lg bg-white/5 px-3 py-1.5 text-xs text-white/60">
+                  className="rounded-lg bg-vigil-surface px-3 py-1.5 text-xs text-vigil-fg-2">
             重新生成
           </button>
           <button onClick={download} disabled={toml === null}
-                  className="rounded-lg bg-sky-500/20 px-3 py-1.5 text-xs text-sky-200 disabled:opacity-40">
+                  className="rounded-lg bg-vigil-accent-soft px-3 py-1.5 text-xs text-vigil-accent-text disabled:opacity-40">
             下载 .toml
           </button>
         </div>
       </div>
 
-      <div className="border-t border-white/10 pt-3">
-        <p className="text-xs text-white/55">导入</p>
+      <div className="border-t border-vigil-border pt-3">
+        <p className="text-xs text-vigil-fg-3">导入</p>
         {/* ⚠️ `aria-label` 不是装饰：`<input type="file">` **没有隐式 ARIA role**，
             没有它就只能靠 `querySelector('input[type=file]')` 去抓——那种抓法
             在用例里长得像"内部实现细节"，也让屏幕阅读器只能念出一句"按钮"。 */}
         <input type="file" accept=".toml,text/plain" aria-label="选择配置包文件"
                onChange={(e) => { const f = e.target.files?.[0]; if (f) readFile(f) }}
-               className="mt-1 block w-full text-xs text-white/60" />
+               className="mt-1 block w-full text-xs text-vigil-fg-2" />
         <textarea value={importText} onChange={(e) => setImportText(e.target.value)} rows={8}
                   placeholder="选一个 .toml，或直接把它粘在这里"
-                  className="mt-2 w-full rounded-lg bg-black/30 p-2 font-mono text-xs text-white/70" />
-        <label className="mt-2 flex items-center gap-2 text-xs text-white/60">
+                  className="mt-2 w-full rounded-lg bg-vigil-inset p-2 font-mono text-xs text-vigil-fg-2" />
+        <label className="mt-2 flex items-center gap-2 text-xs text-vigil-fg-2">
           <input type="checkbox" checked={keepSettings}
                  onChange={(e) => setKeepSettings(e.target.checked)} />
           保留本机路径（[settings] 用本机这份，不采用包里的）
         </label>
         <div className="mt-2 flex gap-2">
           <button onClick={() => run(false)} disabled={busy || !importText.trim()}
-                  className="rounded-lg bg-white/5 px-3 py-1.5 text-xs text-white/60 disabled:opacity-40">
+                  className="rounded-lg bg-vigil-surface px-3 py-1.5 text-xs text-vigil-fg-2 disabled:opacity-40">
             先校验不写入
           </button>
           <button onClick={() => run(true)} disabled={busy || !importText.trim()}
-                  className="rounded-lg bg-amber-500/20 px-3 py-1.5 text-xs text-amber-200 disabled:opacity-40">
+                  className="rounded-lg bg-vigil-warn-btn px-3 py-1.5 text-xs text-vigil-warn-text disabled:opacity-40">
             导入并覆盖本机配置
           </button>
         </div>
       </div>
 
-      {err !== null && <p className="text-xs text-red-400">{err}</p>}
-      {msg !== null && <p className="text-xs text-white/60">{msg}</p>}
+      {err !== null && <p className="text-xs text-vigil-danger">{err}</p>}
+      {msg !== null && <p className="text-xs text-vigil-fg-2">{msg}</p>}
       {notes.length > 0 && (
-        <ul className="space-y-1 text-xs text-white/60">
+        <ul className="space-y-1 text-xs text-vigil-fg-2">
           {notes.map((n, i) => <li key={i}>· {n}</li>)}
         </ul>
       )}
       {warnings.length > 0 && (
-        <ul className="space-y-1 text-xs text-amber-200">
+        <ul className="space-y-1 text-xs text-vigil-warn-text">
           {warnings.map((w, i) => <li key={i}>⚠️ {w}</li>)}
         </ul>
       )}

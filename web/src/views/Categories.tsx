@@ -41,7 +41,7 @@ export default function Categories({
   return (
     <div>
       {err !== null && (
-        <div className="mb-3 rounded-lg bg-red-500/10 p-3 text-sm text-red-400">
+        <div className="mb-3 rounded-lg bg-vigil-danger-soft p-3 text-sm text-vigil-danger">
           <p>类目读取失败：{err}</p>
           {/* 显式的恢复入口：没有这个按钮，用户就只能靠「切走再切回」这类
               隐性绕路（App.tsx 是条件渲染，切 tab 会卸载重挂本组件）。
@@ -49,7 +49,7 @@ export default function Categories({
               「接口没有返回任何类目」这类没有依据的话。 */}
           <button
             onClick={() => setReloadTick((t) => t + 1)}
-            className="mt-2 rounded-lg bg-red-500/15 px-3 py-1.5 text-xs text-red-200 active:bg-red-500/25"
+            className="mt-2 rounded-lg bg-vigil-danger-btn px-3 py-1.5 text-xs text-vigil-danger-text active:bg-vigil-danger-btn-active"
           >
             重试
           </button>
@@ -58,17 +58,17 @@ export default function Categories({
 
       {cats === null ? (
         // 失败时横幅已经解释了原因，这里不再说「读取中」——那会是一句谎话
-        err === null && <p className="text-sm text-white/40">读取类目…</p>
+        err === null && <p className="text-sm text-vigil-fg-4">读取类目…</p>
       ) : cats.length === 0 ? (
         // 说的是「接口这次给了什么」，不是「世界上没有类目」——后者我们无从知道
-        <p className="text-sm text-white/40">接口没有返回任何类目。</p>
+        <p className="text-sm text-vigil-fg-4">接口没有返回任何类目。</p>
       ) : (
         <>
           {/* 数字**由实际数据推导**，不写死：配置文件主动教用户加类目，
               加完第八个，上一版的「七个类目」当场变成假话——而正确数字
               就在手边的 cats 里。走到这里 cats.length >= 1 恒成立
               （空列表与 null 两个分支在上面） */}
-          <p className="mb-3 text-xs text-white/40">
+          <p className="mb-3 text-xs text-vigil-fg-4">
             {cats.length} 个类目 · 点一个看该类全部条目
           </p>
           <div className="grid grid-cols-2 gap-3">
@@ -76,11 +76,11 @@ export default function Categories({
               <button
                 key={c.slug}
                 onClick={() => onPick(c.slug)}
-                className="rounded-xl bg-white/5 p-4 text-left transition-colors active:bg-white/10"
+                className="rounded-xl bg-vigil-surface p-4 text-left transition-colors active:bg-vigil-surface-2"
               >
                 <div className="text-2xl">{c.icon}</div>
                 <div className="mt-1 font-medium">{c.label}</div>
-                <div className="text-xs text-white/45">{c.count} 条</div>
+                <div className="text-xs text-vigil-fg-3">{c.count} 条</div>
               </button>
             ))}
           </div>

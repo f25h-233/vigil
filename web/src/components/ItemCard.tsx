@@ -97,7 +97,7 @@ export default function ItemCard({
   }
 
   return (
-    <li className="rounded-xl bg-white/5 p-3">
+    <li className="rounded-xl bg-vigil-surface p-3">
       <div className="flex items-start gap-2">
         {/* ⚠️ 多选框**必须在外层 button 之外**：HTML 不允许 `<button>` 里嵌交互
             元素（`<input>` 也是），浏览器会把内层踢出来、点击行为变得不可预测
@@ -113,13 +113,13 @@ export default function ItemCard({
           />
         )}
         <button onClick={toggle} className="w-full min-w-0 flex-1 text-left">
-          <div className="flex flex-wrap items-center gap-x-2 text-xs text-sky-400">
+          <div className="flex flex-wrap items-center gap-x-2 text-xs text-vigil-accent">
             <span>
               {item.kind_icon} {item.kind_label}
             </span>
-            <span className="text-white/30">·</span>
-            <span className="text-white/45">{item.group_name}</span>
-            <span className="ml-auto text-white/40">
+            <span className="text-vigil-fg-4">·</span>
+            <span className="text-vigil-fg-3">{item.group_name}</span>
+            <span className="ml-auto text-vigil-fg-4">
               {relTime(item.event_ts)}
             </span>
           </div>
@@ -128,13 +128,13 @@ export default function ItemCard({
             {item.title}
           </p>
           {item.detail !== null && item.detail !== '' && (
-            <p className="mt-1 text-sm text-white/70">{item.detail}</p>
+            <p className="mt-1 text-sm text-vigil-fg-2">{item.detail}</p>
           )}
 
-          <div className="mt-2 flex flex-wrap gap-x-3 gap-y-1 text-xs text-white/50">
+          <div className="mt-2 flex flex-wrap gap-x-3 gap-y-1 text-xs text-vigil-fg-3">
             {/* 截止日只在数据层核验通过时才有值（NULL = 源文里找不到依据）*/}
             {item.deadline_ts !== null && (
-              <span className="text-amber-400">
+              <span className="text-vigil-warn">
                 ⏰ {fmtDate(item.deadline_ts)} 截止
               </span>
             )}
@@ -159,12 +159,12 @@ export default function ItemCard({
       {/* ⚠️ 操作条在**外层 button 之外**：`<button>` 里不能再放 `<select>`/`<button>`
           （HTML 不允许嵌套交互元素），浏览器会把内层踢出去、点击行为变得不可预测。 */}
       {onMutated && (
-        <div className="mt-2 flex flex-wrap items-center gap-2 border-t border-white/5 pt-2 text-xs">
+        <div className="mt-2 flex flex-wrap items-center gap-2 border-t border-vigil-border-soft pt-2 text-xs">
           <select
             value={item.kind}
             disabled={busy}
             onChange={(e) => changeKind(e.target.value)}
-            className="rounded-lg bg-black/30 px-2 py-1 text-xs text-white/70 outline-none"
+            className="rounded-lg bg-vigil-inset px-2 py-1 text-xs text-vigil-fg-2 outline-none"
           >
             {cats.map((c) => (
               <option key={c.slug} value={c.slug}>
@@ -175,16 +175,16 @@ export default function ItemCard({
           <button
             onClick={remove}
             disabled={busy}
-            className="rounded-lg bg-red-500/10 px-2 py-1 text-red-300 disabled:opacity-40"
+            className="rounded-lg bg-vigil-danger-soft px-2 py-1 text-vigil-danger disabled:opacity-40"
           >
             删除
           </button>
-          {actErr !== null && <span className="text-red-400">{actErr}</span>}
+          {actErr !== null && <span className="text-vigil-danger">{actErr}</span>}
         </div>
       )}
 
       {open && (
-        <div className="mt-3 border-t border-white/10 pt-3">
+        <div className="mt-3 border-t border-vigil-border pt-3">
           {item.links.length > 0 && (
             <div className="mb-2 flex flex-col gap-1 text-xs">
               {item.links.map((l) => (
@@ -193,7 +193,7 @@ export default function ItemCard({
                   href={l}
                   target="_blank"
                   rel="noreferrer"
-                  className="break-all text-sky-400 underline"
+                  className="break-all text-vigil-accent underline"
                 >
                   {l}
                 </a>
@@ -201,7 +201,7 @@ export default function ItemCard({
             </div>
           )}
           {err !== null && (
-            <div className="rounded-lg bg-red-500/10 p-3 text-xs text-red-400">
+            <div className="rounded-lg bg-vigil-danger-soft p-3 text-xs text-vigil-danger">
               <p>源消息读取失败：{err}</p>
               {/* 显式的恢复入口：没有这个按钮，用户就只能靠「收起再展开」
                   这类隐性绕路——而那条路以前也是死的（守卫含 err === null）。
@@ -209,7 +209,7 @@ export default function ItemCard({
                   「读取源消息…」，然后停在没读到也没说为什么的状态。 */}
               <button
                 onClick={load}
-                className="mt-2 rounded-lg bg-red-500/15 px-3 py-1.5 text-xs text-red-200 active:bg-red-500/25"
+                className="mt-2 rounded-lg bg-vigil-danger-btn px-3 py-1.5 text-xs text-vigil-danger-text active:bg-vigil-danger-btn-active"
               >
                 重试
               </button>
@@ -217,7 +217,7 @@ export default function ItemCard({
           )}
           {/* 三态各说各的话：读取中 / 失败（上面那条横幅）/ 读到了。
               加载态必须显式——否则重试期间这里是一片空白 */}
-          {loading && <p className="text-xs text-white/40">读取源消息…</p>}
+          {loading && <p className="text-xs text-vigil-fg-4">读取源消息…</p>}
           {sources !== null && <SourceList sources={sources} />}
         </div>
       )}

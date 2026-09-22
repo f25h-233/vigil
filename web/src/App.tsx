@@ -43,20 +43,20 @@ export default function App() {
   }
 
   return (
-    <div className="min-h-screen bg-vigil-bg text-vigil-fg">
-      <header className="sticky top-0 z-10 border-b border-white/10 bg-vigil-bg/90 backdrop-blur">
+    <div className="min-h-screen text-vigil-fg">
+      <header className="sticky top-0 z-10 border-b border-vigil-border bg-vigil-header backdrop-blur-vigil-header">
         <div className="mx-auto flex max-w-3xl items-center gap-2 px-4 py-3">
           <span className="text-base font-semibold tracking-wide">🏮 VIGIL</span>
           {/* ⚠️ `ml-auto` 原来挂在 `nav` 上；撤销按钮插到它前面之后必须**挪过来**
               （同一行里只有一个 `ml-auto` 起作用，两个都在会变成两段式布局）。 */}
           <button
             onClick={undo}
-            className="ml-auto rounded-lg px-2 py-1 text-xs text-white/55 active:bg-white/5"
+            className="ml-auto rounded-lg px-2 py-1 text-xs text-vigil-fg-3 active:bg-vigil-surface"
           >
             ↶ 撤销
           </button>
           {undoMsg !== null && (
-            <span className="text-xs text-white/40">{undoMsg}</span>
+            <span className="text-xs text-vigil-fg-4">{undoMsg}</span>
           )}
           <nav className="flex gap-1 text-sm">
             {TABS.map((t) => (
@@ -66,8 +66,8 @@ export default function App() {
                 className={
                   'rounded-lg px-3 py-1.5 transition-colors ' +
                   (tab === t.key
-                    ? 'bg-white/10 text-white'
-                    : 'text-white/55 active:bg-white/5')
+                    ? 'bg-vigil-surface-2 text-vigil-fg'
+                    : 'text-vigil-fg-3 active:bg-vigil-surface')
                 }
               >
                 {t.label}

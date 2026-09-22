@@ -78,12 +78,12 @@ export default function Digests() {
       <div>
         <button
           onClick={() => setOpened(null)}
-          className="mb-3 text-sm text-sky-400 active:opacity-70"
+          className="mb-3 text-sm text-vigil-accent active:opacity-70"
         >
           ‹ 返回日报列表
         </button>
 
-        <article className="rounded-xl bg-white/5 p-4">
+        <article className="rounded-xl bg-vigil-surface p-4">
           {/* 这一天由数据层给出，是页面唯一的标题 */}
           <h1 className="text-lg font-semibold">{cur.day} 日报</h1>
           <div className="mt-3">
@@ -99,12 +99,12 @@ export default function Digests() {
                 // 所以这里按「不重复」处理：这行头部不渲染，标题以数据层的 cur.day 为准。
                 h1: () => null,
                 h2: ({ children }) => (
-                  <h2 className="mt-4 mb-2 text-base font-semibold text-white/90">
+                  <h2 className="mt-4 mb-2 text-base font-semibold text-vigil-fg">
                     {children}
                   </h2>
                 ),
                 h3: ({ children }) => (
-                  <h3 className="mt-3 mb-1 text-sm font-semibold text-white/80">
+                  <h3 className="mt-3 mb-1 text-sm font-semibold text-vigil-fg">
                     {children}
                   </h3>
                 ),
@@ -117,17 +117,17 @@ export default function Digests() {
                   </ul>
                 ),
                 li: ({ children }) => (
-                  <li className="text-sm leading-relaxed text-white/75">
+                  <li className="text-sm leading-relaxed text-vigil-fg">
                     {children}
                   </li>
                 ),
                 p: ({ children }) => (
-                  <p className="my-1.5 text-sm leading-relaxed text-white/75">
+                  <p className="my-1.5 text-sm leading-relaxed text-vigil-fg">
                     {children}
                   </p>
                 ),
                 strong: ({ children }) => (
-                  <strong className="font-semibold text-white/95">
+                  <strong className="font-semibold text-vigil-fg">
                     {children}
                   </strong>
                 ),
@@ -136,7 +136,7 @@ export default function Digests() {
                     href={href}
                     target="_blank"
                     rel="noreferrer"
-                    className="break-all text-sky-400 underline"
+                    className="break-all text-vigil-accent underline"
                   >
                     {children}
                   </a>
@@ -150,7 +150,7 @@ export default function Digests() {
 
         {cur.items.length > 0 && (
           <>
-            <p className="mt-5 mb-2 text-xs text-white/40">
+            <p className="mt-5 mb-2 text-xs text-vigil-fg-4">
               这篇日报引用的 {cur.items.length} 条条目（点开可看源消息）
             </p>
             <ul className="space-y-2">
@@ -170,11 +170,11 @@ export default function Digests() {
           用户已经读到的列表从屏幕上抹掉（抹掉了就再也渲染不出列表按钮，
           err 也就永远清不掉了）。 */}
       {err !== null && (
-        <div className="mb-3 rounded-lg bg-red-500/10 p-3 text-sm text-red-400">
+        <div className="mb-3 rounded-lg bg-vigil-danger-soft p-3 text-sm text-vigil-danger">
           <p>日报读取失败：{err}</p>
           <button
             onClick={retry}
-            className="mt-2 rounded-lg bg-red-500/15 px-3 py-1.5 text-xs text-red-200 active:bg-red-500/25"
+            className="mt-2 rounded-lg bg-vigil-danger-btn px-3 py-1.5 text-xs text-vigil-danger-text active:bg-vigil-danger-btn-active"
           >
             重试
           </button>
@@ -183,10 +183,10 @@ export default function Digests() {
 
       {list === null ? (
         // 失败时横幅已经说了原因，这里不再说「读取中」——那会是一句谎话
-        err === null && <p className="text-sm text-white/40">读取日报列表…</p>
+        err === null && <p className="text-sm text-vigil-fg-4">读取日报列表…</p>
       ) : list.length === 0 ? (
-        <p className="text-center text-sm text-white/40">
-          还没有日报。生成：<code className="text-white/60">vigil digest</code>
+        <p className="text-center text-sm text-vigil-fg-4">
+          还没有日报。生成：<code className="text-vigil-fg-2">vigil digest</code>
         </p>
       ) : (
         <ul className="space-y-2">
@@ -194,10 +194,10 @@ export default function Digests() {
             <li key={d.digest_id}>
               <button
                 onClick={() => open(d.digest_id)}
-                className="w-full rounded-xl bg-white/5 p-4 text-left transition-colors active:bg-white/10"
+                className="w-full rounded-xl bg-vigil-surface p-4 text-left transition-colors active:bg-vigil-surface-2"
               >
                 <div className="font-medium">{d.day}</div>
-                <div className="mt-0.5 text-xs text-white/45">
+                <div className="mt-0.5 text-xs text-vigil-fg-3">
                   {d.item_count} 条条目
                   {/* 列表留在原地，就得有「点击生效了」的痕迹，否则用户会
                       以为没点动（与 Feed 计数行的「读取中…」同一个理由）。
