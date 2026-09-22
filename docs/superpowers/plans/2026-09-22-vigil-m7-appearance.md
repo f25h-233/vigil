@@ -136,6 +136,26 @@ T1 执行期实测（报告 §4 发现 B）：`'AaBbGg123 !@#'` 的宽度指纹 
 T1 自己写的目标是「默认主题与今天**逐像素相同**」，字体栈是唯一残留差异。
 ⇒ **另外四套主题不受此限**（它们本来就该长得不一样；T3 的 `system-ui` / `Roboto` / 等宽栈照旧）。
 
+### E11 ⭐ 档位合并的**完整清单**——计划正文只声明了白系，另三族**也塌缩了**
+
+T2 的映射表把 35 个裸类名收成 23 个 token，**每一族都有"多档 → 少档"的合并**。
+计划正文只写了「白系 13 档 → 4 档」，reviewer 实测**另三族同样塌缩**（共 11 个调用点，它判为 Important：
+不是映射错，而是**"观感不变"这句承诺留了未批准的缺口**）：
+
+| 原类 | 去处 | 实际落到 | 调用点 |
+|---|---|---|---|
+| `text-sky-300` | `text-vigil-accent-text` | = sky-200（`#bae6fd`） | 6 |
+| `text-red-300` | `text-vigil-danger` | = red-400（`#f87171`） | 3 |
+| `text-amber-100` | `text-vigil-warn-text` | = amber-200 | 1 |
+| `bg-red-500/20` | `bg-vigil-danger-btn` | α 0.20 → 0.15 | 1 |
+
+白系那一族里 **12/35 个类有数值漂移**（分 9 组；T2 报告只报了 3 组）——最大的一处是
+`text-white/75 → #e6edf3`（≈ **+40/通道**，落在**日报正文**）。
+
+⇒ **裁决 R5**：① 这份清单**照实入计划**（合并是设计决定，不是误差，但必须说出来）；
+② **最大的一处回正**：`text-white/75` → `text-vigil-fg-2`（0.72，与原 0.75 差 0.03）；
+③ 其余保留（族内同色；用户人眼验收时一并看，见 §1 判据 1）。
+
 ### E6 `bg-black/30` 的 12 处里有 10 处是**输入框底**，不是遮罩
 
 实测分布：`ItemCard.tsx:167`、`PersonPicker.tsx:147/153`、`Feed.tsx:302`、`Settings.tsx:532/534/536/539/579/968/991`（输入框/文本域）、`SourceList.tsx:15`（源消息条目）。**本应用没有模态遮罩**。
@@ -826,12 +846,16 @@ MAPPING: dict[str, str] = {
     # 边框
     "border-white/10": "border-vigil-border",
     "border-white/5": "border-vigil-border-soft",
-    # 文字四级（白系 13 档 → 4 档；档位合并是**设计决定**，不是误差）
+    # 文字四级（白系 13 档 → 4 档）。
+    # ⚠️ **档位合并遍及四族，不只是白系**（reviewer 实测，见 §0 E11）：
+    #   text-sky-300 → accent-text（= sky-200，6 处）/ text-red-300 → danger（= red-400，3 处）/
+    #   text-amber-100 → warn-text（= amber-200，1 处）/ bg-red-500/20 → danger-btn（α .20→.15，1 处）。
+    #   白系里 **12/35 个类有数值漂移**（分 9 组）；最大的一处 `text-white/75` 已按 R5 回正为 fg-2。
     "text-white/95": "text-vigil-fg",
     "text-white/90": "text-vigil-fg",
     "text-white/85": "text-vigil-fg",
     "text-white/80": "text-vigil-fg",
-    "text-white/75": "text-vigil-fg",
+    "text-white/75": "text-vigil-fg-2",   # R5：原来映到 fg（#e6edf3）≈ +40/通道，是全部漂移里最大的一处
     "text-white/70": "text-vigil-fg-2",
     "text-white/60": "text-vigil-fg-2",
     "text-white/55": "text-vigil-fg-3",
