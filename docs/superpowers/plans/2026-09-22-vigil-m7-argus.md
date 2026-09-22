@@ -428,6 +428,34 @@ parity 要求集合相等；其余五块那份只是占位，注释写清"只有
   ⇒ 补一对**纯红边界见证**：取两个只差一点点的红色，一个该拒一个该收（把算式与 `#d00000` 的真值写进注释）。
 - **R12-d（文书）**：本卷 `:330/:336/:380` 曾要求 `--v-argus`（与本轮相反）——已由上面那条勘误作废，不必改正文，但**别照旧实施**。
 
+### R13（用户定稿）· 徽记图形 = **D 版**（荒坂内核改 + 用户四条要求）
+
+**用户 2026-09-22 定稿**：用户在看过 7 个候选后，指定「把荒坂（Arasaka）那个改一改」的 **D 版**。
+四条改动（用户原话）：**① 删下面的字母 ② 删外边那个圆圈 ③ 把那三个球掏空成环 ④ 加两条扇骨（像 V2 那样）**。
+迭代过程中 controller 实测出的**关键一改**：**支干必须只接到环的外缘、不许穿进去**——
+原来三个球是实心的，线连上去看不出来；**掏空成环后，穿过去就像"环被划了一道"**（左环看着像 "Q"）。
+⇒ 接点按「环心 + 单位向量 × (r + 0.9)」算。
+
+**定稿的精确 SVG（照抄，勿重推几何）**：
+
+```svg
+<svg viewBox="0 0 32 32" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+  <path d="M16 29 V 16" />
+  <path d="M12.8 16 q-2.8 3.6 -3.4 7.6" />
+  <path d="M19.2 16 q2.8 3.6 3.4 7.6" />
+  <path d="M16 16 V 12.9" />
+  <path d="M16 16 L 12.6 13.8" />
+  <path d="M16 16 L 19.4 13.8" />
+  <circle cx="16" cy="8.8" r="3.2" />
+  <circle cx="7.6" cy="10.6" r="3.2" />
+  <circle cx="24.4" cy="10.6" r="3.2" />
+</svg>
+```
+
+⚠️ **全是 `currentColor` / `fill="none"`、无瞳孔、无写死颜色** ⇒ 品牌区里那条"纯色"守卫（逐属性检查）继续成立；
+`ArgusBrand.tsx` 里的 `<ArgusLogo className="h-9 w-9 shrink-0" />` **不必改**（换的是 SVG 内部）。
+预览材料：`_smoke/m7-shots/argus-logo-arasaka.png`（左起 D / E / A）与逐格 `argus-logo-{a,b,c,d,e}.png`。
+
 # Task 2: ARGUS 品牌区 + 终端式头部 + `/color` 命令
 
 **Dependencies**：Task 1｜**Touches**：`web/src/components/ArgusLogo.tsx`(新)、`web/src/components/ArgusBrand.tsx`(新)、
