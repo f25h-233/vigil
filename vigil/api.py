@@ -1688,8 +1688,18 @@ def create_app(config: Config) -> FastAPI:
             # 所以目录逃逸（`../.env` 之类）必须在这里挡死。
             candidate = (dist_root / full_path).resolve()
             if candidate.is_relative_to(dist_root) and candidate.is_file():
+                # ⚠️ `/sw.js` 必须 `no-cache`（出口判据 3 的机械半边）：
+                # Service Worker 脚本是「有新版本」唯一的发现入口，而浏览器对它走
+                # **启发式缓存**（本仓此前 `Cache-Control` 零命中——计划期 grep 只命中
+                # `.venv/` 里的 starlette）。被推迟的更新检查，在手机上表现为
+                # 「我改了主题怎么没变」。
+                #
+                # ⛔ 其余静态资源**不许**跟着加：它们的正确语义是「内容哈希 + 长缓存」，
+                # 顺手加 no-cache 是把一个文件的更新语义扩成全部资源的（阴性对照钉着）。
                 return FileResponse(
-                    candidate, media_type=_MIME.get(candidate.suffix.lower())
+                    candidate,
+                    media_type=_MIME.get(candidate.suffix.lower()),
+                    headers={"Cache-Control": "no-cache"} if candidate.name == "sw.js" else None,
                 )
             # 请求的是**前端要用的那类静态资源**（js/css/图标/webmanifest…）而
             # 磁盘上没有 → 宁可 404，绝不许拿 index.html 顶。否则「manifest 不存在」

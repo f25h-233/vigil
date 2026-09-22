@@ -415,6 +415,34 @@ def test_static_file_is_served_as_a_file_not_the_spa_page(client, tmp_path, monk
     assert client.get("/some/route").text.startswith("<title>VIGIL")   # SPA 兜底仍工作
 
 
+def test_sw_js_is_served_with_no_cache(client, tmp_path, monkeypatch):
+    """⭐ 出口判据 3（新版本部署后无需手动清缓存）的机械半边。
+
+    Service Worker 脚本是「有新版本」唯一的发现入口，而它此前**没有任何
+    Cache-Control**（计划期实测：全仓 `grep -rn Cache-Control` 只命中 `.venv/`）
+    ⇒ 浏览器走启发式缓存 ⇒ 更新检查被推迟 ⇒ 手机上表现为「我改了主题怎么没变」。
+
+    阴性对照（本条一半的价值在这里）：别的静态资源**不许**被顺手加上 no-cache。
+    """
+    import vigil.api as api
+
+    dist = tmp_path / "dist"
+    (dist / "assets").mkdir(parents=True)
+    (dist / "index.html").write_text("<!doctype html>", encoding="utf-8")
+    (dist / "sw.js").write_text("self.define = 1", encoding="utf-8")
+    (dist / "assets" / "index-abc123.js").write_text("1", encoding="utf-8")
+    monkeypatch.setattr(api, "WEB_DIST", dist)
+
+    r = client.get("/sw.js")
+    assert r.status_code == 200
+    assert r.text == "self.define = 1"  # 仍然发真文件（不是 index.html）
+    assert r.headers["cache-control"] == "no-cache"
+
+    r2 = client.get("/assets/index-abc123.js")
+    assert r2.status_code == 200
+    assert "no-cache" not in r2.headers.get("cache-control", "")
+
+
 def test_static_file_content_type_comes_from_the_table(client, tmp_path, monkeypatch):
     """⭐ 真文件的 content-type 必须与 `_MIME` 的**值**一致。
 
