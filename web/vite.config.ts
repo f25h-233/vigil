@@ -11,7 +11,34 @@ export default defineConfig({
     react(),
     tailwindcss(),
     VitePWA({
-      registerType: 'autoUpdate',
+      // ⚠️ 必须是 `'prompt'`，**不能**是 `'autoUpdate'`——后者会把 `onNeedRefresh`
+      // 编成**死支**（提示条在生产环境永不出现，且"立即刷新"按钮是空操作）。
+      // 三层证据（读插件源码得出，并已用出厂产物复核）：
+      //   ① 本处配置：插件 `dist/index.js:169` 把客户端模板里的占位符
+      //      `__SW_AUTO_UPDATE__` 替换成 `${registerType === 'autoUpdate'}`，
+      //      于是它变成字符串 `"true"`；
+      //   ② 模板 `dist/client/build/register.js`：`var auto = autoUpdateMode === "true"`，
+      //      而 `onNeedRefresh?.()` 的**唯一**调用点只出现在
+      //      `if (auto) {…} else {…}` 的 **else 支**里；
+      //   ③ 出厂产物 `dist/assets/index-*.js`：那段编译成
+      //      ``ne=`true`,S=`false`,C=ne===`true` `` ⇒ `C` 恒真 ⇒ 走 auto 支，else 支是死代码。
+      // 后果不止"不提示"：返回值 `updateServiceWorker` 是
+      // `async(e=!0)=>{await l,C||u?.()}` ⇒ `C` 为真时它**连 `messageSkipWaiting`
+      // 都不发**，点了白点；而真正生效的是 auto 支 `activated` 监听器里的
+      // `window.location.reload()`——正是 `SwUpdateToast.tsx` 明文拒绝的
+      // "在用户打字/勾选的中途把页面抽走"。
+      //
+      // ⚠️ 代价（如实记下）：`'prompt'` 下插件不再烘入**无条件**的
+      // `skipWaiting`/`clientsClaim`（`dist/index.js:874-876` 那条 `if` 要求
+      // `registerType === 'autoUpdate'`；实测产物 `dist/sw.js` 相应地从
+      // `self.skipWaiting(),e.clientsClaim()` 变成只剩一条
+      // `"SKIP_WAITING"===e.data.type&&self.skipWaiting()` 的消息监听）
+      // ⇒ 新 SW 会停在 waiting，版本更新**必须用户点一次**「立即刷新」才接管。
+      // 这正是 spec §4.3④ 想要的"不静默跑旧 bundle"，但它与"部署后自动生效"
+      // 是**互斥**的两件事：要提示条，就得接受这一下点击。
+      // ⛔ 因此**不要**顺手补 `workbox.skipWaiting`/`clientsClaim`：那等于把 prompt
+      // 流程又变回静默自动更新，提示条会重新变成摆设。
+      registerType: 'prompt',
       includeAssets: ['icon-192.png', 'icon-512.png'],
       manifest: {
         name: 'VIGIL 守夜人',
