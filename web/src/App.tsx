@@ -1,36 +1,47 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { undoLast } from './api.ts'
 import ThemePicker from './components/ThemePicker.tsx'
 import { applyTheme, readTheme, type ThemeId } from './theme.ts'
+import { readView, writeView, TABS, type Tab } from './uiState.ts'
 import Categories from './views/Categories.tsx'
 import Digests from './views/Digests.tsx'
 import Feed from './views/Feed.tsx'
 import Settings from './views/Settings.tsx'
 
-type Tab = 'feed' | 'cats' | 'digests' | 'settings'
-
-const TABS: { key: Tab; label: string }[] = [
-  { key: 'feed', label: '信息流' },
-  { key: 'cats', label: '类目' },
-  { key: 'digests', label: '日报' },
-  { key: 'settings', label: '配置' },
-]
-
+// ⚠️ `type Tab` 与 `TABS` **搬去** `./uiState.ts`（T5）：它们与「当前在哪个
+// tab」的持久化是同一件事——`readView` 要靠 `TABS` 校验取回的值合不合法，
+// 两处各留一份的话，加一个 tab 就得记得改两个文件（漏一个的后果是
+// 刷新后那个 tab 回落信息流，而代码里看不出为什么）。
 export default function App() {
-  const [tab, setTab] = useState<Tab>('feed')
+  // ⚠️ 三个坐标（tab / kinds / persons）收成**一份** `view` 并落盘（T5）。
+  // 拆成三个 state 就要写三遍落盘；而 `readView` 是**逐字段**校验的，
+  // 一份对象进出正好对上它的形状。
+  // ⚠️ `readView` 传的是**函数引用** ⇒ React 当惰性初始化用，挂载时读一次盘
+  // （与下面 `readTheme` 同一个形状）。坏字段的回落发生在 `readView` 里面。
+  const [view, setView] = useState(readView)
   // 类目筛选状态**提到 App**：这样「类目」页点一个类目跳回信息流时，
   // 筛选条件能带过去，而 Feed 卸载重挂也不会丢。
   //
   // ⚠️ 多选：维度**内**是并集（选中多个类目 = 它们的合集），
   // 维度**间**是交集（类目 ∧ 人物）——spec §四 #4。
-  const [kinds, setKinds] = useState<string[]>([])
-  const [persons, setPersons] = useState<number[]>([])
   // 撤销的可见反馈：点完要说一句，否则不知道到底生效没有
   const [undoMsg, setUndoMsg] = useState<string | null>(null)
   // 撤销改的是库的**有效状态**，而 Feed 手里那份列表是旧快照——不给它发个
   // 信号，条目不会回到屏幕上（实测：撤销成功了，界面却毫无变化，
   // 用户会以为撤销没生效，于是再点一次，把上一步也撤掉）。
   const [dataTick, setDataTick] = useState(0)
+
+  const { tab, kinds, persons } = view
+  const setTab = (t: Tab) => setView((v) => ({ ...v, tab: t }))
+  const setKinds = (k: string[]) => setView((v) => ({ ...v, kinds: k }))
+  const setPersons = (p: number[]) => setView((v) => ({ ...v, persons: p }))
+
+  // 任何一处筛选变化都写回一次（一个 effect 收口，好过在每个 setter 里各写一遍）。
+  // 挂载时也跑一次：`readView` 已经把坏字段清成默认值了，这一写等于把
+  // 盘上那份垃圾一并**改回合法**——否则坏 JSON 会一直躺在那里，每次刷新重解析。
+  useEffect(() => {
+    writeView(view)
+  }, [view])
 
   // 主题：值放在 App（应用级状态），ThemePicker 只是它的一个**视图**
   // （两处各持一份就会出现「菜单说材质、页面是蒸汽波」）。
