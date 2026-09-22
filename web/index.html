@@ -25,6 +25,48 @@
           var t = localStorage.getItem('vigil.theme')
           if (t && ALLOWED.indexOf(t) !== -1) {
             document.documentElement.setAttribute('data-theme', t)
+            /*
+              ⭐ R10：ARGUS 的**基色是用户可改的**（`/color`），而它生效的方式是 `:root` 的
+              **行内**变量——由 `applyArgusColor` 在模块加载**之后**才写。那一段窗口里页面
+              先按 CSS 里的默认绿画一帧、再跳成用户的颜色（手机上就是一道闪）。
+              ⇒ 这里把 `applyArgusColor` 落盘的那份 JSON 读回来、**原样**贴成行内变量。
+
+              ⛔ 不在这里自己算颜色：算一份 = 把 `deriveArgusVars` 的 alpha 表抄成第二份
+              真相，两处必然漂移（判据 `R10③` 钉的就是这个）。
+              ⛔ 不用 `<style>` 标签：它与 `[data-theme='…']` 是**同级**选择器，谁赢只看
+              出现顺序 ⇒ 不可靠。**必须行内**（行内赢过任何选择器）。
+
+              ⚠️ 整段嵌在 `=== 'argus'` 分支**内**：别的主题下贴 ARGUS 的行内变量，就是
+              「行内覆盖顶掉那套主题的 token」那个已知缺陷换个入口重演。
+              ⚠️ 自己一个 try：盘上那份读炸了不该把 `data-theme` 也带下水（它是更重要的那条）。
+            */
+            if (t === 'argus') {
+              try {
+                /*
+                  ⛔ 安全：这份 JSON 在 **localStorage 里** ⇒ 用户（或任何一个能跑在本站的
+                  脚本）都可以把它改成任意内容。键名直接喂 `setProperty` = **任意行内样式
+                  注入**（`background-image: url(…)` 之类，甚至盖掉整页）。
+                  ⇒ 按**形状**逐条白名单：键名必须是 `--v-*` 自定义属性，值必须长得像
+                  十六进制或 rgb(a)——**不匹配的整条丢弃**（不是"试试看"）。
+                  ⚠️ 陈旧的 blob（少键 / 旧键名）不硬套：有的就贴、没有的留 CSS 默认值。
+                */
+                var raw = localStorage.getItem('vigil.argus.vars')
+                if (raw) {
+                  var vars = JSON.parse(raw)
+                  var RE_KEY = /^--v-[a-z0-9-]+$/
+                  var RE_HEX = /^#[0-9a-f]{6}$/
+                  var RE_RGB = /^rgba?\([0-9., %]+\)$/
+                  for (var k in vars) {
+                    if (!Object.prototype.hasOwnProperty.call(vars, k)) continue
+                    if (typeof vars[k] !== 'string' || !RE_KEY.test(k)) continue
+                    if (!RE_HEX.test(vars[k]) && !RE_RGB.test(vars[k])) continue
+                    document.documentElement.style.setProperty(k, vars[k])
+                  }
+                }
+              } catch (e2) {
+                /* 那份 blob 读不出/不是 JSON ⇒ 保持 CSS 里的默认色：防闪脚本不该是任何功能失败的原因 */
+              }
+            }
           }
         } catch (e) {
           /* 读不到就保持默认主题：防闪脚本**不该**是任何功能失败的原因 */

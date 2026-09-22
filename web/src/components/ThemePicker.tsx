@@ -49,6 +49,11 @@ export default function ThemePicker({
         <ul
           role="menu"
           aria-label="主题"
+          /* ⭐ T8-3 的钩子：菜单容器的机械标识（那里要在这块浮层上挂乱码演出）。
+             ⚠️ **只加属性、不加任何行为**：按钮与 aria 结构一字未动。
+             钉它的是 `argusBrand.dom.test.tsx` 那条——没有判据的话，它在任何一次
+             "顺手清理属性"里都会静默消失，而发现它的时刻是 T8-3 的渲染脚本里。 */
+          data-theme-picker=""
           className="absolute right-0 z-30 mt-1 w-40 rounded-lg border border-vigil-border bg-vigil-surface-solid p-1 text-sm shadow-vigil-card"
         >
           {THEMES.map((t) => (

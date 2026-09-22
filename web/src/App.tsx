@@ -1,5 +1,7 @@
 import { useEffect, useState } from 'react'
 import { undoLast } from './api.ts'
+import ArgusBrand from './components/ArgusBrand.tsx'
+import ArgusCommand from './components/ArgusCommand.tsx'
 import ThemePicker from './components/ThemePicker.tsx'
 import { applyTheme, readTheme, type ThemeId } from './theme.ts'
 import { readView, writeView, TABS, type Tab } from './uiState.ts'
@@ -66,43 +68,102 @@ export default function App() {
 
   return (
     <div className="min-h-screen text-vigil-fg">
-      {/* ⚠️ 头部**两行**（品牌+动作 / tab）不是审美选择：375×667 下仪器实测
-          （计划 §0 E8）——单行时顶栏 77px、tab 被 flex 挤到 48px 宽、标签折成**两行**，
-          而**没有任何元素被裁**（右侧余 16px）⇒ 这不是「修溢出」，是「别把标签挤扁」；
-          再加一个 🎨 只会更扁。第二行留 `overflow-x-auto`：宁可横向滚，也别再压扁。 */}
-      <header className="sticky top-0 z-10 border-b border-vigil-border bg-vigil-header backdrop-blur-vigil-header">
-        <div className="mx-auto flex max-w-3xl items-center gap-1.5 px-4 pt-2">
-          <span className="text-base font-semibold tracking-wide">🏮 VIGIL</span>
-          {/* ⚠️ `ml-auto` 原来挂在 `nav` 上；撤销按钮插到它前面之后必须**挪过来**
-              （同一行里只有一个 `ml-auto` 起作用，两个都在会变成两段式布局）。 */}
-          <button
-            onClick={undo}
-            className="ml-auto rounded-lg px-2 py-1 text-xs text-vigil-fg-3 active:bg-vigil-surface"
-          >
-            ↶ 撤销
-          </button>
-          {undoMsg !== null && (
-            <span className="max-w-[9rem] truncate text-xs text-vigil-fg-4">{undoMsg}</span>
-          )}
-          <ThemePicker value={theme} onChange={pickTheme} />
-        </div>
-        <nav className="mx-auto flex max-w-3xl gap-1 overflow-x-auto px-4 pb-2 pt-1 text-sm">
-          {TABS.map((t) => (
+      {theme === 'argus' ? (
+        /* ── ARGUS 头部（T8-2，计划 Task 2 Step 3）───────────────────────────
+           用户原话：「看起来像终端一样的主题…一定要大变样，和现有的 UI 的按钮排布可以
+           完全不同，**但功能不能少**」。⇒ 换掉的只有**排布与视觉**：
+           品牌区（徽记 + ARGUS + 小字）整体取代「🏮 VIGIL」、撤销与主题切换变成终端风的
+           文字动作、导航带 `[n]` 序号——四个 tab 与全部功能一个不少。
+           ⚠️ 这里是**三行**（品牌 / 提示符行 / 导航），默认头部是两行；这是**设计**，
+           不是回归（`[n]` 序号与提示符都要占地方）。375px 下不横向溢出归冒烟的渲染脚本核。 */
+        <header className="sticky top-0 z-10 border-b border-vigil-border bg-vigil-header">
+          <div className="mx-auto max-w-3xl px-4 pt-2">
+            <div className="flex items-start gap-2">
+              <ArgusBrand />
+              <button
+                onClick={undo}
+                className="ml-auto shrink-0 rounded-md px-2 py-1 text-xs text-vigil-fg-3 active:bg-vigil-surface"
+              >
+                ↶undo
+              </button>
+              <ThemePicker value={theme} onChange={pickTheme} />
+            </div>
+            {/* ⚠️ `undoMsg` 在终端风里的落点：默认头部把它塞在撤销按钮**旁边**，
+                这里没有那个位置（一行里已经放不下更多字）⇒ 单独一行小字。
+                **功能不许少**：撤销的反馈在 ARGUS 下同样要看得见，否则用户点一下
+                没有任何回话（那是"撤销到底生效没有"那个老问题的复现）。 */}
+            {undoMsg !== null && (
+              <div className="pb-0.5 text-[10px] text-vigil-fg-4">
+                {/* ⚠️ 箭头**单占一个元素**（不是 `↶ {undoMsg}` 平铺）：平铺时这一格
+                    的文本节点是 "↶ 没有可撤销的操作"，而判据（`argusBrand.dom.test.tsx`
+                    的 `undoMsg` 那条）按**逐字**找那条消息 ⇒ 找不到。
+                    判据要的是"那句话看得见"，箭头是装饰 ⇒ 各归各位。 */}
+                <span aria-hidden="true">↶ </span>
+                {undoMsg}
+              </div>
+            )}
+            <div className="flex items-center gap-2 pb-1 pt-1.5 text-sm">
+              <span className="shrink-0 text-vigil-fg-4">ARGUS:~$</span>
+              <ArgusCommand />
+            </div>
+            <nav className="flex gap-1 overflow-x-auto pb-2 text-sm">
+              {TABS.map((t, i) => (
+                <button
+                  key={t.key}
+                  onClick={() => setTab(t.key)}
+                  className={
+                    'shrink-0 rounded-md px-1.5 py-1 transition-colors ' +
+                    (tab === t.key
+                      ? 'bg-vigil-surface-2 text-vigil-fg'
+                      : 'text-vigil-fg-3 active:bg-vigil-surface')
+                  }
+                >
+                  [{i + 1}]{t.label}
+                </button>
+              ))}
+            </nav>
+          </div>
+        </header>
+      ) : (
+        /* ⚠️ 头部**两行**（品牌+动作 / tab）不是审美选择：375×667 下仪器实测
+           （计划 §0 E8）——单行时顶栏 77px、tab 被 flex 挤到 48px 宽、标签折成**两行**，
+           而**没有任何元素被裁**（右侧余 16px）⇒ 这不是「修溢出」，是「别把标签挤扁」；
+           再加一个 🎨 只会更扁。第二行留 `overflow-x-auto`：宁可横向滚，也别再压扁。
+           ⚠️ 这一段是**另外五套主题**的头部，T8-2 一字未动。 */
+        <header className="sticky top-0 z-10 border-b border-vigil-border bg-vigil-header backdrop-blur-vigil-header">
+          <div className="mx-auto flex max-w-3xl items-center gap-1.5 px-4 pt-2">
+            <span className="text-base font-semibold tracking-wide">🏮 VIGIL</span>
+            {/* ⚠️ `ml-auto` 原来挂在 `nav` 上；撤销按钮插到它前面之后必须**挪过来**
+                （同一行里只有一个 `ml-auto` 起作用，两个都在会变成两段式布局）。 */}
             <button
-              key={t.key}
-              onClick={() => setTab(t.key)}
-              className={
-                'shrink-0 rounded-lg px-3 py-1.5 transition-colors ' +
-                (tab === t.key
-                  ? 'bg-vigil-surface-2 text-vigil-fg'
-                  : 'text-vigil-fg-3 active:bg-vigil-surface')
-              }
+              onClick={undo}
+              className="ml-auto rounded-lg px-2 py-1 text-xs text-vigil-fg-3 active:bg-vigil-surface"
             >
-              {t.label}
+              ↶ 撤销
             </button>
-          ))}
-        </nav>
-      </header>
+            {undoMsg !== null && (
+              <span className="max-w-[9rem] truncate text-xs text-vigil-fg-4">{undoMsg}</span>
+            )}
+            <ThemePicker value={theme} onChange={pickTheme} />
+          </div>
+          <nav className="mx-auto flex max-w-3xl gap-1 overflow-x-auto px-4 pb-2 pt-1 text-sm">
+            {TABS.map((t) => (
+              <button
+                key={t.key}
+                onClick={() => setTab(t.key)}
+                className={
+                  'shrink-0 rounded-lg px-3 py-1.5 transition-colors ' +
+                  (tab === t.key
+                    ? 'bg-vigil-surface-2 text-vigil-fg'
+                    : 'text-vigil-fg-3 active:bg-vigil-surface')
+                }
+              >
+                {t.label}
+              </button>
+            ))}
+          </nav>
+        </header>
+      )}
 
       <main className="mx-auto max-w-3xl px-4 py-4 pb-24">
         {tab === 'feed' && (

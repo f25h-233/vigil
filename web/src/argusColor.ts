@@ -11,6 +11,21 @@
 export const ARGUS_DEFAULT = '#00ff9c'
 export const ARGUS_COLOR_KEY = 'vigil.argus.color'
 
+/**
+ * 派生表落盘的键（⭐ R10：**防闪**那一半）。
+ *
+ * ⚠️ 为什么盘上要**整份 JSON**、而不是只存基色让防闪脚本自己算：
+ * `applyArgusColor` 是模块加载**之后**才跑的，而 `index.html` 的防闪脚本在**首帧之前**
+ * ——那一段窗口里 `:root` 上没有任何行内变量 ⇒ 页面先画成 CSS 里的**默认绿**，再跳成
+ * 用户的颜色（手机上就是一道闪）。防闪脚本要贴出**用户色**，就得能在不加载任何模块的
+ * 前提下拿到那 12 个值。
+ * ⛔ 让它"照着基色自己算一份" = 把 alpha 表复制进 `index.html`（两处真相，必然漂移）
+ * ⇒ 存 `deriveArgusVars` 的**原样输出**：算的地方只有这一个函数。
+ * ⚠️ 与 `ARGUS_COLOR_KEY` **同一条纪律**：`clearArgusColor` 只清"这次生效的覆盖"
+ * （行内变量），盘上这份与基色一样是**用户的偏好**，不清。
+ */
+export const ARGUS_VARS_KEY = 'vigil.argus.vars'
+
 /** 具名色：不是 CSS 的 green（#008000 在纯黑底上偏暗），而是终端色 */
 export const ARGUS_NAMED: Record<string, string> = {
   green: '#00ff9c',
@@ -97,6 +112,17 @@ export function deriveArgusVars(base: string): Record<string, string> {
 }
 
 /**
+ * 派生表 → JSON（⭐ R10 的**可单测的那一半**）。
+ *
+ * 存在的唯一理由：`index.html` 的防闪脚本要**原样读回**这套变量，而它不许复制派生数学
+ * （R10③ 那条判据就是钉这个的）。⇒ 盘上那份必须是**同一个函数**的输出
+ * ⇒ 前端回读时不需要知道任何 alpha，也就没有第二处真相。
+ */
+export function argusVarsJson(base: string): string {
+  return JSON.stringify(deriveArgusVars(base))
+}
+
+/**
  * 基色 → 写 `:root` 行内变量 + 落盘。**它只负责"写变量"，不负责"判断该不该写"**。
  *
  * ⚠️ F7（T8-1 fix 轮）：这里**没有**"当前主题必须是 argus"的前置条件——按本仓纪律，
@@ -113,8 +139,12 @@ export function applyArgusColor(input: string): ArgusColorResult {
   for (const [k, v] of Object.entries(vars)) root.style.setProperty(k, v)
   try {
     localStorage.setItem(ARGUS_COLOR_KEY, parsed.value)
+    // ⭐ R10：盘上再存一份**派生结果的 JSON**——`index.html` 的防闪脚本靠它把用户色
+    // 赶在首帧之前贴上去（它能读盘，但加载不了任何模块、也不许自己算）。
+    // ⚠️ 同一句 try：两份都是"下次还记得"，存不下就两份都不动（不留"基色新、变量旧"的错位）。
+    localStorage.setItem(ARGUS_VARS_KEY, argusVarsJson(parsed.value))
   } catch {
-    // 存不下只影响"下次还记得"，不该让这次切换失败
+    // 存不下只影响"下次还记得"（含防闪），不该让这次切换失败
   }
   return parsed
 }
