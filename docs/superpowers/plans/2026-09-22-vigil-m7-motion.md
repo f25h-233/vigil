@@ -345,6 +345,28 @@ cd web && npm run build     # 干净（tsc -b 在内）
 
 ---
 
+## 2.9 ⚠️ 勘误区（T7 执行期实测，**计划里手写的测试代码有 4 处错**）
+
+> 形态一句话：**我手写的"测试替身/断言"与本仓真实的运行时契约不符**（这是本项目第 4 次出现同一类错）。
+> 每条都有实测；组件代码本身**一字未改照抄后仍有 3 条红** ⇒ 错在计划，不在实现。
+
+| # | 计划的错 | 实测症状 | 修法 |
+|---|---|---|---|
+| **EMA** | `stubAnimate` 返回 `{ finished: Promise.resolve() }` | 微任务里就兑现 ⇒ 断言①红在 `expected +0 to be 1`（动画"还没插就被移除了"） | 用**显式 deferred** 控制何时兑现（断言一条没少，反而更强） |
+| **EMB** | `vi.spyOn(window, 'matchMedia')` | `can only spy on a function`；**jsdom@30.1.0 整个 lib 里 0 处 `matchMedia`**（grep 实证） | 显式赋值 `window.matchMedia = …` + 用后还原 |
+| **EMC** | `.resolves.toBeUndefined()` | 与真契约不符：`@testing-library/user-event` 的 `directApi.js:32` 兑现的是 **System 实例** | 删掉该断言；"不抛"由 `await` 承担 |
+| **EMD** | `closest<HTMLElement>('button')` | **`tsc -b` 直接失败**（TS2339：`HTMLElement` 上没有 `.disabled`） | 用 `HTMLButtonElement`（**纯类型，零行为变化**） |
+
+**另外两条实测结论（值得留给后来者）**：
+- **变异①只红了 2 条而非 4 条**：另两条"不该插"的用例的 `return` 排在**颜色判断之前** ⇒ 各守各的。
+  ⇒ 这不是覆盖不足，而是**判据按边界分工**；写变异时别把"红 2 条"当成"守卫漏了 2 处"。
+- ⭐ **`StrictMode` 双挂载的真实形态被量到了**：`pointerdown` **add 2 / remove 1**（effect 跑两遍、cleanup 只跑一次是 React 的正常行为），
+  而**一次按下插 1 个涟漪、`animate` 1 次** ⇒ **没有双监听器**（听众集合是 Set 语义/或第二次 add 被 cleanup 抵消）。
+  同轮还验了"涟漪活着时宿主按钮重渲染"**不炸**（连点 3 次，文案仍正确）。
+- **`overflow: hidden` 的裁切排查**：52/52 个按钮两轴全扫 ⇒ 定位/形变轴 **0 命中**、负偏移 0；
+  文本轴只 1 个带宽度类且是 `ItemCard.tsx:115` 的 `w-full min-w-0`（整幅宽换行容器，非窄框）⇒ **本仓找不到可裁对象**。
+  ⚠️ 但**焦点环只按规范判定、未上真浏览器** ⇒ 留给冒烟。
+
 ## 3. 渲染验证（动效**不能**靠静态截图验，必须真浏览器）
 
 写一次性脚本（`_smoke/` 下，Playwright + msedge）：
