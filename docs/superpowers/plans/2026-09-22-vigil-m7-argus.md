@@ -390,6 +390,18 @@ parity 要求集合相等；其余五块那份只是占位，注释写清"只有
 
 ---
 
+### R10 / R11（controller 裁决，T8-1 执行期发现，**并入 Task 2 的范围**）
+
+- **R10 · 颜色的 FOUC**：T8-1 实测指出的真问题——`index.html` 的防闪脚本只挂 `data-theme`，
+  **读不到 `/color` 的落盘值** ⇒ 刷新后**首帧是默认绿**、再跳成用户色（而主题本身没有这个问题，因为它是脚本挂的）。
+  **修法**：`applyArgusColor` 额外把**派生结果**（12 个变量的 JSON）落到 `vigil.argus.vars`；
+  防闪脚本里若 `data-theme === 'argus'` 就把那份 JSON **行内应用**到 `:root`。
+  ⛔ **不许**在防闪脚本里复制一份派生数学（复制 = 两处真相，必然漂移）。
+  判据：模拟"盘上有 vars + 主题是 argus" ⇒ 首帧的 `--v-fg` 就已是用户色（不是默认绿）。
+- **R11 · 一句无判据的声称**：`index.css` 的 argus 块里那些默认值，注释声称"≡ `deriveArgusVars(ARGUS_DEFAULT)`"。
+  那是**声称**、不是判据 ⇒ 补一条测试：解析 CSS 的 argus 块，把它与 `deriveArgusVars(ARGUS_DEFAULT)` 的
+  **12 个重叠变量逐个逐字比**（期望值写死；这是"两处真相必须机械对上"的典型）。
+
 # Task 2: ARGUS 品牌区 + 终端式头部 + `/color` 命令
 
 **Dependencies**：Task 1｜**Touches**：`web/src/components/ArgusLogo.tsx`(新)、`web/src/components/ArgusBrand.tsx`(新)、
