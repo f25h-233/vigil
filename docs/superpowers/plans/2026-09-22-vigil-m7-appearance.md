@@ -78,6 +78,23 @@ path string. Received 'file:///@vite-plugin-pwa/virtual:pwa-register/react'
 
 ⇒ 裸 `rounded` 由 T2 换成 `rounded-md`；**粗野主义的"厚边框"由 `--v-shadow-card` 的硬阴影承担**（`4px 4px 0 0`），不是 border-width。
 
+### E8 ⚠️ 计划期的一条**错论证**（T4 的动机）：375px 下今天**没有"溢出被裁"**，真实症状是**被挤扁**
+
+T4 原写「375px 下现有单行 ≈ 426px > 375 ⇒ `overflow-x:hidden` 会静默裁掉右边内容」。
+**仪器校准没有被复现**（2026-09-22，真 Edge + 375×667 + 页内探针，`_smoke/m7-instrument-check.md`）：
+
+| 量 | 修前实测 |
+|---|---|
+| 被裁元素（逐元素 bounding rect） | **0 个**（`clippedHeaderCount=0` / `clippedCount=0`） |
+| 撤销右缘 / 末个 tab 右缘 / 视口 | 136 / 359 / 375 ⇒ 右侧还余 **16px** |
+| ⭐ **真实症状** | 顶栏高 **77px**、5 个标签**全折成两行**、每个 tab 只剩 **48px 宽** |
+
+⇒ 426px 是**不换行的内在宽度**，flex 收缩 + 文字换行把它吸收了。
+⇒ **算术推出来的症状不算实测**（M6「没有实测支撑的理由不许写成结论」的同族，这次落在我自己的论证上）。
+⇒ 连带两条：
+① T4 的验收**不许**用"没有控件被裁"——**修前就已满足**，那是不会失败的判据；
+② 改用「导航 tab 宽 ≥ 56px 且标签文字只占一行」（修前实测 48px / 两行 ⇒ **必红**）。
+
 ### E6 `bg-black/30` 的 12 处里有 10 处是**输入框底**，不是遮罩
 
 实测分布：`ItemCard.tsx:167`、`PersonPicker.tsx:147/153`、`Feed.tsx:302`、`Settings.tsx:532/534/536/539/579/968/991`（输入框/文本域）、`SourceList.tsx:15`（源消息条目）。**本应用没有模态遮罩**。
@@ -1187,10 +1204,10 @@ cd web && npm test && npm run build
 - **Consumes**：`THEMES` / `ThemeId` / `readTheme` / `applyTheme`（T1）。
 - **Produces**：`ThemePicker`（`{ value: ThemeId; onChange: (id: ThemeId) => void }`）。
 
-**为什么头部要改成两行**（这是**算术**，不是爱好）：375px 宽下现有单行是
-`px-4×2 + 🏮VIGIL(~72) + 撤销(~50) + 4 个 tab(4×~62) + gap ≈ 426px` > 375 —— 今天已经溢出，
-而 `html{overflow-x:hidden}` 会**静默裁掉**右边的内容（看不到、点不着）。
-再加一个控件只会更糟 ⇒ 第一行放"品牌 + 动作"、第二行放 tab（必要时可横向滚动）。
+**为什么头部要改成两行**（**修前实测**，不是算术——我第一版写的"溢出被裁"是错的，见 §0 E8）：
+375×667 下仪器量到「顶栏高 **77px**、5 个标签**全折成两行**、每个 tab 只剩 **48px 宽**」，
+而**没有任何元素被裁**（右侧余 16px，`clippedCount=0`）——是**被挤扁**，不是被裁掉。
+再加一个控件只会更扁 ⇒ 第一行放"品牌 + 动作"、第二行放 tab（必要时可横向滚动）。
 
 **Steps**
 
@@ -1382,8 +1399,12 @@ function pickTheme(id: ThemeId) {
 ```bash
 cd web && npm test && npm run build
 ```
-- **375px 目视**：8787 上切 iPhone SE（375×667），确认 ① 两行都在 ② 没有控件被裁 ③ 🎨 菜单在屏幕内。
-- commit：`feat(web): 顶栏主题切换器 + 头部两行化（375px 下不再裁控件）`
+- **375px 判据（⭐ 修前必红、修后必绿）**：在 375×667 下量**导航 tab 的盒子**——
+  ① 每个 tab **宽 ≥ 56px**；② 标签文字**只占一行**（按钮高 ≤ 40px）。
+  **修前实测**：48px 宽 / 两行文字 / 顶栏 77px 高（§0 E8）。
+  ⛔ **不许**用"没有控件被裁"当判据——修前就已满足，那是不会失败的判据。
+  量法：DevTools 或 `_smoke/m7-appearance-smoke.py`（它的页内探针已经打了这两个量）。
+- commit：`feat(web): 顶栏主题切换器 + 头部两行化（375px 下 tab 不再被挤成两行）`
 
 ---
 
@@ -1848,9 +1869,14 @@ cd .. && uv run pytest tests/test_api.py && uv run pytest
    ⚠️ **`?theme=` 覆盖当前还没实现**——它是 T4 的可选加项（约 5 行：URL 参数优先于 localStorage，且**不落盘**）。
    实现者按 Escape hatch 处理：**加了就在报告里说明并补一条用例；不加就报告"冒烟改用点击切换"**。
 3. 机械检查（同一次会话里跑）：
+   - ⚠️ **先记构建指纹**（仪器校准实测的缺口：dist 会在跑的过程中被外部重建，
+     不记指纹的话两遍读数不是同一个构建，而报告看不出来）：`/index.html` 与 `/sw.js`
+     的 sha256 + `/assets/*` 名单 + `git rev-parse HEAD` + `git status --porcelain` 条数，
+     一起进 `report.json`；
    - 每套主题页面**非空白**（元素数 > 20、`document.body.innerText.length > 50`）；
-   - `document.documentElement.scrollWidth <= innerWidth`（375px 不横向溢出）；
+   - 375px 下**不被挤扁**：导航每个 tab 宽 ≥ 56px、标签只占一行（修前 48px / 两行，见 §0 E8）。
+     ⛔ 不用 `scrollWidth <= innerWidth`：`html{overflow-x:hidden}` 会把它夹到视口宽，**量不到**；
    - material 主题下**没有**亮度 < 0.15 的大面积背景（深色残留的像素级复核）；
-   - 五套首屏截图**两两不同**（phash 距离 > 阈值）——防"切了没变"。
+   - 五套首屏截图**两两不同**（dHash 距离 > 4）——防"切了没变"。
 4. PWA 更新：改一处可见文案 → `npm run build` → 已开着的标签页应在 ≤ 一轮内出现「有新版本」提示（真浏览器 + 真 SW）。
 5. 用户人眼验收五套（判据 1）；某套不满意 ⇒ 一次**只改 `index.css`** 的 fix 轮 + 重截该套。
