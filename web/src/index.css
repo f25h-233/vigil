@@ -3,6 +3,11 @@
 /* ═══════════════════════════════════════════════════════════════════════
    M7 · 主题层：两层结构（调用点的类名固定，值随主题走）
    ───────────────────────────────────────────────────────────────────────
+   ⚠️ 还回原文件头那句（T1 全文替换时被误删，F3）——它仍是真的，而且是
+   「主题为什么写在 CSS 里」的答案：
+   Tailwind v4 是 **CSS-first** 配置，**没有 `tailwind.config.js`**；照 v3 的写法
+   建一个 config 文件**不会被读取**。要加主题就改这个文件，别去建 config。
+
    ① 原始变量层（`--v-*`）：每套主题各给一份**完整**的值。`[data-theme='x']`
       挂在 `<html>` 上；`:root, [data-theme='default']` 那一份就是默认主题。
    ② 映射层（`@theme inline`）：把原始变量接进 Tailwind 的命名空间，于是
@@ -14,9 +19,15 @@
    * `@theme inline { --color-x: var(--v-x) }` ⇒ `.bg-x{background-color:var(--v-x)}`。
      **必须**是 `inline`，否则产物里会烘进一个**构建期**的 hex fallback。
    * ⛔ 由此：**语义 token 一律不许带透明度修饰符**（`bg-vigil-surface/50`）。
-     实测 `bg-vigil-bg/90` 在产物里同时出现 `#0b0f14e6`（构建期烘死）
-     与 `color-mix(...)` 两条——前者的值来自构建那一刻的主题，切了也不变。
-     值是 `var()` 的那一支没人验过 ⇒ 整条路直接禁用（守卫有机械检查）。
+     两条理由（F2 照实改写，见计划 §0 的 E3-补）：
+     ① 透明度是**主题资产**——它该由 token 的值决定（比如 `--v-header` 的值里
+        本身就写着 0.9），不该出现在调用点；否则「这套主题的顶栏多透」散在几十个
+        类名里，改一处漏一处。
+     ② 实测收窄：把 `--color-vigil-bg` 从字面量改成 `var(--v-bg)` **之后**，产物里
+        那条构建期烘死的 `#0b0f14e6` 就**消失了**，只剩 `color-mix(...)` 一支
+        ——而这一支**只在一个类上验过**（`bg-vigil-bg/90`）⇒ 把没完全验过的路关掉
+        （守卫有机械检查）。
+     ⛔ 别把「构建期必然烘死」写成普适结论：它**只对"值是字面量"那一支**成立。
    * 覆盖内置刻度同样生效：实测 `.rounded-lg{border-radius:var(--v-probe-radius)}`。
    * ⛔ 裸 `rounded` 是**字面量**（产物 `.rounded{border-radius:.25rem}`）、
      `border` 的宽度也是（`.border-t{border-top-width:1px}`）⇒ 这两样**不可主题化**。
@@ -65,7 +76,14 @@
   --v-shadow-card: none;
   --v-header-blur: 8px;
   --v-panel-blur: 0px;
-  --v-font-sans: system-ui, -apple-system, 'Segoe UI', 'Microsoft YaHei', sans-serif;
+  /* ⭐ F1（= 计划 E10）：`'Segoe UI'` 必须**字面第一**。T1 的目标是「默认主题与
+     今天**逐像素相同**」，而 M7 之前渲染拉丁文的就是 Segoe UI。
+     实测宽度指纹（Chromium；字符串 `AaBbGg123 !@#` 的像素宽）：
+       `"Segoe UI"` 单独用 = **146.221** ＝ Tailwind 旧栈 = 146.221（**相同**）
+       `system-ui`（本机 zh-CN Windows → 雅黑）= **158.857**
+     ⇒ 把 `system-ui` 放第一位，拉丁串宽 +8.6%、整页 +5px、**4.983% 像素不同**。
+     ⚠️ **只改这一块**：另外四套主题的字体栈是它们各自的设计值，归 T3。 */
+  --v-font-sans: 'Segoe UI', system-ui, -apple-system, 'Microsoft YaHei', sans-serif;
   --v-tracking: normal;
 }
 
