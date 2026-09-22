@@ -10,6 +10,27 @@
     <link rel="icon" href="/icon-192.png" />
     <link rel="apple-touch-icon" href="/icon-192.png" />
     <title>VIGIL 守夜人</title>
+    <!--
+      ⚠️ 防闪（FOUC）：主题属性必须在**首帧之前**挂上，否则默认主题会先画一帧
+      再跳成用户选的那套——手机上就是一道闪。
+
+      ⚠️ 白名单是**手写的第二份真相**（第一份是 src/theme.ts 的 THEMES）
+      ⇒ `theme.test.ts` 里有一条逐字比对。不校验的话，垃圾值会挂到
+      data-theme 上、CSS 静默回落——排查时零线索。
+    -->
+    <script>
+      ;(function () {
+        var ALLOWED = ['default', 'material', 'brutalism', 'vaporwave', 'glass']
+        try {
+          var t = localStorage.getItem('vigil.theme')
+          if (t && ALLOWED.indexOf(t) !== -1) {
+            document.documentElement.setAttribute('data-theme', t)
+          }
+        } catch (e) {
+          /* 读不到就保持默认主题：防闪脚本**不该**是任何功能失败的原因 */
+        }
+      })()
+    </script>
   </head>
   <body>
     <div id="root"></div>

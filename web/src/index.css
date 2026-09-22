@@ -1,10 +1,297 @@
 @import 'tailwindcss';
 
-/* Tailwind v4：主题在这里声明，**没有 tailwind.config.js**
-   （v4 是 CSS-first 配置；照 v3 的写法建 config 文件不会被读取）。 */
-@theme {
-  --color-vigil-bg: #0b0f14;
-  --color-vigil-fg: #e6edf3;
+/* ═══════════════════════════════════════════════════════════════════════
+   M7 · 主题层：两层结构（调用点的类名固定，值随主题走）
+   ───────────────────────────────────────────────────────────────────────
+   ① 原始变量层（`--v-*`）：每套主题各给一份**完整**的值。`[data-theme='x']`
+      挂在 `<html>` 上；`:root, [data-theme='default']` 那一份就是默认主题。
+   ② 映射层（`@theme inline`）：把原始变量接进 Tailwind 的命名空间，于是
+      `bg-vigil-surface` / `text-vigil-fg-2` / `shadow-vigil-card` /
+      `backdrop-blur-vigil-panel` 这些**调用点的类名不变**，值随主题走；
+      `--radius-{md,lg,xl}` 是**覆盖内置刻度**，所以 `rounded-lg` 一个字都不用改。
+
+   ⚠️ 计划期实测（2026-09-22，vite build 产物 grep）——这几条都是踩过的：
+   * `@theme inline { --color-x: var(--v-x) }` ⇒ `.bg-x{background-color:var(--v-x)}`。
+     **必须**是 `inline`，否则产物里会烘进一个**构建期**的 hex fallback。
+   * ⛔ 由此：**语义 token 一律不许带透明度修饰符**（`bg-vigil-surface/50`）。
+     实测 `bg-vigil-bg/90` 在产物里同时出现 `#0b0f14e6`（构建期烘死）
+     与 `color-mix(...)` 两条——前者的值来自构建那一刻的主题，切了也不变。
+     值是 `var()` 的那一支没人验过 ⇒ 整条路直接禁用（守卫有机械检查）。
+   * 覆盖内置刻度同样生效：实测 `.rounded-lg{border-radius:var(--v-probe-radius)}`。
+   * ⛔ 裸 `rounded` 是**字面量**（产物 `.rounded{border-radius:.25rem}`）、
+     `border` 的宽度也是（`.border-t{border-top-width:1px}`）⇒ 这两样**不可主题化**。
+     裸 `rounded` 由 T2 换成 `rounded-md`；「厚边框」由各主题的 `--v-shadow-card`
+     承担（粗野主义用 `4px 4px 0 0` 的硬阴影）。
+   ═══════════════════════════════════════════════════════════════════════ */
+
+/* ── ① 原始变量：默认主题（`:root` 与显式 `[data-theme='default']` 共用一块） ── */
+:root,
+[data-theme='default'] {
+  /* 页面与浮层底 */
+  --v-bg: #0b0f14;
+  --v-header: rgba(11, 15, 20, 0.9);
+  --v-page-image: none;
+  /* 文字四级（1 最强 → 4 最弱） */
+  --v-fg: #e6edf3;
+  --v-fg-2: rgba(255, 255, 255, 0.72);
+  --v-fg-3: rgba(255, 255, 255, 0.55);
+  --v-fg-4: rgba(255, 255, 255, 0.4);
+  /* 面（solid = 浮层用，必须不透明，否则菜单背后透出正文） */
+  --v-surface: rgba(255, 255, 255, 0.05);
+  --v-surface-2: rgba(255, 255, 255, 0.1);
+  --v-surface-solid: #141a22;
+  --v-inset: rgba(0, 0, 0, 0.3);
+  --v-border: rgba(255, 255, 255, 0.1);
+  --v-border-soft: rgba(255, 255, 255, 0.05);
+  /* 强调（链接 / 主按钮 / 选中态） */
+  --v-accent: #38bdf8;
+  --v-accent-soft: rgba(56, 189, 248, 0.2);
+  --v-accent-text: #bae6fd;
+  /* 危险（错误框 / 重试 / 危险按钮） */
+  --v-danger: #f87171;
+  --v-danger-soft: rgba(239, 68, 68, 0.1);
+  --v-danger-btn: rgba(239, 68, 68, 0.15);
+  --v-danger-btn-active: rgba(239, 68, 68, 0.25);
+  --v-danger-text: #fecaca;
+  /* 提醒（公告框 / 死线 / 警告按钮） */
+  --v-warn: #fbbf24;
+  --v-warn-soft: rgba(245, 158, 11, 0.1);
+  --v-warn-btn: rgba(245, 158, 11, 0.2);
+  --v-warn-text: #fde68a;
+  /* 结构：圆角（覆盖内置刻度）/ 阴影 / 模糊 / 字体 / 字距 */
+  --v-radius-md: 0.375rem;
+  --v-radius-lg: 0.5rem;
+  --v-radius-xl: 0.75rem;
+  --v-shadow-card: none;
+  --v-header-blur: 8px;
+  --v-panel-blur: 0px;
+  --v-font-sans: system-ui, -apple-system, 'Segoe UI', 'Microsoft YaHei', sans-serif;
+  --v-tracking: normal;
+}
+
+/* ── ② 映射层 ── */
+@theme inline {
+  /* ⚠️ 偏差 1（见 task-1-report.md）：brief 的 Step 4 全文里**没有**这一行，
+     但今天 `App.tsx:46/47` 还在用 `bg-vigil-bg` 与 `bg-vigil-bg/90`，而这两处
+     不在 T1 的 Interfaces 里（不许改）⇒ 少了它，产物里 `.bg-vigil-bg\/90`
+     整条规则消失（实测：`grep 'bg-vigil-bg' dist/assets/*.css` 零命中），
+     粘性顶栏就**没有任何底色**了——与 T1 的「默认主题观感与今天逐像素相同」
+     直接冲突。T2 的 codemod 会把调用点换成 `bg-vigil-header`（值同为
+     rgba(11,15,20,0.9)）、并从 App 根 div 上摘掉 `bg-vigil-bg`，
+     **到那时再由 T2 删掉这一行**（计划 §Task 2 步骤 5 就是这么写的）。 */
+  --color-vigil-bg: var(--v-bg);
+  --color-vigil-fg: var(--v-fg);
+  --color-vigil-fg-2: var(--v-fg-2);
+  --color-vigil-fg-3: var(--v-fg-3);
+  --color-vigil-fg-4: var(--v-fg-4);
+  --color-vigil-header: var(--v-header);
+  --color-vigil-surface: var(--v-surface);
+  --color-vigil-surface-2: var(--v-surface-2);
+  --color-vigil-surface-solid: var(--v-surface-solid);
+  --color-vigil-inset: var(--v-inset);
+  --color-vigil-border: var(--v-border);
+  --color-vigil-border-soft: var(--v-border-soft);
+  --color-vigil-accent: var(--v-accent);
+  --color-vigil-accent-soft: var(--v-accent-soft);
+  --color-vigil-accent-text: var(--v-accent-text);
+  --color-vigil-danger: var(--v-danger);
+  --color-vigil-danger-soft: var(--v-danger-soft);
+  --color-vigil-danger-btn: var(--v-danger-btn);
+  --color-vigil-danger-btn-active: var(--v-danger-btn-active);
+  --color-vigil-danger-text: var(--v-danger-text);
+  --color-vigil-warn: var(--v-warn);
+  --color-vigil-warn-soft: var(--v-warn-soft);
+  --color-vigil-warn-btn: var(--v-warn-btn);
+  --color-vigil-warn-text: var(--v-warn-text);
+
+  /* 覆盖内置刻度 ⇒ 调用点的 `rounded-md/lg/xl` 一个字都不用改 */
+  --radius-md: var(--v-radius-md);
+  --radius-lg: var(--v-radius-lg);
+  --radius-xl: var(--v-radius-xl);
+
+  --shadow-vigil-card: var(--v-shadow-card);
+  --blur-vigil-header: var(--v-header-blur);
+  --blur-vigil-panel: var(--v-panel-blur);
+}
+
+/* ── ③ 页面层：不进 Tailwind（body 上一次用掉），因此能承载"美术资产"
+      ——渐变 / 网格纸 / 辉光都是任意 CSS，只受"每套主题各给一份"约束 ── */
+body {
+  background-color: var(--v-bg);
+  background-image: var(--v-page-image);
+  color: var(--v-fg);
+  font-family: var(--v-font-sans);
+  letter-spacing: var(--v-tracking);
+  min-height: 100vh;
+}
+
+/* ⚠️ 表单控件**不继承** font-family / letter-spacing（UA 样式给它们另设了一套）。
+   不写这一段，粗野主义的等宽字体只作用在正文上，而所有按钮/输入框还是系统字体
+   ——就是「主题看着没生效」的典型形态。
+
+   ⚠️⚠️ **必须待在 `@layer base` 里**（偏差 3，见 task-1-report.md）——计划期实测：
+   * Tailwind 预检**已经**发过同一条规则（产物 grep：`button,input,select,optgroup,
+     textarea{font:inherit;…letter-spacing:inherit;…}`），所以它本来就在 `base` 层；
+   * 不套 `@layer` 时，这条规则**不属于任何层**，而「未分层样式胜过一切分层样式」
+     ⇒ 它会把 utilities 层的 `text-xs` 压掉：DOM 指纹对比实测**8 个元素**
+     字号被改（撤销按钮 12px → 16px），整页高度也跟着变（1292 → 1305）。
+     这条规则是**声明式兜底**，不该是覆盖工具类的锤子。
+   * 放进 `@layer base` 后与预检同层 ⇒ `text-*` / `font-*` 照旧压得过它。 */
+@layer base {
+  button,
+  input,
+  textarea,
+  select {
+    font: inherit;
+    letter-spacing: inherit;
+  }
+}
+
+/* ── ④ 另外四套主题：**先逐字等于默认**（机制先跑通）。
+      T3 把它们换成各自的值——注意 T3 换的是**整块 33 个 token**，
+      不是"只改颜色那几行"。 ── */
+[data-theme='material'] {
+  --v-bg: #0b0f14;
+  --v-header: rgba(11, 15, 20, 0.9);
+  --v-page-image: none;
+  --v-fg: #e6edf3;
+  --v-fg-2: rgba(255, 255, 255, 0.72);
+  --v-fg-3: rgba(255, 255, 255, 0.55);
+  --v-fg-4: rgba(255, 255, 255, 0.4);
+  --v-surface: rgba(255, 255, 255, 0.05);
+  --v-surface-2: rgba(255, 255, 255, 0.1);
+  --v-surface-solid: #141a22;
+  --v-inset: rgba(0, 0, 0, 0.3);
+  --v-border: rgba(255, 255, 255, 0.1);
+  --v-border-soft: rgba(255, 255, 255, 0.05);
+  --v-accent: #38bdf8;
+  --v-accent-soft: rgba(56, 189, 248, 0.2);
+  --v-accent-text: #bae6fd;
+  --v-danger: #f87171;
+  --v-danger-soft: rgba(239, 68, 68, 0.1);
+  --v-danger-btn: rgba(239, 68, 68, 0.15);
+  --v-danger-btn-active: rgba(239, 68, 68, 0.25);
+  --v-danger-text: #fecaca;
+  --v-warn: #fbbf24;
+  --v-warn-soft: rgba(245, 158, 11, 0.1);
+  --v-warn-btn: rgba(245, 158, 11, 0.2);
+  --v-warn-text: #fde68a;
+  --v-radius-md: 0.375rem;
+  --v-radius-lg: 0.5rem;
+  --v-radius-xl: 0.75rem;
+  --v-shadow-card: none;
+  --v-header-blur: 8px;
+  --v-panel-blur: 0px;
+  --v-font-sans: system-ui, -apple-system, 'Segoe UI', 'Microsoft YaHei', sans-serif;
+  --v-tracking: normal;
+}
+
+[data-theme='brutalism'] {
+  --v-bg: #0b0f14;
+  --v-header: rgba(11, 15, 20, 0.9);
+  --v-page-image: none;
+  --v-fg: #e6edf3;
+  --v-fg-2: rgba(255, 255, 255, 0.72);
+  --v-fg-3: rgba(255, 255, 255, 0.55);
+  --v-fg-4: rgba(255, 255, 255, 0.4);
+  --v-surface: rgba(255, 255, 255, 0.05);
+  --v-surface-2: rgba(255, 255, 255, 0.1);
+  --v-surface-solid: #141a22;
+  --v-inset: rgba(0, 0, 0, 0.3);
+  --v-border: rgba(255, 255, 255, 0.1);
+  --v-border-soft: rgba(255, 255, 255, 0.05);
+  --v-accent: #38bdf8;
+  --v-accent-soft: rgba(56, 189, 248, 0.2);
+  --v-accent-text: #bae6fd;
+  --v-danger: #f87171;
+  --v-danger-soft: rgba(239, 68, 68, 0.1);
+  --v-danger-btn: rgba(239, 68, 68, 0.15);
+  --v-danger-btn-active: rgba(239, 68, 68, 0.25);
+  --v-danger-text: #fecaca;
+  --v-warn: #fbbf24;
+  --v-warn-soft: rgba(245, 158, 11, 0.1);
+  --v-warn-btn: rgba(245, 158, 11, 0.2);
+  --v-warn-text: #fde68a;
+  --v-radius-md: 0.375rem;
+  --v-radius-lg: 0.5rem;
+  --v-radius-xl: 0.75rem;
+  --v-shadow-card: none;
+  --v-header-blur: 8px;
+  --v-panel-blur: 0px;
+  --v-font-sans: system-ui, -apple-system, 'Segoe UI', 'Microsoft YaHei', sans-serif;
+  --v-tracking: normal;
+}
+
+[data-theme='vaporwave'] {
+  --v-bg: #0b0f14;
+  --v-header: rgba(11, 15, 20, 0.9);
+  --v-page-image: none;
+  --v-fg: #e6edf3;
+  --v-fg-2: rgba(255, 255, 255, 0.72);
+  --v-fg-3: rgba(255, 255, 255, 0.55);
+  --v-fg-4: rgba(255, 255, 255, 0.4);
+  --v-surface: rgba(255, 255, 255, 0.05);
+  --v-surface-2: rgba(255, 255, 255, 0.1);
+  --v-surface-solid: #141a22;
+  --v-inset: rgba(0, 0, 0, 0.3);
+  --v-border: rgba(255, 255, 255, 0.1);
+  --v-border-soft: rgba(255, 255, 255, 0.05);
+  --v-accent: #38bdf8;
+  --v-accent-soft: rgba(56, 189, 248, 0.2);
+  --v-accent-text: #bae6fd;
+  --v-danger: #f87171;
+  --v-danger-soft: rgba(239, 68, 68, 0.1);
+  --v-danger-btn: rgba(239, 68, 68, 0.15);
+  --v-danger-btn-active: rgba(239, 68, 68, 0.25);
+  --v-danger-text: #fecaca;
+  --v-warn: #fbbf24;
+  --v-warn-soft: rgba(245, 158, 11, 0.1);
+  --v-warn-btn: rgba(245, 158, 11, 0.2);
+  --v-warn-text: #fde68a;
+  --v-radius-md: 0.375rem;
+  --v-radius-lg: 0.5rem;
+  --v-radius-xl: 0.75rem;
+  --v-shadow-card: none;
+  --v-header-blur: 8px;
+  --v-panel-blur: 0px;
+  --v-font-sans: system-ui, -apple-system, 'Segoe UI', 'Microsoft YaHei', sans-serif;
+  --v-tracking: normal;
+}
+
+[data-theme='glass'] {
+  --v-bg: #0b0f14;
+  --v-header: rgba(11, 15, 20, 0.9);
+  --v-page-image: none;
+  --v-fg: #e6edf3;
+  --v-fg-2: rgba(255, 255, 255, 0.72);
+  --v-fg-3: rgba(255, 255, 255, 0.55);
+  --v-fg-4: rgba(255, 255, 255, 0.4);
+  --v-surface: rgba(255, 255, 255, 0.05);
+  --v-surface-2: rgba(255, 255, 255, 0.1);
+  --v-surface-solid: #141a22;
+  --v-inset: rgba(0, 0, 0, 0.3);
+  --v-border: rgba(255, 255, 255, 0.1);
+  --v-border-soft: rgba(255, 255, 255, 0.05);
+  --v-accent: #38bdf8;
+  --v-accent-soft: rgba(56, 189, 248, 0.2);
+  --v-accent-text: #bae6fd;
+  --v-danger: #f87171;
+  --v-danger-soft: rgba(239, 68, 68, 0.1);
+  --v-danger-btn: rgba(239, 68, 68, 0.15);
+  --v-danger-btn-active: rgba(239, 68, 68, 0.25);
+  --v-danger-text: #fecaca;
+  --v-warn: #fbbf24;
+  --v-warn-soft: rgba(245, 158, 11, 0.1);
+  --v-warn-btn: rgba(245, 158, 11, 0.2);
+  --v-warn-text: #fde68a;
+  --v-radius-md: 0.375rem;
+  --v-radius-lg: 0.5rem;
+  --v-radius-xl: 0.75rem;
+  --v-shadow-card: none;
+  --v-header-blur: 8px;
+  --v-panel-blur: 0px;
+  --v-font-sans: system-ui, -apple-system, 'Segoe UI', 'Microsoft YaHei', sans-serif;
+  --v-tracking: normal;
 }
 
 html {
