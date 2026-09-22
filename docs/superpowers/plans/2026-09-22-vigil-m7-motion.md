@@ -367,6 +367,22 @@ cd web && npm run build     # 干净（tsc -b 在内）
   文本轴只 1 个带宽度类且是 `ItemCard.tsx:115` 的 `w-full min-w-0`（整幅宽换行容器，非窄框）⇒ **本仓找不到可裁对象**。
   ⚠️ 但**焦点环只按规范判定、未上真浏览器** ⇒ 留给冒烟。
 
+## 2.95 ⛔ 勘误 EN-1（**本项目最值钱的一条新结论**）：涟漪载体换了三次，两次都因为"挂在 React 管的节点上"
+
+| 版本 | 载体 | 被谁抹掉 | 活实例 |
+|---|---|---|---|
+| v1 | 按钮里的 `<span class="vigil-ripple">` | React 的 **`textContent` 快路径**（`react-dom-client.development.js:2846`） | `Feed.tsx:390-395`「加载更多」（整段一个动态字符串） |
+| v2 | 按钮上的 `class="vigil-rippling"` + `::after` | React 写 **`className`**（`setValueForKnownAttribute`→`setAttribute`） | `Feed.tsx:416` chip、`Settings.tsx:33` tab（点击即改 className） |
+| **v3** | **`document.body` 上的 `.vigil-ripple-layer`** | ——（React 不管 body 的子节点，也不管它们的 class） | —— |
+
+⇒ ⭐ **通则**：**任何"载体挂在 React 管理的子树里"的机制，都会被 React 的某一种写入抹掉**
+（`textContent` / `className` / `style` 各有各的受害者）。**正解是把载体放进 React 不写的容器**（body 级 overlay），
+而不是去猜"这次它写不写"。
+⇒ 推论：**v1 与 v2 各自的"反证都通过了"**（v1 有测试、v2 也有测试）——说明**当时的判据覆盖不到这个维度**；
+真正抓住它的是**独立审查设计出的变异**（"载体被 React 写入时会怎样"）。
+⇒ 另一条：**"只按一次"的用例挡不住"摘类/清理那行被删"**（re-review 实测：删掉 `classList.remove` ⇒ 9/9 全绿）
+⇒ 凡是有"清理/收尾"步骤的机制，判据必须**至少走两轮**。
+
 ## 3. 渲染验证（动效**不能**靠静态截图验，必须真浏览器）
 
 写一次性脚本（`_smoke/` 下，Playwright + msedge）：
