@@ -139,10 +139,25 @@ test('正文与弱化文字在面板上都读得清（WCAG：正文 ≥4.5 / 弱
     const muted = worst('--v-fg-3', null)
     const soft = worst('--v-accent-text', '--v-accent-soft')
     const danger = worst('--v-danger-text', '--v-danger-btn')
+
+    // ⭐ R7（fix 轮，补一条**没人守的**文字 token）：`--v-accent` **也当文字用**
+    // （`text-vigil-accent`：链接，以及刚修好的两个按钮），而**全仓此前没有任何判据
+    // 守它的可读性**——上一轮是修订者**手算**的（最低 4.98，落在 material）。
+    // ⚠️ 手算不是判据：它不进 CI、也不挡"下次顺手改个色值"。而这类 token 恰好最容易被
+    // 改坏——material 的 `--v-accent`（#6750a4）离它的面（#e8def8）只差 0.48。
+    // 判据按**正文级**（≥4.5）：accent 当文字用时与正文同重，它不是"弱化文字"。
+    // ⚠️ 面取两个里**更差**的那个、文字侧同样 `over()` 合成——与上面四条同一写法。
+    // ⚠️ 变异反证：把 material 的 `--v-accent` 改成 `#eaddff`（≈近底色）⇒ 本条必红。
+    const accent = worst('--v-accent', null)
+
     // 断言消息带上"最差的那个面"：只写"glass 软底按钮文字 4.42"看不出是哪个面在拉低
     expect(body.ratio, `${t.id} 正文/面（最差面 ${body.where}）`).toBeGreaterThanOrEqual(4.5)
     expect(muted.ratio, `${t.id} 弱化文字/面（最差面 ${muted.where}）`).toBeGreaterThanOrEqual(3)
     expect(soft.ratio, `${t.id} 软底按钮文字（最差面 ${soft.where}）`).toBeGreaterThanOrEqual(3)
     expect(danger.ratio, `${t.id} 危险按钮文字（最差面 ${danger.where}）`).toBeGreaterThanOrEqual(3)
+    expect(
+      accent.ratio,
+      `${t.id} 强调文字/面（--v-accent 当文字用；最差面 ${accent.where}）`,
+    ).toBeGreaterThanOrEqual(4.5)
   }
 })

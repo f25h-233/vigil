@@ -2,6 +2,7 @@ import { render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { afterEach, expect, test, vi } from 'vitest'
 import App from '../App.tsx'
+import { VIEW_STORAGE_KEY } from '../uiState.ts'
 
 type Call = { url: string; method: string }
 
@@ -23,7 +24,20 @@ function installFetch(undoResult: boolean) {
   return calls
 }
 
-afterEach(() => vi.unstubAllGlobals())
+/**
+ * ⭐ T5 review 的 Low-2（fix 轮）：view 持久化上线后，`render(<App/>)` 会**从盘上**
+ * 读初始 tab/筛选（`uiState.readView`),而这里原先的 `afterEach` **不清 localStorage**
+ * ⇒ 下一个用例是**从上一个用例留下的那个页面开跑**的（M6 #27「模块级状态跨用例串」的
+ * 同族缺陷：单条绿、整文件一起跑就换了个起点）。本文件当下每条的起点恰好都是默认值，
+ * 所以今天是零红——它是**可构造的假绿**，不是历史问题。
+ * ⚠️ 这里**可以**用 `VIEW_STORAGE_KEY` 常量：它不是与 `index.html` 防闪脚本的接口
+ *（盘上那个键名只有 `uiState.ts` 一个真相）。必须用**字面量**的是
+ * `ThemePicker.dom.test.tsx` 里那条断言——键名在两处（TS 与防闪脚本），
+ * 用常量就守不住"两处没漂移"。 */
+afterEach(() => {
+  vi.unstubAllGlobals()
+  localStorage.removeItem(VIEW_STORAGE_KEY)
+})
 
 test('撤销成功后必须让筛选列表重取一次', async () => {
   /**

@@ -2,6 +2,7 @@ import { render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { afterEach, expect, test, vi } from 'vitest'
 import App from '../App.tsx'
+import { VIEW_STORAGE_KEY } from '../uiState.ts'
 import Settings from '../views/Settings.tsx'
 import type { CategoriesResponse, GroupsResponse, LlmSettings } from '../types.ts'
 
@@ -135,6 +136,13 @@ afterEach(() => {
     if (orig === undefined) delete u[name]
     else u[name] = orig
   }
+  // ⭐ T5 review 的 Low-2（fix 轮）：本文件里 `render(<App/>)` 的那几条会**从盘上**读
+  // 初始 tab/筛选（`uiState.readView`），而这里原先不清 localStorage ⇒ 下一条用例是
+  // **从上一条留下的那个页面开跑**的（M6 #27「模块级状态跨用例串」的同族）。
+  // ⚠️ 用常量（而不是字面量）是可以的：盘上这个键名只有 `uiState.ts` 一个真相，
+  // 不与 `index.html` 的防闪脚本构成接口——必须用**字面量**的是
+  // `ThemePicker.dom.test.tsx` 里那条断言（键名在两处，常量守不住漂移）。
+  localStorage.removeItem(VIEW_STORAGE_KEY)
 })
 
 const AVAILABLE: GroupsResponse = {
