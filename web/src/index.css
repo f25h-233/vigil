@@ -106,6 +106,19 @@
      ⚠️ **只改这一块**：另外四套主题的字体栈是它们各自的设计值，归 T3。 */
   --v-font-sans: 'Segoe UI', system-ui, -apple-system, 'Microsoft YaHei', sans-serif;
   --v-tracking: normal;
+  /* ⭐ T7 追加：**动效也是主题身份的一部分**（每套主题各给一档性格）。
+     ⚠️ 与色板 / 圆角 / 字体同一条纪律：五块**每块都给一份**（parity 逐名比，缺一块即红）。
+     性格分工（设计意图）：
+       default   = **克制那一档**：有过渡、**不要涟漪**、按下不缩放；
+       material  = **原生安卓那一档**：有涟漪 + M3 曲线；`--v-press-scale` 仍是 1
+                   ——M3 的按钮本来就不缩放；
+       brutalism = `0ms`（粗野主义的正确回答是"别动"）；
+       vaporwave = 慢一档且**带回弹**（`cubic-bezier(0.34, 1.2, 0.64, 1)` 的 y>1 就是过冲）；
+       glass     = 柔和（时长长一点、曲线同默认，另加一点点按下形变）。 */
+  --v-motion-dur: 150ms;
+  --v-motion-ease: cubic-bezier(0.2, 0, 0, 1);
+  --v-ripple: transparent;   /* transparent = 这套不要涟漪（RippleLayer 的整条机制因此自关） */
+  --v-press-scale: 1;        /* 1 = 按下不缩放（恒等变换，零视觉影响） */
 }
 
 /* ── ② 映射层 ── */
@@ -218,6 +231,55 @@ body::before {
     font: inherit;
     letter-spacing: inherit;
   }
+
+  /* ⭐ T7（动效层）——以下四条与上面那条**同处一个 `@layer base`**，理由也同源：
+     放在 base 层，**故意**要覆盖它的 utility（例如 `transition-none`）仍然能赢；
+     不 layering 就会像 `font:inherit` 那次一样，把 utilities 一起压掉。 */
+
+  /* ① 交互元素的状态变化走**主题的**时长与曲线（而不是浏览器默认的 `ease`）。 */
+  button,
+  a,
+  input,
+  textarea,
+  select {
+    transition:
+      background-color var(--v-motion-dur) var(--v-motion-ease),
+      border-color var(--v-motion-dur) var(--v-motion-ease),
+      color var(--v-motion-dur) var(--v-motion-ease),
+      box-shadow var(--v-motion-dur) var(--v-motion-ease),
+      transform var(--v-motion-dur) var(--v-motion-ease);
+  }
+
+  /* ② 涟漪的容器：必须能裁住它（否则圆角会被涟漪撑破）。
+     ⚠️ `outline`（键盘焦点环）**不受** `overflow: hidden` 影响 ⇒ 无障碍不被这行吃掉。 */
+  button {
+    position: relative;
+    overflow: hidden;
+  }
+
+  /* ③ 按下形变：default/material/brutalism 的 token 是 1 ⇒ 这条对它们是恒等变换（零视觉影响）。 */
+  button:active:not(:disabled) {
+    transform: scale(var(--v-press-scale));
+  }
+
+  /* ④ 涟漪本体（由 `RippleLayer.tsx` 命令式插进按钮里；它不是 React 的子节点）。
+     尺寸 / 落点 / 颜色由那个组件内联写在这三个属性之外的 style 上。 */
+  .vigil-ripple {
+    position: absolute;
+    border-radius: 50%;
+    pointer-events: none;
+    will-change: transform, opacity;
+  }
+
+  /* ⑤ 系统里关了动效 ⇒ 一律不做。**这条不是可选项**（无障碍）。 */
+  @media (prefers-reduced-motion: reduce) {
+    *,
+    *::before,
+    *::after {
+      animation-duration: 0.01ms !important;
+      transition-duration: 0.01ms !important;
+    }
+  }
 }
 
 /* ── ④ 另外四套主题：T3 定稿的完整值（四块都是 **37 个 token 一个不少**——33 是 T3 当时的
@@ -282,6 +344,11 @@ body::before {
   --v-panel-blur: 0px;
   --v-font-sans: 'Roboto', system-ui, 'Segoe UI', 'Microsoft YaHei', sans-serif;
   --v-tracking: normal;
+  /* ⭐ T7 动效：**原生安卓那一档**——M3 标准时长/曲线 + 真涟漪；按下仍不缩放（M3 本来就如此）。 */
+  --v-motion-dur: 180ms;
+  --v-motion-ease: cubic-bezier(0.2, 0, 0, 1);
+  --v-ripple: rgba(103, 80, 164, 0.22); /* M3 primary 的 22%，与 --v-accent 同源 */
+  --v-press-scale: 1;
 }
 
 [data-theme='brutalism'] {
@@ -324,6 +391,11 @@ body::before {
   --v-panel-blur: 0px;
   --v-font-sans: ui-monospace, 'Cascadia Mono', Consolas, 'Microsoft YaHei', monospace;
   --v-tracking: 0.02em;
+  /* ⭐ T7 动效：**粗野主义的正确回答是"别动"**——0ms 是这套主题的判据（可机械验证）。 */
+  --v-motion-dur: 0ms;
+  --v-motion-ease: linear;
+  --v-ripple: transparent;
+  --v-press-scale: 1;
 }
 
 [data-theme='vaporwave'] {
@@ -420,6 +492,12 @@ body::before {
   --v-panel-blur: 6px;
   --v-font-sans: system-ui, -apple-system, 'Segoe UI', 'Microsoft YaHei', sans-serif;
   --v-tracking: 0.02em;
+  /* ⭐ T7 动效：慢一档 + **带回弹**（`cubic-bezier(0.34, 1.2, …)` 的 y>1 = 过冲）+
+     青色的涟漪 + 按下缩到 0.98——与"霓虹在慢镜里晃动"这套主题同调。 */
+  --v-motion-dur: 320ms;
+  --v-motion-ease: cubic-bezier(0.34, 1.2, 0.64, 1);
+  --v-ripple: rgba(0, 229, 255, 0.28); /* 与 --v-accent 同一个青 */
+  --v-press-scale: 0.98;
 }
 
 [data-theme='glass'] {
@@ -512,6 +590,11 @@ body::before {
   --v-panel-blur: 14px;
   --v-font-sans: system-ui, -apple-system, 'Segoe UI', 'Microsoft YaHei', sans-serif;
   --v-tracking: normal;
+  /* ⭐ T7 动效：柔和那一档——时长介于默认与蒸汽波之间、曲线同默认，白涟漪 + 一点点按下形变。 */
+  --v-motion-dur: 240ms;
+  --v-motion-ease: cubic-bezier(0.2, 0, 0, 1);
+  --v-ripple: rgba(255, 255, 255, 0.25);
+  --v-press-scale: 0.98;
 }
 
 html {

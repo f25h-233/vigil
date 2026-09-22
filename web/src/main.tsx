@@ -2,6 +2,7 @@ import { StrictMode } from 'react'
 import { createRoot } from 'react-dom/client'
 import { registerSW } from 'virtual:pwa-register'
 import App from './App.tsx'
+import RippleLayer from './components/RippleLayer.tsx'
 import SwUpdateToast from './components/SwUpdateToast.tsx'
 import { markNeedRefresh } from './swUpdate.ts'
 import { applyTheme, readTheme } from './theme.ts'
@@ -28,5 +29,9 @@ createRoot(document.getElementById('root')!).render(
   <StrictMode>
     <App />
     <SwUpdateToast />
+    {/* T7 动效层：一个挂在 document 上的委托监听器，自己渲染 null。
+        ⚠️ `StrictMode` 下它的 effect 会跑两遍（挂→卸→挂）——那是**正常**的，
+        cleanup 会成对摘掉/重装监听器，不会留下双监听器（见该文件顶部注释）。 */}
+    <RippleLayer />
   </StrictMode>,
 )

@@ -269,6 +269,12 @@ const STRUCTURAL: Record<string, Record<string, string>> = {
     '--v-wallpaper-size': 'auto',
     '--v-wallpaper-pos': 'center top',
     '--v-surface-2': '#e8def8', // F5：M3 secondary-container（选中态的底，= 它的 --v-accent-soft）
+    // ⭐ T7：动效 token 也进这张表——它们是**主题身份**（180ms vs 0ms vs 320ms 是三种性格），
+    // 不只是"能跑就行"的实现细节。四套 × 4 = 16 条，表驱动写法不变。
+    '--v-motion-dur': '180ms',
+    '--v-motion-ease': 'cubic-bezier(0.2, 0, 0, 1)',
+    '--v-ripple': 'rgba(103, 80, 164, 0.22)',
+    '--v-press-scale': '1',
   },
   brutalism: {
     '--v-radius-md': '0px', // 方角是粗野主义的判据
@@ -284,6 +290,12 @@ const STRUCTURAL: Record<string, Record<string, string>> = {
     '--v-wallpaper-size': 'auto',
     '--v-wallpaper-pos': 'center top',
     '--v-surface-2': '#ffe600', // F5：选中态**纯黄**（这套主题唯一的高亮色，退回默认=选中没了）
+    // ⭐ T7：**粗野主义的 0ms 是这套主题的判据**——退回默认的 150ms 会让"别动"变成"慢慢动"，
+    // 而屏幕上只是"有点不对"（这正是这张表存在的理由，见文件上方 F3 那段）。
+    '--v-motion-dur': '0ms',
+    '--v-motion-ease': 'linear',
+    '--v-ripple': 'transparent',
+    '--v-press-scale': '1',
   },
   vaporwave: {
     '--v-radius-md': '0.5rem',
@@ -303,6 +315,11 @@ const STRUCTURAL: Record<string, Record<string, string>> = {
     '--v-wallpaper-size': '100% 62%, 100% 62%',
     '--v-wallpaper-pos': 'center top, center top',
     '--v-surface-2': 'rgba(64, 16, 82, 0.84)', // F5：R7 的暗玻璃**选中态**（alpha 是照判据定的）
+    // ⭐ T7：慢一档 + 回弹（`cubic-bezier(0.34, 1.2, …)`，y>1 就是过冲）。
+    '--v-motion-dur': '320ms',
+    '--v-motion-ease': 'cubic-bezier(0.34, 1.2, 0.64, 1)',
+    '--v-ripple': 'rgba(0, 229, 255, 0.28)',
+    '--v-press-scale': '0.98',
   },
   glass: {
     '--v-radius-md': '0.5rem',
@@ -319,6 +336,11 @@ const STRUCTURAL: Record<string, Record<string, string>> = {
     '--v-wallpaper-size': '100% 100%, 100% 100%',
     '--v-wallpaper-pos': '0 0, 0 0',
     '--v-surface-2': 'rgba(34, 42, 80, 0.68)', // F5：R8 的暗玻璃**选中态**（压在 #22ff88 上定的）
+    // ⭐ T7：柔和那一档。
+    '--v-motion-dur': '240ms',
+    '--v-motion-ease': 'cubic-bezier(0.2, 0, 0, 1)',
+    '--v-ripple': 'rgba(255, 255, 255, 0.25)',
+    '--v-press-scale': '0.98',
   },
 }
 
