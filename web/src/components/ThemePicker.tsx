@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import { THEMES, type ThemeId } from '../theme.ts'
+import ArgusLabel from './ArgusLabel.tsx'
 
 /**
  * 顶栏的紧凑切换器：一个 🎨 + 一个五项菜单。
@@ -73,7 +74,12 @@ export default function ThemePicker({
                     : 'text-vigil-fg-2 active:bg-vigil-surface')
                 }
               >
-                {t.label}
+                {/* ⭐ T8-3：ARGUS 那一条**先乱码、后显名**（用户的要求「每次都演」）。
+                    ⚠️ 乱码期间点它是"**揭晓**"而不是"选中"（`ArgusLabel` 内部 `stopPropagation`），
+                    所以这个 `<button role="menuitemradio">` 里嵌的东西**只能是 span**——
+                    HTML 不许 button 嵌 button（T4 的既有注释同款）。
+                    无障碍的键盘路径不受影响：直接 Enter 就是选中该主题（乱码是装饰）。 */}
+                {t.id === 'argus' ? <ArgusLabel /> : t.label}
               </button>
             </li>
           ))}

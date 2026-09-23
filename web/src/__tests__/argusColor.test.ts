@@ -485,13 +485,31 @@ test('⛔ R10⑥：那份 JSON 是 **localStorage 可控**的 ⇒ 白名单按�
       '--v-page-image': 'url(http://evil/x.png)', // 值不合形状 ⇒ 丢
       '--v-x': '#000000; background-image: url(http://evil)', // 值里夹带 ⇒ 丢
       '--v-y': 42, // 不是字符串 ⇒ 丢
+      // ⭐⭐ N2（T8-2 fix 复审的 Minor，T8-3 折进本轮）：**已知键 + 坏值**。
+      // 上面那四条"坏"条目全部在**键名**那一步就被丢了（`background-color` 不合形状，
+      // `--v-page-image`/`--v-x`/`--v-y` 的键名不在 `KNOWN` 那 12 个里）⇒ 值判据
+      //（`RE_HEX`/`RE_RGB`）**一条都没被执行到**，成了**不可达的判据**。
+      // ⚠️ 这正是本项目最贵的一类（判据在、却永远不会被考验）：实测把 `RE_RGB` 改成
+      // `/^.+$/`（值白名单形同虚设）时，本文件**只红静态钉子 R10④ 一条**，行为侧零信号。
+      // ⇒ 下面两条是**唯一**还能把值判据拉回可达的喂料：键名合法 ⇒ 键名那步放行，
+      // 只有值判据能挡。（⛔ 别用 `--v-fg`：它上面已经有一条合法值，同一对象字面量里
+      // 重复键会被 TS 报 TS1117、且后者覆盖前者。）
+      '--v-accent': 'url(http://evil/x.png)', // 已知键 + 值不合形状 ⇒ 丢（只有值判据能挡）
+      '--v-fg-2': '#000000; background-image: url(http://evil)', // 已知键 + 值里夹带 ⇒ 丢
     }),
   )
   runPreflash()
   const st = document.documentElement.style
   expect(st.getPropertyValue('--v-fg')).toBe('#f2f2f2')
   expect(st.getPropertyValue('--v-border')).toBe('rgba(242, 242, 242, 0.45)')
-  for (const bad of ['background-color', '--v-page-image', '--v-x', '--v-y']) {
+  for (const bad of [
+    'background-color',
+    '--v-page-image',
+    '--v-x',
+    '--v-y',
+    '--v-accent', // N2：这一对**走的是值判据**（键名合法），是它可达的证据
+    '--v-fg-2',
+  ]) {
     expect(st.getPropertyValue(bad), `${bad} 不该被贴上`).toBe('')
   }
 })
