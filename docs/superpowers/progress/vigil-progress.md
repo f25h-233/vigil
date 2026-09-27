@@ -40,6 +40,12 @@ HEAD          见 `git log -1`（M6 代码收尾在 d608409；本文件之后还
 不随时间漂的关系式：
   ① 归档不变量：docs/digests/ 的文件集合 == 库里 digests 的窗口日期集合，且**逐字节相等**
      （`.gitattributes` 给 docs/digests/*.md 定了 text eol=lf —— 对 git 免疫）
+     ⚠️ **口径必须写清（2026-09-28 实测，此前文档缺了这句 ⇒ 害人做出假红结论）**：
+     「窗口日期」= **本机时区（UTC+8）下 `day_of(window_from)`**，**不是 UTC**。
+     根源：`vigil/digest.py` 的 `day_window()` 用 naive `strptime().timestamp()`（本机解释），
+     落盘文件名与它同源。**用 UTC 读整张表会左移一天**（UTC+8 零点在 UTC 里是前一天 16:00）
+     ⇒ 会呈现出"集合差两天 + 共有日 0 天相同"的**假红**（2026-09-28 实测就是这样）。
+     ✅ 按正确口径实测：**17/17 逐字节相等**（工作区纯 LF）。
      ⚠️ **M6 收尾时实测仍成立**（11 个文件、逐字节相等）
   ② Web 侧不写 data/vigil.db（D11）。**M6 把它钉得更死**：守卫覆盖**整个 data/ 目录树**
      （不只是主库指纹），且 `/api/config/pack` 与 `PUT /api/llm` 都进了那份端点表
