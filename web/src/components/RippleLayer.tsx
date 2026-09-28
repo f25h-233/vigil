@@ -1,4 +1,5 @@
 import { useEffect } from 'react'
+import { cssTimeToMs } from '../cssTime.ts'
 
 /**
  * 全局触点涟漪（**事件委托** + **挂在 `document.body` 上的独立图层**）。
@@ -111,9 +112,16 @@ export default function RippleLayer() {
       // ⚠️ 时长与曲线都取**主题 token**（`--v-ripple-dur` 比状态过渡慢一档；
       // `--v-motion-ease` 在 vaporwave 那套是带过冲的 `cubic-bezier(…, 1.2, …, 1)`
       // ——硬编码曲线会把那套主题的性格抹平）。取不到时给中性兜底（jsdom 不加载 CSS）。
-      // ⚠️ 两个 token 的值都**带 `ms` 单位**（五块主题一致）：`parseFloat('360ms')` = 360。
-      const parsedDur = Number.parseFloat(cs.getPropertyValue('--v-ripple-dur').trim())
-      const duration = Number.isFinite(parsedDur) ? parsedDur : 300
+      //
+      // ⚠️⚠️ **时长必须走 `cssTimeToMs`，不能用 `parseFloat`**（M7 冒烟 F1，真缺陷）：
+      // `parseFloat` 假设"值带 `ms` 单位 ⇒ `parseFloat('360ms') = 360`"，但**压缩后的产物**
+      // 把它写成了 **`.36s`**（`vite build` / esbuild 的改写，`dist/assets/index-*.css` 实测）
+      // ⇒ `parseFloat('.36s') = 0.36`（当成毫秒）= **0.36ms**，涟漪在线上等于不存在。
+      // jsdom 不加载 CSS、dev 模式送的是 `360ms` ⇒ 这个单位陷阱**只在构建后出现**，
+      // 解析器本身由 `cssTime.test.ts` 的单测钉住（含 `.36s ⇒ 360` 那条），
+      // "涟漪真的看得见"归冒烟。详见 `../cssTime.ts` 的注释。
+      const parsedDur = cssTimeToMs(cs.getPropertyValue('--v-ripple-dur'))
+      const duration = parsedDur ?? 300
       const easing = cs.getPropertyValue('--v-motion-ease').trim() || 'ease'
 
       /** 动画结束 ⇒ 移除**外层**（内层随它一起去）。这是"连按两次各有一份涟漪"的成对收尾。 */

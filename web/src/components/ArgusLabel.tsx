@@ -13,7 +13,11 @@ function scramble(n: number): string {
  *
  * ⚠️ 三条约束：
  * 1. **只能是 `<span>`**：菜单项本身已经是 `<button role="menuitemradio">`，HTML 不许 button 嵌 button。
- *    ⇒ 跳过用的点击挂在 span 上 + `stopPropagation()`（点它是"揭晓"，不是"选中"）。
+ *    ⇒ 跳过用的点击挂在 span 上 + `stopPropagation()`。
+ *    ⚠️⭐ 那条 `stopPropagation()` **只在乱码期生效**：乱码期点它是"**揭晓**"（不选中），
+ *    **揭晓之后**点它是"**选中**"（正常冒泡到菜单项）。此前它是无条件的，于是揭晓后
+ *    这一行仍点不中（冒烟 F2）——注释说的本来是"乱码期间"，代码做的是"永远"，
+ *    又一处「结论对、依据错」。
  *    无障碍的键盘路径 = 直接 Enter 选中该主题（乱码是**装饰**，不是功能）。
  * 2. 每次挂载都演一遍（用户的要求："每次都演"）⇒ 不需要 localStorage 开关。
  * 3. 显名后**必须清掉定时器**（判据在 `argusLabel.dom.test.tsx` 第三条：**观察
@@ -39,6 +43,13 @@ export default function ArgusLabel({ text = 'Project ARGUS', ms = 2500 }: { text
       data-testid="argus-label"
       title={revealed ? undefined : '点一下直接揭晓'}
       onClick={(e) => {
+        // ⭐⭐ M7 冒烟 F2（真缺陷）：**乱码期是"揭晓"，揭晓后是"选中"**。
+        // ⚠️ `stopPropagation` 的意图从来就只是"乱码期间点一下 = 揭晓，别顺手把主题选了"
+        // （见文件顶部约束 1），但它此前是**无条件**的 ⇒ 揭晓之后这个 span 继续吞掉点击，
+        // 而菜单项（`button role="menuitemradio"`）靠冒泡上来的 click 触发 `onChange`
+        // ⇒ 点标签正中间选不中主题（可点区只剩按钮右侧那条窄边）。
+        // ⇒ 只有**还没揭晓**时才拦。揭晓之后让点击正常冒泡 = 像别的菜单项一样选中。
+        if (revealed) return
         e.stopPropagation()
         setRevealed(true)
       }}
