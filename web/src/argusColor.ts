@@ -26,13 +26,34 @@ export const ARGUS_COLOR_KEY = 'vigil.argus.color'
  */
 export const ARGUS_VARS_KEY = 'vigil.argus.vars'
 
-/** 具名色：不是 CSS 的 green（#008000 在纯黑底上偏暗），而是终端色 */
+/**
+ * 具名色：不是 CSS 的 green（#008000 在纯黑底上偏暗），而是终端色。
+ *
+ * ⚠️⭐ **`red` 的值是 `#ff6b61`，不是它原来那个 `#ff5f56`**（用户 2026-09-29 裁决：
+ * "换个更亮的红，保留'红'这个语义名字"）。理由写在下面，**别照着旧值改回去**。
+ *
+ * **为什么不能更暗**：闸门判的是**派生出来的整份配色**，不只是基色（C1，见
+ * `argusDerivedFailure`）。`#ff5f56` 的基色在纯黑底上有 7.02:1（远超 `MIN_LUMINANCE`
+ * 那关），**但**它派生出的 `--v-fg-3`（alpha 0.58）在 `--v-bg` 上只有 **2.85:1 < 3**
+ * ⇒ 用户 `/color red` 会被自己的闸门拒（这就是用户裁定的那件事）。
+ * ⇒ 新值从**同一个色相族**（保留 `#ff5f56` 的 g:b ≈ 1.10 那个"暖红"而不是纯红
+ * `#ff0000`）整体提亮，**只提亮到刚过线**：`--v-fg-3` = **3.0053**（≥3，余量 0.18%）、
+ * `--v-fg-4` = **1.8462**（≥1.75）。
+ * ⚠️ 口径就是那条 `--v-fg-3 ≥ 3`：它沿用本仓对"弱化文字"（`themePalette.test.ts` 的
+ * muted）的既有标准，是**闸门自己写着的**那个数（`DERIVED_TEXT_CHECKS`），不是这里另定的。
+ * ⛔ **再暗一点都不行**：同一色相族里 `#ff6a5f`（再暗一档）的 fg-3 = 2.9905 < 3 ⇒ 被拒；
+ * `#f85149`（GitHub 的"危险红"）更不行（fg-3 = 2.62）。**提亮就是这条闸门的代价**——
+ * 红变浅是"能不能用"换来的，不是审美选择。
+ * ⚠️ 跨文件连带（**有判据**）：`index.css` 的 argus 块里 `--v-danger` 及其派生
+ * （`-soft`/`-btn`/`-btn-active`）是**照这个值抄的**，`argusColor.test.ts` 的 R12-a
+ * 逐字对账两者 ⇒ 改这里必须同改那边。
+ */
 export const ARGUS_NAMED: Record<string, string> = {
   green: '#00ff9c',
   white: '#f2f2f2',
   amber: '#ffb000',
   cyan: '#22d3ee',
-  red: '#ff5f56',
+  red: '#ff6b61',
   magenta: '#ff5fd2',
 }
 
@@ -131,7 +152,9 @@ const DERIVED_FACES: { name: string; alpha: number }[] = [
  *   ⇒ "刚好够亮的灰"（4.5:1 那条线，`#757575` 一带）**今天会拒**，得往亮处再走 38 档。
  *   这就是为什么错误文案里点名的是"**派生值**"而不是"太暗"——基色明明达标。
  * · **彩色**：alpha 0.58/0.38 是**乘性**的，所以饱和色的窗口比灰宽得多
- *   （`#ff5fd2` 收、`#ff5f56` 拒、`/color white` 富余）。
+ *   （`#ff5fd2` 收、**旧** `red` `#ff5f56` 拒、`/color white` 富余）。
+ *   ⚠️ 具名色 `red` 因此**换过一次值**（`#ff5f56` → `#ff6b61`，用户 2026-09-29 裁决，
+ *   见 `ARGUS_NAMED` 上方那段）：旧值的 fg-3 = 2.85 **过不去这条闸门**；新值 3.0053 刚好过。
  * ⛔ 别把 1.75 或 3 当成"可读性标准"引用：它们唯一的作用是让**每一档 alpha 都有主**。
  */
 const DERIVED_TEXT_CHECKS: { token: string; alpha: number; min: number }[] = [

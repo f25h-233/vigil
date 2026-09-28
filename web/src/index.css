@@ -733,14 +733,16 @@ body::before {
   --v-accent-soft: rgba(0, 255, 156, 0.18);
   --v-accent-text: #00ff9c;
   /* 危险 / 提醒：终端色板——`--v-danger` 就是 `ARGUS_NAMED.red` 的字面值 ——
-     ⚠️ 但 **`/color red` 今天会被闸门拒**（C1 之后）：那个基色派生出的 `--v-fg-3` = 2.85、
-     `--v-fg-4` = 1.78 ⇒ 它当**基色**用会让整套弱化文字读不出来。两件事**都成立**：
-     色值同源（`argusColor.test.ts` 的 R12-a 对账）、而入口被闸门拦着。
+     ⭐ 用户 2026-09-29 裁决：`red` 从 `#ff5f56` **换成更亮的 `#ff6b61`**（保留"红"这个名字），
+     因为它原来**过不去自己那道闸门**（C1 判的是派生出的整份配色：旧值派生的 `--v-fg-3`
+     只有 2.85 < 3）。新值 fg-3 = 3.0053 / fg-4 = 1.8462 ⇒ 今天 `/color red` **收**。
+     ⚠️ 所以下面这五行必须与 `argusColor.ts` 的 `ARGUS_NAMED.red` **同一时刻**动
+     （`argusColor.test.ts` 的 R12-a 逐字对账；改一处不改另一处 ⇒ 必红）。
      `--v-danger` 本身仍被 `themePalette.test.ts` 逐套跑（它遍历 `THEMES` ⇒ argus 自动在内）。 */
-  --v-danger: #ff5f56;
-  --v-danger-soft: rgba(255, 95, 86, 0.12);
-  --v-danger-btn: rgba(255, 95, 86, 0.18);
-  --v-danger-btn-active: rgba(255, 95, 86, 0.3);
+  --v-danger: #ff6b61;
+  --v-danger-soft: rgba(255, 107, 97, 0.12);
+  --v-danger-btn: rgba(255, 107, 97, 0.18);
+  --v-danger-btn-active: rgba(255, 107, 97, 0.3);
   --v-danger-text: #ffb3ae;
   --v-warn: #ffbd2e;
   --v-warn-soft: rgba(255, 189, 46, 0.12);
