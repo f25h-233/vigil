@@ -72,8 +72,97 @@ function luminance([r, g, b]: RGB): number {
  * ⛔ 太暗的颜色要拒：终端主题是**纯黑底**，一个接近黑的前景色等于把整个界面读没
  * （而它会静默生效 ⇒ 用户只会觉得"这个主题坏了"）。
  * 阈值取 4.5:1 对纯黑底反推出的亮度下界：L ≥ 0.175 ⇒ 对比度 = (L+0.05)/0.05 ≥ 4.5。
+ *
+ * ⚠️ 这一条只保证**基色自己**（`--v-fg` / `--v-accent`）读得出来 ⇒ 它是**必要**条件、
+ * **不是**充分条件。（C1 的实证：`#757575` 基色 4.56:1 达标，而它派生出来的
+ * `--v-fg-3` 只有 2.15:1——闸门与 alpha 表一度是**两个不知道彼此的所有者**。）
+ * 派生值的安全由下面 `argusDerivedFailure()` 负责，两条一起才是"整套配色可用"。
  */
 const MIN_LUMINANCE = 0.175
+
+/**
+ * ARGUS 的底。⚠️ **硬编码的纯黑**，因为下面那两条下界就是**对纯黑底**反推出来的。
+ * 它不是"实现细节"：`[data-theme='argus']` 的 `--v-bg` 一旦被改成别的色，
+ * 本文件里的每一个数（含 `MIN_LUMINANCE` 反推的 4.5:1）就都不作数了。
+ * ⇒ `themeTokens.test.ts` 用 verbatim 断言把那个 `#000000` 钉死（C2）。
+ */
+const ARGUS_BG: RGB = [0, 0, 0]
+
+/** 三层叠色：半透明层压在不透明底上（与 `themePalette.test.ts` 的 `over` 同一套算术）。 */
+function over(top: RGB, alpha: number, bottom: RGB): RGB {
+  return [
+    top[0] * alpha + bottom[0] * (1 - alpha),
+    top[1] * alpha + bottom[1] * (1 - alpha),
+    top[2] * alpha + bottom[2] * (1 - alpha),
+  ]
+}
+
+/** WCAG 对比度（与 `themePalette.test.ts` 的 `contrast` 同一套算术、同一个 `luminance`）。 */
+function contrast(a: RGB, b: RGB): number {
+  const [hi, lo] = [luminance(a), luminance(b)].sort((x, y) => y - x)
+  return (hi + 0.05) / (lo + 0.05)
+}
+
+/**
+ * ⭐ C1：派生检查里"文字坐在哪个面上"。终端真正会出现的面只有这两个：
+ *   `--v-bg`（纯黑，alpha 0）与 `--v-surface-2`（选中行 / 输入框 focus / 按钮 active
+ *   的底，= 基色叠 0.14）——**后者更亮 ⇒ 对比度更差 ⇒ 它就是最弱环**。
+ * ⚠️ 与 `themePalette.test.ts` 的面清单同源（那里也是这"两个面取更差"）。
+ */
+const DERIVED_FACES: { name: string; alpha: number }[] = [
+  { name: '--v-bg', alpha: 0 },
+  { name: '--v-surface-2', alpha: 0.14 },
+]
+
+/**
+ * 派生层的两个下界（alpha 照 `deriveArgusVars` 抄死；**不是**从那里读，见下面的注）。
+ *
+ * · `--v-fg-3` = **弱化文字**（未选中的 tab、群名、时间、品牌区小字…全仓最常用的弱化色）
+ *   ⇒ 沿用本仓既有口径 **≥ 3**（`themePalette.test.ts` 的 `muted`）。
+ * · `--v-fg-4` = **最弱一档**（提示符、占位符、"读取中…"）⇒ **≥ 1.75**。
+ *   ⚠️ 为什么是 1.75 这个"看着低"的数：它不是可读性标准，是**下界**——0.38 这道 alpha
+ *   天生只能到这么高（`#00ff9c` 才 2.77，`/color white` 3.14）。定高的会把**连默认色都拒掉**。
+ *   ⚠️ 并且它今天是**被动的**：在 alpha 0.58/0.38 下，"fg-3 ≥ 3"已经蕴含 "fg-4 ≥ 1.83"
+ *   （全色域实测的最小值，见 `argusColor.test.ts` 里那条断言）⇒ 第二条比第一条弱。
+ *   ⇒ 它在这儿的意义是**把 fg-4 的 alpha 变成有主的**：谁把 0.38 调小，这条先红。
+ *
+ * ⚠️⭐ **收紧之后用户该按什么找色**（实测，照抄别猜）：
+ * · **灰**：闸门落在 `#9a9a9a`（`--v-fg-3` = 2.9957，拒）/ `#9b9b9b`（3.0210，收）之间
+ *   ⇒ "刚好够亮的灰"（4.5:1 那条线，`#757575` 一带）**今天会拒**，得往亮处再走 38 档。
+ *   这就是为什么错误文案里点名的是"**派生值**"而不是"太暗"——基色明明达标。
+ * · **彩色**：alpha 0.58/0.38 是**乘性**的，所以饱和色的窗口比灰宽得多
+ *   （`#ff5fd2` 收、`#ff5f56` 拒、`/color white` 富余）。
+ * ⛔ 别把 1.75 或 3 当成"可读性标准"引用：它们唯一的作用是让**每一档 alpha 都有主**。
+ */
+const DERIVED_TEXT_CHECKS: { token: string; alpha: number; min: number }[] = [
+  { token: '--v-fg-3', alpha: 0.58, min: 3 },
+  { token: '--v-fg-4', alpha: 0.38, min: 1.75 },
+]
+
+/** 派生检查的失败详情（`null` = 整套派生配色达标）。 */
+export type ArgusDerivedFailure = { token: string; face: string; ratio: number; min: number }
+
+/**
+ * 逐步复刻 `deriveArgusVars` 的**叠色链**，对每个派生文字 token 的**最弱环**做对比度检查。
+ *
+ * ⚠️ 为什么 alpha 在这里**抄死**、而不是 `deriveArgusVars(base)[token]` 读回来：
+ * 读回来就得**解析** `rgba(r, g, b, a)` 字符串（正则 + `parseFloat`）——多一条解析路径就多一处
+ * 能与派生表漂移的地方。抄死的代价是"改 alpha 要改两处"，而**这一点由判据兜住**：
+ * `argusColor.test.ts` 有一条断言逐字比对 `DERIVED_TEXT_CHECKS` 的 alpha
+ * 与 `deriveArgusVars()` 输出里的那几个数（改一处不改另一处 ⇒ 必红）。
+ */
+export function argusDerivedFailure(base: string): ArgusDerivedFailure | null {
+  const rgb = parseHex(base)
+  if (rgb === null) throw new Error(`argusDerivedFailure 需要 #rrggbb，收到 ${base}`)
+  for (const { token, alpha, min } of DERIVED_TEXT_CHECKS) {
+    for (const { name, alpha: faceAlpha } of DERIVED_FACES) {
+      const face = over(rgb, faceAlpha, ARGUS_BG)
+      const ratio = contrast(over(rgb, alpha, face), face)
+      if (ratio < min) return { token, face: name, ratio, min }
+    }
+  }
+  return null
+}
 
 export function parseArgusColor(input: string): ArgusColorResult {
   const key = input.trim().toLowerCase()
@@ -85,6 +174,16 @@ export function parseArgusColor(input: string): ArgusColorResult {
   }
   if (luminance(rgb) < MIN_LUMINANCE) {
     return { ok: false, reason: `这个颜色太暗了，在纯黑底上读不出来：${toHex(rgb)}` }
+  }
+  // ⭐ C1：基色够亮**不等于**派生出来的那套够亮——判**整份**（见 `argusDerivedFailure`）。
+  const derived = argusDerivedFailure(toHex(rgb))
+  if (derived !== null) {
+    return {
+      ok: false,
+      reason:
+        `这个颜色太暗了：它派生出的 ${derived.token} 在 ${derived.face} 上只有 ` +
+        `${derived.ratio.toFixed(2)}:1（至少要 ${derived.min}:1）——换个更亮的颜色试试：${toHex(rgb)}`,
+    }
   }
   return { ok: true, value: toHex(rgb) }
 }

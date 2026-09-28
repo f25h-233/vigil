@@ -680,9 +680,15 @@ body::before {
 [data-theme='argus'] {
   /* ═══ Project ARGUS（T8-1）：**终端**那一档 ═══
      用户原话：「加上看起来像终端一样的主题（纯黑为底色…一定要大变样…但功能不能少）」。
-     这张块只负责**默认色**（荧光绿）；`/color` 改色时由 `src/argusColor.ts` 把全套
-     `--v-fg*` / `--v-surface*` / `--v-border*` / `--v-accent*` 算成字面 `rgba()` 写到
-     `:root` 的**行内**变量上（行内赢过本块 ⇒ 这才改得动主题）。
+     ⭐ I2（delta 终审 Important）：这张块负责的是「**默认色 + 全部结构**」，**不是**"只负责默认色"。
+     实测过的分工（此前那句话是**错的论证**，它下一个读者是改主题的人）：
+       · **颜色那一族**（`--v-fg*` / `--v-surface*` / `--v-border*` / `--v-accent*`）——
+         本块提供的是**首帧**与 `clearArgusColor()` 之后的**回落值**；而**稳态**恒由
+         `src/argusColor.ts` 的派生写进 `:root` 的**行内**变量（行内赢过本块）。默认色是荧光绿。
+       · **结构那一族**（`--v-danger` / `--v-warn` / `--v-radius-*` / `--v-motion-dur` /
+         `--v-shadow-card` / `--v-font-sans` …）——**只**来自本块：`/color` **永远**碰不到它们
+         （`deriveArgusVars` 只算颜色那 12 个键）。说"本块只负责默认色"会让人以为
+         这些结构 token 在别处也有一份、或者 `/color` 会带着它们一起变——都不是。
 
      ⚠️ **为什么默认值也要在这块里给全**（而不是"反正会被行内覆盖"）：① `/color` 之前的
      首帧、以及 `clearArgusColor()` 之后，屏幕上的字色就是这里这份；② `themePalette.test.ts`
@@ -726,9 +732,11 @@ body::before {
   --v-accent: #00ff9c;
   --v-accent-soft: rgba(0, 255, 156, 0.18);
   --v-accent-text: #00ff9c;
-  /* 危险 / 提醒：终端色板——`--v-danger` 就是 `ARGUS_NAMED.red` 的字面值，
-     于是"用 /color red"与"看错误提示"是同一个红。这张纯黑底上的对比度由
-     `themePalette.test.ts` 逐套跑（它遍历 `THEMES` ⇒ argus 自动在内）。 */
+  /* 危险 / 提醒：终端色板——`--v-danger` 就是 `ARGUS_NAMED.red` 的字面值 ——
+     ⚠️ 但 **`/color red` 今天会被闸门拒**（C1 之后）：那个基色派生出的 `--v-fg-3` = 2.85、
+     `--v-fg-4` = 1.78 ⇒ 它当**基色**用会让整套弱化文字读不出来。两件事**都成立**：
+     色值同源（`argusColor.test.ts` 的 R12-a 对账）、而入口被闸门拦着。
+     `--v-danger` 本身仍被 `themePalette.test.ts` 逐套跑（它遍历 `THEMES` ⇒ argus 自动在内）。 */
   --v-danger: #ff5f56;
   --v-danger-soft: rgba(255, 95, 86, 0.12);
   --v-danger-btn: rgba(255, 95, 86, 0.18);

@@ -198,6 +198,40 @@ test('阴性对照：非 ARGUS 主题下**不许**出现品牌区（它是这套
   expect(screen.queryByText('[1]信息流')).toBeNull()
 })
 
+/**
+ * ⭐ I4（delta 终审 Important）：`ArgusCommand` 是**第二个写入口**，而它"只在 argus 下渲染"
+ * 此前**没有判据**。
+ *
+ * 为什么这条非有不可：`ArgusCommand` 直接调 `applyArgusColor`（**不经** `applyTheme`），
+ * 于是它绕开了 `syncArgusColor` 那层"只在 argus 主题下写"的门（`theme.ts` 的注释把这一点
+ * 写得很清楚：「直接调它而在非 argus 主题下就是 §0.1 那个"行内覆盖顶掉别的主题"的缺陷
+ * 换个入口重演」）。今天它**正确**，靠的是 `App.tsx:71` 那个三元——`theme === 'argus'`
+ * 才渲染这套头部。⚠️ 而上面那条阴性对照守的是**品牌区**（徽记 / 字标 / 小字 / `ARGUS:~$`），
+ * 它**够不到命令行**：有人把 `<ArgusCommand />` 挪进默认头部 ⇒ 另外五套主题下多出一个
+ * 能改 ARGUS 颜色的输入行，而**零信号**。
+ *
+ * ⚠️ 变异反证：把 `App.tsx` 的 argus 分支去掉（两套头部合并、总是渲染带命令行的那个）
+ * ⇒ 本条**必红**（第二段拿不到 `ARGUS 命令`，或第一段不该有却有了）。
+ */
+test('⛔ 非 ARGUS 主题下**不渲染** `ArgusCommand`（它只在终端头部里活着）', () => {
+  installFetch()
+  // ① 非 argus（盘上没写主题 ⇒ `readTheme()` 回落 'default'）：命令行**一格都不许有**。
+  const first = render(<App />)
+  expect(
+    screen.queryByLabelText('ARGUS 命令'),
+    '非 ARGUS 主题下出现了命令行 ⇒ 那是个能改 ARGUS 颜色的第二写入口',
+  ).toBeNull()
+  first.unmount()
+
+  // ② 换到 argus（`App` 的 `useState(readTheme)` 是惰性初始化 ⇒ 挂载时读盘）：它必须**在**。
+  localStorage.setItem('vigil.theme', 'argus')
+  render(<App />)
+  expect(
+    screen.getByLabelText('ARGUS 命令'),
+    'ARGUS 主题下没有命令行 ⇒ `/color` 的入口没了（功能不许少）',
+  ).toBeTruthy()
+})
+
 test('`undoMsg` 在 ARGUS 头部里也有落点（终端风的一行小字）——功能不许少', async () => {
   localStorage.setItem('vigil.theme', 'argus')
   installFetch()
@@ -207,12 +241,15 @@ test('`undoMsg` 在 ARGUS 头部里也有落点（终端风的一行小字）—
 })
 
 /**
- * ⭐ Task 3 的钩子（本任务只**加钩子不加行为**）。
+ * ⭐ Task 3 的钩子 —— ⚠️⭐ I3（delta 终审 Important）：**它的消费者从来没有出现**，这里照实写。
  *
- * ⚠️ 这条判据存在的理由：`data-theme-picker` 是**给别的任务用的接口**——
- * 没有测试钉着，它在任何一次"顺手清理 className/属性"里都会静默消失，
- * 而发现它的时刻是 T8-3 的渲染脚本里（那时候翻回来找，成本高得多）。
- * ⚠️ 顺带钉住"**没加行为**"：菜单照旧六项、照旧选得中。
+ * `data-theme-picker` 是 T8-2 为 T8-3 留的接口（原注释："那里要在这块浮层上挂乱码演出"），
+ * 而 T8-3 **没有用它**——乱码标签渲染在菜单项内部。全仓（含 `_smoke/` 的脚本）
+ * 除了「`ThemePicker.tsx` 加属性」与「本文件这条判据」，**没有第三处**。
+ * ⇒ 这条判据**钉住的是一个没人用的属性**——本仓对这件事的态度是"要么它有用、要么照实说"，
+ * 所以：① 属性的注释已改成"今天没有消费者"；② 这条判据改成**照实守它是什么**——
+ * 它守的是"菜单容器有一个稳定的机械标识，且菜单的行为一字未改"，**不再声称**有人要用它。
+ * ⛔ 要退役它：属性与这条判据**一起删**（那是一次有意的接口退役，不是回归）。
  */
 test('ThemePicker 的菜单容器带 `data-theme-picker` 钩子，且行为一字未改', async () => {
   const onChange = vi.fn()

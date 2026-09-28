@@ -66,6 +66,20 @@ const LAYER = 'vigil-ripple-layer'
  *  而不是在 JS 里硬编码一个 `ease`（硬编码会把那套主题的性格抹平）。 */
 const EASE = 'cubic-bezier(0.34, 1.2, 0.64, 1)'
 
+/**
+ * ⭐ I1（delta 终审 Important）：这份内联的 `--v-ripple-dur` **就是默认主题的值**。
+ *
+ * ⚠️ 它此前是 `360ms`——那是 **material 的**值（`STRUCTURAL.material`），而默认主题是 **300ms**
+ * （`index.css` 的默认块 = 2 × `--v-motion-dur` 150ms），于是"默认主题按下时 WAAPI 拿到什么"
+ * 这件事**取决于哪个文件先写**：两边各自"对"，却**没有一个所有者**。
+ * ⇒ controller 裁决：**以 `index.css` 的默认主题值为唯一所有者**，这里逐字对齐它。
+ * ⛔ 改这个数要先改 `index.css`（顺带 `themeTokens.test.ts` 那条 `v('default','--v-ripple-dur')`
+ * 会一起红——那正是"所有者只有一个"的意思）。
+ * ⚠️ 这里**不是**默认主题的完整语境：曲线用的是 vaporwave 那条（见上），这套夹具是
+ * "把 token 原样读给 WAAPI"的最小组合，**不声称**它等于任何一套真主题。
+ */
+const DEFAULT_RIPPLE_DUR = '300ms'
+
 /** jsdom 不排版 ⇒ 默认 `getBoundingClientRect()` 全是 0，几何量全塌成 `0px`。
  *  给**这个元素实例**钉一个固定几何（不改 `Element.prototype`，因此**不需要还原**：
  *  元素随 unmount 一起消失），几何量才能逐字断言。 */
@@ -92,7 +106,7 @@ function rippleBtn(props: { ripple?: string; disabled?: boolean; radius?: string
         {
           ...(props.ripple === undefined ? {} : { '--v-ripple': props.ripple }),
           borderRadius: props.radius ?? '12px',
-          '--v-ripple-dur': '360ms',
+          '--v-ripple-dur': DEFAULT_RIPPLE_DUR,
           '--v-motion-ease': EASE,
         } as CSSProperties
       }
@@ -194,8 +208,9 @@ test('① 有涟漪色的主题：图层里出现涟漪盒，几何/圆角/动�
 
   // ⭐ 动画参数来自**主题 token**：时长取 `--v-ripple-dur`（比状态过渡慢一档），
   // 曲线取 `--v-motion-ease`（vaporwave 那条带过冲）。硬编码任一个都会丢掉主题性格。
+  // ⚠️ 这个数（300ms）属于**默认主题**，所有者是 `index.css`（见 `DEFAULT_RIPPLE_DUR`）。
   expect(stub.calls, '没把动画交给 WAAPI').toHaveLength(1)
-  expect(stub.calls[0].options.duration, '--v-ripple-dur: 360ms').toBe(360)
+  expect(stub.calls[0].options.duration, `--v-ripple-dur: ${DEFAULT_RIPPLE_DUR}`).toBe(300)
   expect(stub.calls[0].options.easing).toBe(EASE)
   expect(stub.calls[0].keyframes, '关键帧必须与 index.css 里那份 @keyframes 同值').toEqual([
     { transform: 'scale(0)', opacity: 0.9 },

@@ -50,10 +50,14 @@ export default function ThemePicker({
         <ul
           role="menu"
           aria-label="主题"
-          /* ⭐ T8-3 的钩子：菜单容器的机械标识（那里要在这块浮层上挂乱码演出）。
-             ⚠️ **只加属性、不加任何行为**：按钮与 aria 结构一字未动。
-             钉它的是 `argusBrand.dom.test.tsx` 那条——没有判据的话，它在任何一次
-             "顺手清理属性"里都会静默消失，而发现它的时刻是 T8-3 的渲染脚本里。 */
+          /* ⚠️⭐ I3（delta 终审 Important）：这个钩子**今天没有消费者**——照实写。
+             T8-2 加它时是"给 T8-3 用的"（原注释："那里要在这块浮层上挂乱码演出"），
+             而 T8-3 最终**没有**用它：乱码标签直接渲染在菜单项**内部**（见下面
+             `t.id === 'argus' ? <ArgusLabel /> : t.label` 那一行）⇒ 原注释**已过期**。
+             ⚠️ 它是"布置时留下的接口"，**不是**在用的接口：全仓搜 `data-theme-picker`
+             只有「这里加属性」与「`argusBrand.dom.test.tsx` 里那条判据」两处。
+             ⇒ 留着它的**唯一**理由是"菜单容器没有一个稳定的机械标识"这个缺口本身；
+             ⛔ 谁要清理它，连着那条判据一起删（那是**一次有意的接口退役**，不是回归）。 */
           data-theme-picker=""
           className="absolute right-0 z-30 mt-1 w-40 rounded-lg border border-vigil-border bg-vigil-surface-solid p-1 text-sm shadow-vigil-card"
         >
