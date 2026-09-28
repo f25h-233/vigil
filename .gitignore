@@ -4,6 +4,15 @@
 # 数据产物（导出的明文库、缓存的解密副本）
 data/
 
+# 日报归档 —— ⛔ **不入库**（2026-09-28 用户裁定）
+#
+# 它们是 08:00 管线的正常产物，但内容是**私密信息**（群名、发信人、正文摘要）⇒
+# 一旦进 git 就留在历史里，删不干净。本机照常生成、照常读，只是不进版本库。
+# ⚠️ 因此 `.gitattributes` 里那条 `docs/digests/*.md text eol=lf` 也不再承担
+#   「逐字节归档不变量的免疫层」这个职责（那条不变量退化为**本机**性质，
+#   判据见 `docs/superpowers/progress/vigil-progress.md` §二 ①）。
+docs/digests/
+
 # Python
 __pycache__/
 *.py[oc]
