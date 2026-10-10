@@ -151,13 +151,17 @@ export default function Calendar() {
           修掉的同一个缺陷，这里是第四个消费者）。 */}
       {shown !== null && shown.snapshotAt !== null && !online && (
         <div className="mb-3 rounded-lg bg-vigil-warn-soft p-3 text-sm text-vigil-warn">
-          {/* ⚠️⚠️ T6：`最近 5 天` 这个**范围词**是承重的。
-              日历快照存的是 `feed` 那个窗口之外的另一块（全量带截止日的条目），
-              但**范围词仍要写**：用户看到"这天没有到期"时，必须知道手里这份
-              快照不是全量的（与 Feed/Digests 三条横幅同一条判据）。
-              ⚠️ 措辞照旧保持"下面是 … 同步的快照"的形状（Calendar.dom.test 的
-              `getByText(/快照/)` + `toContain('10月9日 08:30')` 依赖它）。 */}
-          离线：下面是 <SnapshotTime ts={shown.snapshotAt} /> 同步的快照（最近 5 天）。
+          {/* ⚠️⚠️ 日历快照**是全量**，所以这里**刻意不写任何范围词**（T6-F1）。
+              `syncSnapshot` 调的是 `fetchCalendar()`（无参）⇒ `api_calendar` 的
+              缺省行为 = 全量带截止日的条目（`snapshot.ts` 的 `Snapshot.calendar`
+              注释也写着"**全量**"）。真库实测：36 条横跨 4 个月，落进 5 天窗口的
+              只有 5 条——所以在日历上写"最近 5 天"是**写在用户界面上的假话**
+              （本项目守得最狠的那条："只说自己有资格说的话"）。
+              ⇒ 与 `Feed`（确实只存最近 5 天）/`Digests`（确实只存 5 篇）**不同**：
+              日历这条**不该**出现范围词。
+              ⚠️ 判据见 `Calendar.dom.test.tsx`：断言横幅里**不出现"5 天"**
+              —— 把"最近 5 天"加回来 ⇒ 必红（方向与 T6 那版相反）。 */}
+          离线：下面是 <SnapshotTime ts={shown.snapshotAt} /> 同步的快照。
         </div>
       )}
 

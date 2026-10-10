@@ -839,6 +839,64 @@ test('⚠️ F4(集成)：Feed 离线 ⇒ 人物筛选的"新增"也置灰(Feed 
   expect(screen.getAllByText('需要联网').length).toBeGreaterThanOrEqual(1)
 })
 
+test('⚠️ T6-F3：`reload()` 开头清掉上一次的失败结论(重试后旧结论必须即刻作废)', async () => {
+  /**
+   * ⭐ F3 —— 审查实测:`reload()` 开头那句 `setErr(null)` **删掉仍全绿**
+   * (无判据)。它的语义与 `Feed.tsx` / `Digests.tsx` / `Calendar.tsx` 三处
+   * 取数 effect 开头那句 `setErr(null)` **逐字同一条**:
+   * 「新一轮读取开始,上一次的失败结论即刻作废——留着它,重试成功后横幅会继续
+   * 描述一个**已经不存在**的状态」(M6 review 的结论,`Digests.tsx:100` 有原文)。
+   *
+   * ⚠️ 可达路径:**在线**加载名单**失败** ⇒ 打开面板看到错误 ⇒ 后端恢复 ⇒
+   * 点「新增」(写操作,在线 ⇒ 可点) ⇒ 成功 ⇒ 面板内 `reload()`。
+   * 此时名单已从**空**变成 `[甲]` ⇒ `people.length > 0` 那一支渲染、`err` 那一支
+   * 不再渲染 ⇒ 只有 `setErr(null)` 能清掉 `err`。
+   *
+   * ⚠️ 变异反证:删掉 `reload()` 开头的 `setErr(null)` ⇒ 名单回来了却仍挂着
+   * 「名单炸了」⇒ 本条必红(下面第一条断言)。
+   */
+  let fail = true
+  const ok = (body: unknown) => ({ ok: true, status: 200, json: async () => body })
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input)
+      const method = init?.method ?? 'GET'
+      // 加人:成功(写操作,在线 ⇒ 可点)。它触发 `reload()`。
+      if (method === 'POST' && url === '/api/persons') return ok({ uin: 10001, label: '甲' })
+      // ⚠️ **404**(`ok:false` + `status 404`):既让加载**失败**(走 catch),
+      // 又让 `noteFetchResult(404 < 500)` = `true` **保持在线**——否则 5xx / 网络
+      // 抛会把状态机按成离线,而离线是读不到快照的(`PersonPicker` 的回落只在
+      // 离线时用快照;这条用例要的是"在线失败")。
+      // ⚠️ 不能用 `ok({detail})`(200):`getJSON` 见 `ok:true` 就当**成功**,
+      // 于是走 `.then` 拿 `r.persons === undefined` ⇒ 渲染崩(实测踩过)。
+      if (url.startsWith('/api/persons')) {
+        if (fail) {
+          return { ok: false, status: 404, json: async () => ({ detail: '名单炸了' }) }
+        }
+        return ok({ persons: [PERSON] })
+      }
+      return ok({})
+    }),
+  )
+  render(<PersonPicker selected={[]} onChange={() => {}} />)
+  await userEvent.click(screen.getByRole('button', { name: /按人物筛选/ }))
+
+  // ① 加载失败 ⇒ 错误可见(这条保证下面的动作确实经过了"有一次失败"的态)
+  await screen.findByText(/名单炸了/)
+
+  // ② 后端恢复 + 点「新增」⇒ 成功 ⇒ `reload()`(它必须把①那句清掉)
+  fail = false
+  await userEvent.type(screen.getByPlaceholderText('QQ 号'), '10001')
+  await userEvent.type(screen.getByPlaceholderText(/名字/), '甲')
+  await userEvent.click(screen.getByRole('button', { name: '新增' }))
+
+  // ③ 名单回来了(甲可见)……
+  expect(await screen.findByText(/辅导员某辅导员/)).toBeTruthy()
+  // ……而**上一轮的失败结论必须已经作废**。
+  expect(screen.queryByText(/名单炸了/), '重试成功后旧失败结论必须被清掉').toBeNull()
+})
+
 // ── App:同步时机 + 离线横幅 + 撤销置灰 ────────────────────────────────
 
 test('⚠️ 在线挂载 ⇒ 同步一次快照(离线才有的那份数据)', async () => {
