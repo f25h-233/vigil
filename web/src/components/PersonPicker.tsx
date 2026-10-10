@@ -1,5 +1,7 @@
 import { useEffect, useState } from 'react'
 import { addPerson, fetchPersons, removePerson } from '../api.ts'
+import { isOnline } from '../connectivity.ts'
+import { readSnapshot } from '../snapshot.ts'
 import type { Person } from '../types.ts'
 
 /**
@@ -45,6 +47,23 @@ export default function PersonPicker({
     fetchPersons()
       .then((r) => setPeople(r.persons))
       .catch((e: unknown) => {
+        // ⚠️ 离线时**从快照取**名单,而不是清成 `null`(T6 的第二个消费者):
+        // `null` 的后果是整块人物筛选器消失——与"类目条只剩「全部」"同一个洞,
+        // 只是换了个组件。列表为空(`people.length === 0`)与"读不到"是两件事,
+        // 这里只解决后者。
+        //
+        // ⚠️ 只在**离线**时用快照(在线 4xx 见 Feed 的同一条判据:回落到旧名单
+        // = 把一次失败谎报成一次成功)。
+        // ⚠️ 快照里那份是**上次在线时的名单**:离线期间新加/删的人物不会在这里
+        // 反映出来——那是离线本身的边界,横幅会说明这是快照。
+        const snap = isOnline() ? null : readSnapshot()
+        if (snap !== null) {
+          // 快照取到了 ⇒ 有名单可用,错误横幅就不再出现(否则屏幕上会同时是
+          // "一份名单"与"读取失败",两句互相矛盾的话)。
+          setErr(null)
+          setPeople(snap.persons)
+          return
+        }
         setErr(e instanceof Error ? e.message : String(e))
         setPeople(null)
       })

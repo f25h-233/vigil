@@ -9,6 +9,45 @@ import type { Category, Item } from '../types.ts'
 
 const PAGE = 50
 
+/**
+ * 离线 + 有筛选时，在**本地**对 `snap.feed` 做与后端同口径的筛选。
+ *
+ * ⚠️ 口径（与 `vigil/store.py` 的 `_item_filters` 对齐，逐维度说明）：
+ *   · `kinds`：`item.kind` ∈ kinds（**维度内并集**）；空数组 = 不过滤。
+ *     后端筛的是**覆盖后**的类目（`_EFFECTIVE_KIND`），而快照里的 `item.kind`
+ *     正是 `item_out` 用同一张覆盖表算出来的值 ⇒ 两者同源。
+ *   · `persons`：`item.actor_uin` ∈ persons；空数组 = 不过滤。
+ *     后端走 `sn.uin`（实名消息才有）⇒ 匿名条目 `actor_uin === null` 必不匹配。
+ *   · `q`：**不分词、子串包含**、**大小写敏感**、与后端的**短查询**那一支
+ *     （`len(q) < 3` 的 `LIKE '%q%'`）**同形**。
+ *     ⚠️ 后端对 `len(q) >= 3` 走 FTS5 trigram：它**不分大小写**（ASCII）、
+ *     按 3-gram 匹配（对中文与短串的边界行为**与子串并不完全一致**）。
+ *     ⇒ 本地这一支对长查询会**比后端更严格**（可能少给条目，**不会**多给）。
+ *     宁可少给：筛不出来时用户看到的是"当前筛选下还没有条目"，
+ *     而不是一条**本来不该在这里**的条目（假阳比假阴危险，M2 同一条判据）。
+ *
+ * ⚠️ 三个维度之间是 **AND**（交集），与后端及 spec §四 #4 一致。
+ * ⚠️ 不剥控制字符 / 不转义 LIKE 通配符：这里不是 SQL，`%` 就是字面量 `%`
+ * ——后端剥控制字符是为了不让 NUL 把 pattern 截断成 `%`（那是 SQL 的问题），
+ * 本地没有这回事。刻意**不**把后端的净化逻辑照抄过来（抄错了反而引入差异）。
+ */
+function filterFeed(
+  items: Item[],
+  kinds: string[],
+  persons: number[],
+  q: string,
+): Item[] {
+  return items.filter((it) => {
+    if (kinds.length > 0 && !kinds.includes(it.kind)) return false
+    if (persons.length > 0 && !persons.includes(it.actor_uin ?? NaN)) return false
+    if (q !== '') {
+      const hay = `${it.title}\n${it.detail ?? ''}`
+      if (!hay.includes(q)) return false
+    }
+    return true
+  })
+}
+
 // 屏幕上这批数据，连同「它属于哪个查询」一起存。
 // 拆成四个 state 的话，请求在飞的那段时间会拼出「新筛选的标签 + 上一次查询的数字」
 // 这种半新半旧的句子——而计数行存在的意义恰恰是交代这个数字覆盖的范围，
@@ -110,7 +149,17 @@ export default function Feed({
   useEffect(() => {
     fetchCategories()
       .then((r) => setCats(r.categories))
-      .catch(() => setCats([])) // 类目栏拉不到不该让信息流整页不可用
+      .catch(() => {
+        // ⚠️ 失败(通常 = 离线)时**从快照取**类目表,而不是清成 `[]`(T6 的缺陷本身):
+        // 清成 `[]` 的后果是类目条只剩「全部」——用户点不出任何筛选。
+        //
+        // ⚠️ 只在**离线**时用快照:在线 4xx 是"后端活着、请求有问题",
+        // 那时回落到一张旧类目表 = 把一次失败谎报成一次成功(与下面取数回落、
+        // 以及 F2/F3 的既有裁决同一条判据)。
+        // ⚠️ `?? []` 是保底:快照也读不到时仍旧没有类目条——它是**真话**
+        //("拿不到类目表"),不是"类目表是空的"(那是另一句话)。
+        setCats(isOnline() ? [] : (readSnapshot()?.categories ?? []))
+      })
   }, [])
 
   // 输入防抖：中文输入法下每敲一下都发请求，手机上会明显卡顿
@@ -144,12 +193,35 @@ export default function Feed({
       })
       .catch((e: unknown) => {
         if (mine !== seq.current) return
-        // ⚠️ 只在**无筛选**时回落快照：快照存的是"最近 N 天的全部条目"，
-        // 把它显示在一个**带筛选**的查询下，就是拿一张不匹配的清单回答
-        // 另一个问题（"只说自己有资格说的话"，M2）。带筛选时如实报错。
+        // ⚠️ 回落快照 = 「拿一份**匹配当前筛选**的清单来显示」。
+        //
+        // ⚠️⚠️ 为什么**无筛选**那一支仍旧带这个守卫（T6）：快照存的是
+        // "最近 N 天的全部条目"——无条件把它显示在一个**带筛选**的查询下，
+        // 就是拿一张不匹配的清单回答另一个问题（"只说自己有资格说的话"，M2）。
+        //
+        // ⚠️⚠️ T6 把"带筛选"这一支从"如实报错"改成"**本地筛快照**"，
+        // 但**只在离线时**（`!isOnline()`）：
+        //   · 离线 ⇒ 带筛选**可以**回落，并对 `snap.feed` 做同口径本地筛。
+        //     用户要的效果就是"离线也能点类目筛"；不这么做，类目条即使从快照
+        //     填出来了，点一下也只会看到"读取失败"。
+        //   · **在线（4xx：后端活着、请求有问题）⇒ 行为一字不改**：仍如实报错。
+        //     那是 M2 的既有裁决——在线时"筛不到"可能是后端真的出错了，
+        //     拿本地快照冒充答案会把一次真实的失败谎报成一次成功的结果。
         const unfiltered = kinds.length === 0 && persons.length === 0 && q === ''
-        const snap = unfiltered ? readSnapshot() : null
-        if (snap !== null && snap.feed.length > 0) {
+        const canFallback = isOnline() ? unfiltered : true
+        const snap = canFallback ? readSnapshot() : null
+        // ⚠️ 空筛选时 `filterFeed` 原样返回（`kinds/persons` 为空、`q` 为 ''），
+        // 所以无筛选那一支走的仍是 `snap.feed` 本身，一字不差。
+        const items = snap === null ? null : filterFeed(snap.feed, kinds, persons, q)
+        // ⚠️⚠️ 「有没有东西可看」的判据分两种（刻意的不对称，T6）：
+        //   · **无筛选** ⇒ 要 `items.length > 0`（= T5 的既有行为："空快照不外显"）。
+        //   · **带筛选**（只有离线会走到）⇒ **空结果也算**：那是"这个筛选下快照里
+        //     没有"——必须显示「共 0 条」+ 空结果文案 + 横幅（点明仅最近 5 天），
+        //     而不是报"读取失败"（用户会以为离线根本没数据）。
+        //     这正是 brief 里"筛不到会被读成没有这类 ⇒ 横幅要点明范围"这一条
+        //     所预设的形态：**筛不到是要显示出来的**。
+        const usable = snap !== null && items !== null && (items.length > 0 || !unfiltered)
+        if (usable) {
           // ⚠️⚠️ F2:**在线**失败(4xx:后端活着、请求有问题)时**保留**错误——
           // 回落到快照 == "屏幕上有东西看",**不是**"什么都没发生"。少了这一行,
           // 在线 404 会既不说"离线"(横幅已被 `!online` 挡掉)又不报错 ⇒
@@ -158,8 +230,10 @@ export default function Feed({
           // 再挂一条"读取失败"是把预期内的离线报成意外。
           setErr(isOnline() ? (e instanceof Error ? e.message : String(e)) : null)
           setShown({
-            items: snap.feed,
-            total: snap.feed.length,
+            items,
+            // ⚠️ `total` = **本地筛后**的条数（不是快照总条数）：计数行说的是
+            // "这个筛选下有多少条"，用快照总条数会让用户以为筛出来了一整库。
+            total: items.length,
             kindsKey,
             personsKey,
             q,
@@ -367,7 +441,11 @@ export default function Feed({
           快照 **!=** 离线；少了它，在线 4xx 会把"读不到"谎报成"离线"。 */}
       {shown !== null && shown.snapshotAt !== null && !online && (
         <p className="mt-3 rounded-lg bg-vigil-warn-soft p-2 text-xs text-vigil-warn">
-          离线：显示的是本地快照（{fmtDateTime(shown.snapshotAt)} 同步）。
+          {/* ⚠️⚠️ T6:`仅最近 5 天` 这个**范围词**是承重的。快照只含最近 5 天,
+              而离线 + 带筛选时"筛不到"会被用户读成"没有这类"(是**没有**,
+              不是**这段时间内没有**)——"只说自己有资格说的话"(M2)。
+              ⚠️ 变异反证:删掉「仅最近 5 天」⇒ Offline.dom.test 的范围词用例必红。 */}
+          离线：显示的是本地快照（{fmtDateTime(shown.snapshotAt)} 同步，仅最近 5 天）。
         </p>
       )}
 

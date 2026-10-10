@@ -122,6 +122,10 @@ test('⚠️ 网络失败但有快照 ⇒ 显示快照 + 同步时刻', async ()
       feed: [],
       calendar: [item(7, at(2026, 10, 20))],
       digests: [],
+      // ⚠️ T6 起这两份**元数据**是必需字段：缺了它们 `readSnapshot` 会当成
+      // "没有快照"（半份快照更坏）。本文件只验证日历，留空数组即可。
+      categories: [],
+      persons: [],
     }),
   )
   vi.stubGlobal(
@@ -134,6 +138,9 @@ test('⚠️ 网络失败但有快照 ⇒ 显示快照 + 同步时刻', async ()
   const banner = await screen.findByText(/快照/)
   // 同步时刻**逐字**可见（"不许假装实时"——G10 / 出口标准 5）
   expect(banner.textContent).toContain('10月9日 08:30')
+  // ⚠️ T6：**范围词**同样承重（快照不是全量，「这天没有到期」会被读成「没有」）。
+  // ⚠️ 变异反证：把 Calendar 横幅里的「最近 5 天」删掉 ⇒ 本条必红。
+  expect(banner.textContent, '离线快照横幅必须点明范围（仅最近 5 天）').toContain('最近 5 天')
   // 快照里的日历条目真的进了网格：10 月 20 日那格有一个到期点
   expect(screen.getByLabelText('1 条到期')).toBeTruthy()
 })
@@ -186,6 +193,10 @@ test('⭐ 三态①：成功时**不许**挂快照横幅、**不许**弹错误�
       feed: [],
       calendar: [item(99, at(2026, 10, 20))],
       digests: [],
+      // ⚠️ T6 起这两份**元数据**是必需字段：缺了它们 `readSnapshot` 会当成
+      // "没有快照"（半份快照更坏）。本文件只验证日历，留空数组即可。
+      categories: [],
+      persons: [],
     }),
   )
   // 网络**通**，且返回**空**（三态里的第一条：通·无数据）
@@ -213,6 +224,9 @@ test('⭐ 三态②：有快照但网络通 ⇒ 显示**网络**数据、不挂�
       feed: [],
       calendar: [item(888, at(2026, 10, 5))],
       digests: [],
+      // ⚠️ T6 起必需（见上一条同形注释）。
+      categories: [],
+      persons: [],
     }),
   )
   // 网络：只有 10-20 一条（快照里**没有**这个日子）
@@ -240,6 +254,9 @@ function writeCalendarSnapshot() {
       feed: [],
       calendar: [item(888, at(2026, 10, 5))],
       digests: [],
+      // ⚠️ T6 起必需（见上一条同形注释）。
+      categories: [],
+      persons: [],
     }),
   )
 }

@@ -93,7 +93,10 @@ function stubOkApi(feed: Item[] = []): string[] {
           categories: [{ slug: 'notice', label: '通知公告', icon: '📋', count: 1, desc: 'x' }],
         })
       }
-      if (url.startsWith('/api/persons')) return ok({ persons: [] })
+      // ⚠️ T6：`persons` 与 `categories` 都是**快照要收的两份元数据**。
+      // 这里给一个人物，`syncSnapshot` 才收得进去（"在线挂载 ⇒ 同步一次快照"
+      // 那条用例顺便验了人物表也进了快照）。
+      if (url.startsWith('/api/persons')) return ok({ persons: [PERSON] })
       // ⚠️ 批量改类目（G9 第五消费者的用例要**先改出一批**，那个撤销按钮才出现；
       // 没有它，"撤销离线置灰"这一条根本走不到按钮跟前）。
       // 加在这里**不影响**任何既有用例：它们一个都没发过 `/api/items/kinds`
@@ -197,6 +200,11 @@ test('⚠️ 离线但有快照 ⇒ 显示快照 + 同步时刻 + 横幅(出口�
     feed: [item(7, '快照里的停水通知')],
     calendar: [],
     digests: [],
+    // ⚠️ T6 起 `categories`/`persons` 是**必需字段**：缺了它们 `readSnapshot`
+    // 会当成"没有快照"（半份快照更坏——见 `snapshot.ts` 里那条注释）。
+    // 这些用例都不涉及类目/人物筛选 ⇒ 留空数组即可（= "有快照、但没有元数据"）。
+    categories: [],
+    persons: [],
   })
   stubDeadApi()
   render(<Feed {...feedProps} />)
@@ -204,8 +212,10 @@ test('⚠️ 离线但有快照 ⇒ 显示快照 + 同步时刻 + 横幅(出口�
   // ⚠️ 必须写清**何时**同步的,不许假装实时(G10 / 出口标准 2)。
   // ⚠️ 断言**原文**(不是 `/本地快照（/`):正则会被"日报侧那条同形的横幅"就近满足
   // (F4 的形状:一条弱断言被另一条新文案喂饱)。原文 + 时刻两个断言,改词就红。
+  // ⚠️ T6 起横幅多了**范围词**「仅最近 5 天」：快照只含最近 5 天，不说清范围，
+  // "筛不到"会被用户读成"没有这类"（M2「只说自己有资格说的话」）。
   expect(
-    screen.getByText(`离线：显示的是本地快照（${SNAPSHOT_LABEL} 同步）。`),
+    screen.getByText(`离线：显示的是本地快照（${SNAPSHOT_LABEL} 同步，仅最近 5 天）。`),
   ).toBeTruthy()
   expect(screen.getByText(new RegExp(SNAPSHOT_LABEL))).toBeTruthy()
 })
@@ -216,6 +226,11 @@ test('⚠️ 离线时有快照 ⇒ 卡片置灰 + 批量条不可用(G9 / 出�
     feed: [item(7, '快照里的停水通知')],
     calendar: [],
     digests: [],
+    // ⚠️ T6 起 `categories`/`persons` 是**必需字段**：缺了它们 `readSnapshot`
+    // 会当成"没有快照"（半份快照更坏——见 `snapshot.ts` 里那条注释）。
+    // 这些用例都不涉及类目/人物筛选 ⇒ 留空数组即可（= "有快照、但没有元数据"）。
+    categories: [],
+    persons: [],
   })
   stubDeadApi()
   render(<Feed {...feedProps} />)
@@ -318,22 +333,33 @@ test('⚠️「清空选择」**不**随离线置灰:它是纯本地动作(不�
   expect(screen.queryByText(/已选 \d+ 条/), '点了就该真的清空').toBeNull()
 })
 
-test('⚠️ 带筛选时失败 ⇒ 如实报错,不许拿"不匹配的快照"冒充答案(unfiltered 守卫)', async () => {
+test('⚠️【在线】带筛选时失败 ⇒ 如实报错,不许拿"不匹配的快照"冒充答案(unfiltered 守卫)', async () => {
   /**
-   * ⭐ 这条钉的是 brief Step 8 变异 2(`unfiltered` 改成恒 true):
-   * 快照存的是「最近 5 天的**全部**条目」,把它显示在一个**带筛选**的查询下,
-   * 就是拿一张不匹配的清单回答另一个问题(「只说自己有资格说的话」,M2)。
+   * ⭐ 这条钉的是原本的 `unfiltered` 守卫:`const unfiltered = ...` → `true`
+   * ⇒ 「带筛选的在线失败」会拿快照冒充答案 ⇒ 必红。
    *
-   * ⚠️ 变异反证:`const unfiltered = ...` → `const unfiltered = true` ⇒ 本条必红
-   * (快照条目会出现在屏幕上、横幅也会在)。
+   * ⚠️⚠️ **T6 把这条的入口从"真离线"改成了"在线 4xx"**（语义变化,逐字说明理由）:
+   * T6 之前**任何**失败(含离线)走"带筛选 ⇒ 如实报错";T6 之后**离线**那一支
+   * 改成"本地筛快照"（用户 2026-10-10 裁定:离线也要能点类目筛）。
+   * ⇒ 原来那条用 `stubDeadApi`（真离线）的输入**不再该报错**,拿它继续断言
+   * "如实报错"就是让一条**已经失效**的判据继续绿——正是本项目最忌的"假绿"。
+   *
+   * 守卫本身**没有放宽**:在线 4xx（后端活着、请求有问题）仍然"带筛选 ⇒ 如实报错、
+   * 绝不本地筛"——那是 M2 的既有裁决原样保留。所以把输入换成 `stub404Api`。
+   * 真离线 + 带筛选的**新行为**由下面 T6 那一组用例把守。
    */
   writeSnapshot({
     synced_at: SNAPSHOT_TS,
     feed: [item(7, '快照里的停水通知')],
     calendar: [],
     digests: [],
+    // ⚠️ T6 起 `categories`/`persons` 是**必需字段**：缺了它们 `readSnapshot`
+    // 会当成"没有快照"（半份快照更坏——见 `snapshot.ts` 里那条注释）。
+    // 这些用例都不涉及类目/人物筛选 ⇒ 留空数组即可（= "有快照、但没有元数据"）。
+    categories: [],
+    persons: [],
   })
-  stubDeadApi()
+  stub404Api()
   render(<Feed {...feedProps} kinds={['notice']} />)
   expect(await screen.findByText(/读取失败/)).toBeTruthy()
   expect(screen.queryByText('快照里的停水通知')).toBeNull()
@@ -346,6 +372,11 @@ test('⚠️ 网络恢复 ⇒ 自动回到实时数据,不是卡在快照上(出
     feed: [item(7, '快照里的停水通知')],
     calendar: [],
     digests: [],
+    // ⚠️ T6 起 `categories`/`persons` 是**必需字段**：缺了它们 `readSnapshot`
+    // 会当成"没有快照"（半份快照更坏——见 `snapshot.ts` 里那条注释）。
+    // 这些用例都不涉及类目/人物筛选 ⇒ 留空数组即可（= "有快照、但没有元数据"）。
+    categories: [],
+    persons: [],
   })
   stubDeadApi()
   render(<Feed {...feedProps} />)
@@ -398,6 +429,11 @@ test('⚠️ 在线 4xx + 盘上有快照 ⇒ 如实报错,不许说"离线"、�
     feed: [item(7, '快照里的停水通知')],
     calendar: [],
     digests: [],
+    // ⚠️ T6 起 `categories`/`persons` 是**必需字段**：缺了它们 `readSnapshot`
+    // 会当成"没有快照"（半份快照更坏——见 `snapshot.ts` 里那条注释）。
+    // 这些用例都不涉及类目/人物筛选 ⇒ 留空数组即可（= "有快照、但没有元数据"）。
+    categories: [],
+    persons: [],
   })
   stub404Api()
   render(<Feed {...feedProps} />)
@@ -430,6 +466,11 @@ test('⚠️ F3:在线 4xx + 快照回落 ⇒ 卡片**不许**被灰、也不许
     feed: [item(7, '快照里的停水通知')],
     calendar: [],
     digests: [],
+    // ⚠️ T6 起 `categories`/`persons` 是**必需字段**：缺了它们 `readSnapshot`
+    // 会当成"没有快照"（半份快照更坏——见 `snapshot.ts` 里那条注释）。
+    // 这些用例都不涉及类目/人物筛选 ⇒ 留空数组即可（= "有快照、但没有元数据"）。
+    categories: [],
+    persons: [],
   })
   stub404Api()
   render(<Feed {...feedProps} />)
@@ -452,6 +493,11 @@ test('⚠️ F3 阴性对照:真离线 + 快照 ⇒ 卡片**确实**被灰且说
     feed: [item(7, '快照里的停水通知')],
     calendar: [],
     digests: [],
+    // ⚠️ T6 起 `categories`/`persons` 是**必需字段**：缺了它们 `readSnapshot`
+    // 会当成"没有快照"（半份快照更坏——见 `snapshot.ts` 里那条注释）。
+    // 这些用例都不涉及类目/人物筛选 ⇒ 留空数组即可（= "有快照、但没有元数据"）。
+    categories: [],
+    persons: [],
   })
   stubDeadApi()
   render(<Feed {...feedProps} />)
@@ -468,7 +514,7 @@ test('⚠️ 在线 4xx 且**无**快照 ⇒ 只说错误,不许说"离线,且�
 })
 
 test('⚠️ 在线 4xx + 盘上有快照 ⇒ Digests 也如实报错、不说"离线"(F2:Digests 两处)', async () => {
-  writeSnapshot({ synced_at: SNAPSHOT_TS, feed: [], calendar: [], digests: [DIGEST] })
+  writeSnapshot({ synced_at: SNAPSHOT_TS, feed: [], calendar: [], digests: [DIGEST], categories: [], persons: [] })
   stub404Api()
   render(<Digests />)
   // ⭐ 快照照常回落,但**错误仍如实报出**(在线 4xx 不是"离线")
@@ -498,6 +544,11 @@ test('⚠️ 网络通 ⇒ 用实时数据(快照只是备份,不是显示源)�
     feed: [item(7, '快照里的停水通知')],
     calendar: [],
     digests: [],
+    // ⚠️ T6 起 `categories`/`persons` 是**必需字段**：缺了它们 `readSnapshot`
+    // 会当成"没有快照"（半份快照更坏——见 `snapshot.ts` 里那条注释）。
+    // 这些用例都不涉及类目/人物筛选 ⇒ 留空数组即可（= "有快照、但没有元数据"）。
+    categories: [],
+    persons: [],
   })
   stubOkApi([item(8, '实时读到的条目')])
   render(<Feed {...feedProps} />)
@@ -513,6 +564,11 @@ test('⚠️ 离线时只回落一次:失鲜的请求不许把快照也一起报
     feed: [item(7, '快照里的停水通知')],
     calendar: [],
     digests: [],
+    // ⚠️ T6 起 `categories`/`persons` 是**必需字段**：缺了它们 `readSnapshot`
+    // 会当成"没有快照"（半份快照更坏——见 `snapshot.ts` 里那条注释）。
+    // 这些用例都不涉及类目/人物筛选 ⇒ 留空数组即可（= "有快照、但没有元数据"）。
+    categories: [],
+    persons: [],
   })
   stubDeadApi()
   render(<Feed {...feedProps} />)
@@ -597,15 +653,18 @@ test('⚠️ 离线但有快照 ⇒ 日报列表与正文都从快照来,并写�
    * ⚠️ 打开正文**不该再发请求**:快照里就有正文,离线下那个请求必然失败,
    * 失败了再把用户刚点开的那一篇报成"读取失败"是自找的。
    */
-  writeSnapshot({ synced_at: SNAPSHOT_TS, feed: [], calendar: [], digests: [DIGEST] })
+  writeSnapshot({ synced_at: SNAPSHOT_TS, feed: [], calendar: [], digests: [DIGEST], categories: [], persons: [] })
   stubDeadApi()
   render(<Digests />)
 
   expect(await screen.findByText('2026-10-05')).toBeTruthy()
   expect(screen.getByText(new RegExp(SNAPSHOT_LABEL))).toBeTruthy()
   // ⚠️ 原文(不是 `/本地快照（/`):F2 的变异必须能让这里红 ⇒ 也用原文钉住。
+  // ⚠️ T6 起横幅多了**范围词**「仅最近 5 篇」：快照只留最近 5 篇日报，不说清范围，
+  // 列表短会被用户读成"日报只有这几篇"（M2「只说自己有资格说的话」）。
+  // ⚠️ 这里是**篇**不是**天**：日报一天一篇，但快照存的是"最近 5 篇"。
   expect(
-    screen.getByText(`离线：显示的是本地快照（${SNAPSHOT_LABEL} 同步）。`),
+    screen.getByText(`离线：显示的是本地快照（${SNAPSHOT_LABEL} 同步，仅最近 5 篇）。`),
   ).toBeTruthy()
 
   await userEvent.click(screen.getByRole('button', { name: /2026-10-05/ }))
@@ -635,7 +694,7 @@ test('⚠️ F2：网络恢复 ⇒ Digests **自动重取**列表、回到实时
    * ⚠️ 变异反证:把 `[reloadTick, onlineEpoch]` 改回 `[reloadTick]` ⇒ 恢复后
    * 屏幕仍是 `2026-10-05`、不说"还没有日报" ⇒ 本条必红。
    */
-  writeSnapshot({ synced_at: SNAPSHOT_TS, feed: [], calendar: [], digests: [DIGEST] })
+  writeSnapshot({ synced_at: SNAPSHOT_TS, feed: [], calendar: [], digests: [DIGEST], categories: [], persons: [] })
   _resetForTests()
   noteFetchResult(false) // 离线:挂载时 online 为 false(用户离线打开)
   stubDeadApi()
@@ -759,6 +818,11 @@ test('⚠️ F4(集成)：Feed 离线 ⇒ 人物筛选的"新增"也置灰(Feed 
     feed: [item(7, '快照里的停水通知')],
     calendar: [],
     digests: [],
+    // ⚠️ T6 起 `categories`/`persons` 是**必需字段**：缺了它们 `readSnapshot`
+    // 会当成"没有快照"（半份快照更坏——见 `snapshot.ts` 里那条注释）。
+    // 这些用例都不涉及类目/人物筛选 ⇒ 留空数组即可（= "有快照、但没有元数据"）。
+    categories: [],
+    persons: [],
   })
   stubDeadApi()
   render(<Feed {...feedProps} />)

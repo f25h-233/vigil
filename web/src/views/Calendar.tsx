@@ -151,7 +151,13 @@ export default function Calendar() {
           修掉的同一个缺陷，这里是第四个消费者）。 */}
       {shown !== null && shown.snapshotAt !== null && !online && (
         <div className="mb-3 rounded-lg bg-vigil-warn-soft p-3 text-sm text-vigil-warn">
-          离线：下面是 <SnapshotTime ts={shown.snapshotAt} /> 同步的快照。
+          {/* ⚠️⚠️ T6：`最近 5 天` 这个**范围词**是承重的。
+              日历快照存的是 `feed` 那个窗口之外的另一块（全量带截止日的条目），
+              但**范围词仍要写**：用户看到"这天没有到期"时，必须知道手里这份
+              快照不是全量的（与 Feed/Digests 三条横幅同一条判据）。
+              ⚠️ 措辞照旧保持"下面是 … 同步的快照"的形状（Calendar.dom.test 的
+              `getByText(/快照/)` + `toContain('10月9日 08:30')` 依赖它）。 */}
+          离线：下面是 <SnapshotTime ts={shown.snapshotAt} /> 同步的快照（最近 5 天）。
         </div>
       )}
 

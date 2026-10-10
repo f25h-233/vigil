@@ -1,5 +1,5 @@
 import { afterEach, expect, test, vi } from 'vitest'
-import type { DigestDetail, Item } from '../types.ts'
+import type { CategoryDetail, DigestDetail, Item, Person } from '../types.ts'
 import {
   SNAPSHOT_STORAGE_KEY,
   clearSnapshot,
@@ -34,6 +34,17 @@ function item(id: number, deadline: number | null): Item {
   }
 }
 
+// ⚠️ T6 起快照还存两份**元数据**（类目表 / 人物表）。逐字断言要连它们一起钉住。
+const CATEGORY: CategoryDetail = {
+  slug: 'notice',
+  label: '通知公告',
+  icon: '📋',
+  count: 3,
+  desc: '学校发的正式通知',
+}
+
+const PERSON: Person = { uin: 10001, label: '辅导员某辅导员', note: '', count: 2 }
+
 const DIGEST: DigestDetail = {
   digest_id: 9,
   day: '2026-10-05',
@@ -57,12 +68,16 @@ test('存了再读 ⇒ 逐字相同', () => {
     feed: [item(1, null)],
     calendar: [item(2, 1_700_100_000)],
     digests: [DIGEST],
+    categories: [CATEGORY],
+    persons: [PERSON],
   })
   expect(readSnapshot()).toEqual({
     synced_at: 1_700_000_000,
     feed: [item(1, null)],
     calendar: [item(2, 1_700_100_000)],
     digests: [DIGEST],
+    categories: [CATEGORY],
+    persons: [PERSON],
   })
 })
 
@@ -79,22 +94,54 @@ test('⚠️ 形状不对（缺 synced_at / 数组字段不是数组）⇒ null�
   expect(readSnapshot()).toBeNull()
   localStorage.setItem(
     SNAPSHOT_STORAGE_KEY,
-    JSON.stringify({ synced_at: 1, feed: 'nope', calendar: [], digests: [] }),
+    JSON.stringify({ synced_at: 1, feed: 'nope', calendar: [], digests: [], categories: [], persons: [] }),
   )
   expect(readSnapshot()).toBeNull()
   // ⚠️ 上面两条**都到不了** `typeof s.synced_at !== 'number'` 那一行
   // （`{feed: []}` 被更早的数组守卫拦下；`feed: 'nope'` 也是）——
   // review 的 M1 变异证实：删掉 synced_at 守卫后它们仍全绿。这一条是
-  // **唯一到达那一行的输入**：四个字段的数组都对，只有 synced_at 类型错。
+  // **唯一到达那一行的输入**：其余字段的数组都对，只有 synced_at 类型错。
   localStorage.setItem(
     SNAPSHOT_STORAGE_KEY,
-    JSON.stringify({ synced_at: 'x', feed: [], calendar: [], digests: [] }),
+    JSON.stringify({ synced_at: 'x', feed: [], calendar: [], digests: [], categories: [], persons: [] }),
+  )
+  expect(readSnapshot()).toBeNull()
+})
+
+// ── T6：两份**元数据**（类目表 / 人物表）的必需性 ──────────────────────────
+//
+// ⚠️ 裁定：**旧快照（缺这两个字段）当作 `null`（"没有可用快照"）**，
+// 而不是"缺字段就按空数组读"。理由：半份快照更坏——按空数组读出来的
+// "类目表里一个类目都没有"是**假话**，而"没有快照"是**真话**。
+// 代价是：升级后的第一次离线回到"离线，且还没有本地快照"，
+// 下一次在线同步即修复（与 `syncSnapshot` 宁可不写也不写半份同一条判据）。
+
+test('⚠️ 旧快照（缺 categories / persons）⇒ null：半份快照比"没有快照"更坏', () => {
+  localStorage.setItem(
+    SNAPSHOT_STORAGE_KEY,
+    JSON.stringify({ synced_at: 1, feed: [], calendar: [], digests: [] }),
+  )
+  expect(readSnapshot()).toBeNull()
+  // 只缺一个也一样 ⇒ null（不是"缺的那个按空数组补"）
+  localStorage.setItem(
+    SNAPSHOT_STORAGE_KEY,
+    JSON.stringify({ synced_at: 1, feed: [], calendar: [], digests: [], categories: [] }),
+  )
+  expect(readSnapshot()).toBeNull()
+  // ⚠️ 变异反证：把 `!Array.isArray(s.categories)` 或 `!Array.isArray(s.persons)`
+  // 从守卫里删掉 ⇒ 上面两条会各自读出一份"有快照、但类目/人物是空的" ⇒ 必红。
+})
+
+test('⚠️ categories / persons 不是数组 ⇒ null（与 feed/calendar/digests 同等严）', () => {
+  localStorage.setItem(
+    SNAPSHOT_STORAGE_KEY,
+    JSON.stringify({ synced_at: 1, feed: [], calendar: [], digests: [], categories: 'nope', persons: [] }),
   )
   expect(readSnapshot()).toBeNull()
 })
 
 test('clearSnapshot 之后 ⇒ null', () => {
-  writeSnapshot({ synced_at: 1, feed: [], calendar: [], digests: [] })
+  writeSnapshot({ synced_at: 1, feed: [], calendar: [], digests: [], categories: [], persons: [] })
   clearSnapshot()
   expect(readSnapshot()).toBeNull()
 })
@@ -139,7 +186,7 @@ const DIGEST_DETAIL = {
   items: [feedItem(1)],
 }
 
-/** 按 URL 分发：三个端点各回一个**可识别**的体。 */
+/** 按 URL 分发：五个端点各回一个**可识别**的体。 */
 function stubApi() {
   vi.stubGlobal(
     'fetch',
@@ -157,21 +204,65 @@ function stubApi() {
       if (u === '/api/digests/9') {
         return Promise.resolve({ ok: true, status: 200, json: async () => DIGEST_DETAIL })
       }
+      // ⚠️ T6 新收的两份**元数据**：同一端点（`/api/categories` 就带 `desc`）。
+      if (u === '/api/categories') {
+        return Promise.resolve({ ok: true, status: 200, json: async () => ({ categories: [CATEGORY], aliases: {} }) })
+      }
+      if (u === '/api/persons') {
+        return Promise.resolve({ ok: true, status: 200, json: async () => ({ persons: [PERSON] }) })
+      }
       return Promise.reject(new Error(`未预期的 URL：${u}`))
     }),
   )
 }
 
-test('syncSnapshot 把三块数据都收进快照（feed / calendar / digests 各一条）', async () => {
+test('syncSnapshot 把五块数据都收进快照（feed / calendar / digests / categories / persons）', async () => {
   stubApi()
   await syncSnapshot()
   const s = readSnapshot()
   expect(s).not.toBeNull()
-  // 逐块断言：少收任何一块（比如 M4 去掉 fetchCalendar）这里必红。
+  // 逐块断言：少收任何一块（比如 M4 去掉 fetchCalendar、T6 漏掉类目表）这里必红。
   expect(s!.feed).toEqual([feedItem(11)])
   expect(s!.calendar).toEqual([CAL_ITEM])
   expect(s!.digests).toEqual([DIGEST_DETAIL])
+  // ⭐ T6：类目/人物是**元数据**，离线时类目条与人物筛选器的唯一数据源。
+  // ⚠️ 变异反证：把 `categories: categories.categories` 写成 `categories: []` ⇒ 必红。
+  expect(s!.categories).toEqual([CATEGORY])
+  expect(s!.persons).toEqual([PERSON])
   expect(typeof s!.synced_at).toBe('number')
+})
+
+test('⚠️ 类目请求失败 ⇒ 整个 syncSnapshot 抛，且**不写半份快照**（T6 的新守卫）', async () => {
+  /**
+   * ⭐ T6 的两份元数据进了**同一个 `Promise.all`** ⇒ 它们失败必须同样让整份
+   * 同步失败。否则会落下一份"信息流有、类目表没有"的快照——
+   * 而 `Feed` 从快照取类目的那一支会读到 `[]` ⇒ **类目条只剩「全部」**，
+   * 也就是 T6 要修的缺陷换了个地方复发。
+   *
+   * ⚠️ 变异反证：把 `/api/categories` 从 `syncSnapshot` 的 `Promise.all` 里
+   * 挪出来单独 `catch` ⇒ 本条红（快照会被写出来）。
+   */
+  vi.stubGlobal('fetch', vi.fn((url: string) => {
+    const u = String(url)
+    if (u === '/api/categories') {
+      return Promise.resolve({ ok: false, status: 500, json: async () => ({ detail: '内部错误' }) })
+    }
+    if (u.startsWith('/api/items?')) {
+      return Promise.resolve({ ok: true, status: 200, json: async () => ({ items: [feedItem(11)], total: 1, limit: 200, offset: 0 }) })
+    }
+    if (u === '/api/calendar') {
+      return Promise.resolve({ ok: true, status: 200, json: async () => ({ items: [CAL_ITEM], total: 1 }) })
+    }
+    if (u === '/api/digests') {
+      return Promise.resolve({ ok: true, status: 200, json: async () => ({ digests: [] }) })
+    }
+    if (u === '/api/persons') {
+      return Promise.resolve({ ok: true, status: 200, json: async () => ({ persons: [] }) })
+    }
+    return Promise.reject(new Error(`未预期的 URL：${u}`))
+  }))
+  await expect(syncSnapshot()).rejects.toThrow()
+  expect(readSnapshot()).toBeNull()
 })
 
 test('⚠️ 任一请求失败 ⇒ 整个 syncSnapshot 抛，且**不写半份快照**', async () => {

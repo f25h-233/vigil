@@ -280,7 +280,11 @@ export default function Digests() {
           谎报成"离线"。 */}
       {listShown !== null && listShown.snapshotAt !== null && !online && (
         <p className="mb-3 rounded-lg bg-vigil-warn-soft p-3 text-sm text-vigil-warn">
-          离线：显示的是本地快照（{fmtDateTime(listShown.snapshotAt)} 同步）。
+          {/* ⚠️⚠️ T6：`仅最近 5 篇` 是**范围词**（Feed/Calendar 那两条同族）。
+              快照只留最近 5 篇日报 ⇒ 列表短不是"日报只有这几篇"，而是"快照只有这几篇"。
+              ⚠️ 这里是**篇**不是**天**：日报是一天一篇，但快照存的是"最近 5 篇"
+              （`SNAPSHOT_DIGESTS`），措辞必须与它一致，别写成"最近 5 天"。 */}
+          离线：显示的是本地快照（{fmtDateTime(listShown.snapshotAt)} 同步，仅最近 5 篇）。
         </p>
       )}
 
