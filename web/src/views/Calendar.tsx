@@ -163,6 +163,10 @@ export default function Calendar() {
               {n > 0 && (
                 <span
                   aria-label={`${n} 条到期`}
+                  // `data-overdue` 是给测试用的**语义**钩子（T4 加固）：判据读它，
+                  // 而不是读 `bg-vigil-fg-4` 那个**字面类名**（换 token / 调色会假红）。
+                  // 它同时是"已过期以变淡区分"（用户 Q2）这条契约的**可查询**载体。
+                  data-overdue={overdue ? 'true' : 'false'}
                   className={
                     'h-1.5 w-1.5 rounded-full ' +
                     (overdue ? 'bg-vigil-fg-4' : 'bg-vigil-accent')
