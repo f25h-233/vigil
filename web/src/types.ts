@@ -42,6 +42,15 @@ export type ItemPage = {
   offset: number
 }
 
+/**
+ * 日历端点的响应。**与 `/api/items` 同形**（items 是同一套 `item_out`），
+ * 只是**不分页**、只含带截止日的条目。
+ */
+export type CalendarPage = {
+  items: Item[]
+  total: number
+}
+
 export type Category = {
   slug: string
   label: string

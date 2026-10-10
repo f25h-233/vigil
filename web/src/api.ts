@@ -1,4 +1,5 @@
 import type {
+  CalendarPage,
   CategoriesResponse,
   Category,
   DigestDetail,
@@ -11,22 +12,42 @@ import type {
   Person,
 } from './types'
 
+import { noteFetchResult } from './connectivity.ts'
+
 // ⚠️ `Person` 类型**定义在 `types.ts`**（Task 10 Step 4），这里只 import 再转出去。
 // 两个文件各定义一份的话，TS 会以其中一份为准、另一份悄悄失效——
 // 而 `types.ts` 是「与后端契约逐字对应」的那一份，它必须是唯一的真相源。
 export type { Person }
 
+/**
+ * ⚠️ `noteFetchResult` 由 `connectivity.ts`（T3）提供。**这里先写死 import**——
+ * T3 未落地时它会编译失败，所以 T2 与 T3 必须**同批**合入或按序（T3 先）。
+ * 计划按 **T2 先、T3 紧随** 排；落地时若 T3 还没做完，把下面两处调用临时注释掉，
+ * **但必须在 T3 里补回来**（否则状态机失去了"请求真的失败"这一路信号，
+ * Review Focus #1 就没人守）。
+ */
 async function getJSON<T>(url: string): Promise<T> {
-  const r = await fetch(url)
+  let r: Response
+  try {
+    r = await fetch(url)
+  } catch (e) {
+    // fetch **本身抛** = 网络层没通（离线、DNS、连接被拒）。
+    // ⚠️ 这与"服务器返回 500"是两回事：后者 fetch 不抛。
+    noteFetchResult(false)
+    throw e
+  }
+  // ⚠️ 只有 **5xx** 才算"后端不可达"：4xx 是"服务器活着、这个请求有问题"
+  // （bad date、404），把它算成离线会让用户看到一个假的"离线"横幅。
+  // ⚠️ 这正是"设置对了 ≠ 行为对了"（M4 二十五节）的落点：`navigator.onLine`
+  // 是**设置**，"请求真的失败"是**行为**——两个都要看（spec §3.4）。
+  noteFetchResult(r.status < 500)
   if (!r.ok) {
-    // 后端出错时给的是 {"detail": "..."}；拿不到就说状态码，
-    // 但**绝不吞掉错误**——静默的空列表会被读成「没有数据」。
     let msg = `HTTP ${r.status}`
     try {
       const body = (await r.json()) as { detail?: unknown }
       if (typeof body.detail === 'string') msg = body.detail
     } catch {
-      // 响应不是 JSON（比如前端未构建时的 503 HTML），就用状态码
+      /* 响应不是 JSON（比如前端未构建时的 503 HTML），就用状态码 */
     }
     throw new Error(msg)
   }
@@ -86,6 +107,19 @@ export function fetchItems(query: ItemQuery): Promise<ItemPage> {
   if (query.limit !== undefined) p.set('limit', String(query.limit))
   if (query.offset !== undefined) p.set('offset', String(query.offset))
   return getJSON<ItemPage>(`/api/items?${p.toString()}`)
+}
+
+/**
+ * 日历数据：**只**含带截止日的条目，默认全量（第三版 spec §3.1）。
+ *
+ * ⚠️ 它**不走** `/api/items`：后者的 `limit` 上限是 200，而日历要全量。
+ */
+export const fetchCalendar = (range?: { since?: string; until?: string }) => {
+  const p = new URLSearchParams()
+  if (range?.since) p.set('since', range.since)
+  if (range?.until) p.set('until', range.until)
+  const qs = p.toString()
+  return getJSON<CalendarPage>(`/api/calendar${qs ? `?${qs}` : ''}`)
 }
 
 export const fetchItem = (id: number) => getJSON<ItemDetail>(`/api/items/${id}`)
