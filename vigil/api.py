@@ -1088,6 +1088,39 @@ def create_app(config: Config) -> FastAPI:
             "offset": offset,
         }
 
+    @app.get("/api/calendar")
+    def api_calendar(
+        since: str | None = None,
+        until: str | None = None,
+    ) -> dict:
+        """带截止日的条目。**默认全量**（不带 since/until）。
+
+        ⚠️ 自成一端，不走 `/api/items`：后者的 `limit` 上限是 `MAX_LIMIT = 200`，
+        而日历要**全量**（用户 2026-10-10 裁定）——200 这条线迟早会咬；
+        且前端硬筛要先把整个窗口的条目拉回来（第三版 spec §1.4/§3.1）。
+
+        ⚠️ 不分页：截止日是全库最稀疏的一类数据（spec §1.1 实测 36/592）。
+        真要涨到需要分页时，这个响应的 `total` 就是触发器。
+
+        ⚠️ `since`/`until` 都按**包含该日**理解（右端取次日 00:00），与
+        `/api/items` 同口径——两处必须都走 `_day_start`（E5）。
+        """
+        names = group_names_map()
+        cats = category_map()
+        con = connect()
+        try:
+            items = store.deadlines_in_range(
+                con,
+                since=_day_start(since) if since else None,
+                until=_day_start(until, plus_days=1) if until else None,
+            )
+        finally:
+            con.close()
+        return {
+            "items": [item_out(it, names, cats) for it in items],
+            "total": len(items),
+        }
+
     @app.get("/api/items/{item_id}")
     def api_item(item_id: int) -> dict:
         names = group_names_map()

@@ -3646,3 +3646,113 @@ def test_api_import_pack_returns_400_for_a_single_bracket_section(client_factory
     r = client_factory().post("/api/config/pack", json={"toml": text, "apply": True})
     assert r.status_code == 400, r.text
     assert "数组表" in r.json()["detail"], r.json()["detail"]
+
+
+# ── 日历端点（第三版 spec §3.1）────────────────────────────────────────
+
+
+def test_calendar_returns_only_items_with_deadline(client, db_path):
+    """⚠️ 只回带截止日的条目。`deadline` 为空的那条**必须不出现**。
+
+    变异反证：删掉 `WHERE i.deadline_ts IS NOT NULL` ⇒ 本条必红。
+    """
+    con = sqlite3.connect(str(db_path))
+    # item 1（夹具那条）deadline 是 NULL；再加两条带截止日的
+    con.execute(
+        "INSERT INTO items (item_id, kind, title, detail, event_ts, deadline_ts,"
+        " group_id, actor_uid, place, amount, links, confidence, model, prompt_ver,"
+        " created_at) VALUES (2, 'notice', '报名截止', NULL, ?, ?, 12345, NULL,"
+        " NULL, NULL, '[]', 0.9, 'm', 'v1', 1)",
+        (int(dt.datetime(2026, 9, 10, 9, 0).timestamp()),
+         int(dt.datetime(2026, 9, 20, 0, 0).timestamp())),
+    )
+    con.execute(
+        "INSERT INTO items (item_id, kind, title, detail, event_ts, deadline_ts,"
+        " group_id, actor_uid, place, amount, links, confidence, model, prompt_ver,"
+        " created_at) VALUES (3, 'activity', '活动报名', NULL, ?, ?, 12345, NULL,"
+        " NULL, NULL, '[]', 0.9, 'm', 'v1', 1)",
+        (int(dt.datetime(2026, 9, 11, 9, 0).timestamp()),
+         int(dt.datetime(2026, 9, 18, 0, 0).timestamp())),
+    )
+    con.commit()
+    con.close()
+
+    body = client.get("/api/calendar").json()
+    ids = [it["item_id"] for it in body["items"]]
+    assert 1 not in ids                    # 无截止日 ⇒ 不出现
+    assert ids == [3, 2]                   # 按 deadline_ts 升序（18 号在 20 号前）
+    assert body["total"] == 2
+
+
+def test_calendar_item_shape_is_the_frozen_field_set(client, db_path):
+    """⚠️ 日历的条目**必须**与 `/api/items` 同形——前端 `Item` 类型一字不改就靠它。
+
+    变异反证：把 `item_out(it, names, cats)` 换成裸 `asdict(it)` ⇒ 本条必红。
+    """
+    con = sqlite3.connect(str(db_path))
+    con.execute(
+        "INSERT INTO items (item_id, kind, title, detail, event_ts, deadline_ts,"
+        " group_id, actor_uid, place, amount, links, confidence, model, prompt_ver,"
+        " created_at) VALUES (2, 'academic', '选课截止', NULL, ?, ?, 12345, NULL,"
+        " NULL, NULL, '[\"https://x.test/b\"]', 0.9, 'm', 'v1', 1)",
+        (int(dt.datetime(2026, 9, 10, 9, 0).timestamp()),
+         int(dt.datetime(2026, 9, 20, 0, 0).timestamp())),
+    )
+    con.commit()
+    con.close()
+    item = client.get("/api/calendar").json()["items"][0]
+    assert {
+        "item_id", "kind", "kind_label", "kind_icon", "title", "detail", "event_ts",
+        "deadline_ts", "group_id", "group_name", "actor", "actor_uin", "place", "amount",
+        "links", "source_count",
+    } == set(item)
+    assert item["links"] == ["https://x.test/b"]
+
+
+def test_calendar_since_until_are_inclusive_of_both_ends(client, db_path):
+    """⚠️ `since`/`until` 都按**包含该日**理解——与 `/api/items` 同口径。
+
+    变异反证：把 `_day_start(until, plus_days=1)` 改成 `_day_start(until)` ⇒
+    右端那条（恰好落在 until 当天 00:00）会被排除 ⇒ 本条必红。
+    """
+    con = sqlite3.connect(str(db_path))
+    con.execute(
+        "INSERT INTO items (item_id, kind, title, detail, event_ts, deadline_ts,"
+        " group_id, actor_uid, place, amount, links, confidence, model, prompt_ver,"
+        " created_at) VALUES (2, 'notice', '18 号截止', NULL, ?, ?, 12345, NULL,"
+        " NULL, NULL, '[]', 0.9, 'm', 'v1', 1)",
+        (int(dt.datetime(2026, 9, 10, 9, 0).timestamp()),
+         int(dt.datetime(2026, 9, 18, 0, 0).timestamp())),
+    )
+    con.commit()
+    con.close()
+    # 窗口 [9-18, 9-18]：右端那条**当天 00:00** 的必须被含进来
+    got = client.get("/api/calendar", params={"since": "2026-09-18", "until": "2026-09-18"}).json()
+    assert [it["item_id"] for it in got["items"]] == [2]
+    # 窗口 [9-19, 9-30]：它必须被排除
+    assert client.get("/api/calendar", params={"since": "2026-09-19"}).json()["items"] == []
+
+
+def test_calendar_excludes_soft_deleted(client, db_path):
+    """⚠️ 软删的条目**在所有读取路径上都必须消失**（D15）——日历不是例外。
+
+    变异反证：把 `_NOT_DELETED` 从 WHERE 里删掉 ⇒ 本条必红。
+    """
+    con = sqlite3.connect(str(db_path))
+    con.execute(
+        "INSERT INTO items (item_id, kind, title, detail, event_ts, deadline_ts,"
+        " group_id, actor_uid, place, amount, links, confidence, model, prompt_ver,"
+        " created_at) VALUES (2, 'notice', '要删掉的', NULL, ?, ?, 12345, NULL,"
+        " NULL, NULL, '[]', 0.9, 'm', 'v1', 1)",
+        (int(dt.datetime(2026, 9, 10, 9, 0).timestamp()),
+         int(dt.datetime(2026, 9, 20, 0, 0).timestamp())),
+    )
+    con.commit()
+    con.close()
+    assert client.delete("/api/items/2").status_code == 200
+    assert [it["item_id"] for it in client.get("/api/calendar").json()["items"]] == []
+
+
+def test_calendar_rejects_bad_date(client):
+    """坏日期串 ⇒ 400（与 `/api/items` 同形，走 `_day_start`）。"""
+    assert client.get("/api/calendar", params={"since": "2026/09/18"}).status_code == 400

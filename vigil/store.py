@@ -1113,6 +1113,44 @@ def search_items(
     return [_to_api_item(r) for r in rows], total
 
 
+def deadlines_in_range(
+    conn: sqlite3.Connection,
+    *,
+    since: int | None = None,
+    until: int | None = None,
+) -> list[ApiItem]:
+    """带截止日的条目，按 ``(deadline_ts, event_ts, item_id)`` **升序**。
+
+    日历用：从早到晚读，与信息流的 `event_ts DESC` 相反。
+
+    ⚠️ 三处复用既有常量（`_ITEM_COLS` / `_ITEM_JOINS` / `_NOT_DELETED`），
+    理由与 `search_items` 逐字相同：软删必须在这里也生效、类目别名也必须在这里
+    也解析——漏任何一处的后果是「日历与信息流对同一个条目的说法不同」（R13）。
+
+    ⚠️ 排序的第三键是 `item_id`：`deadline_ts` 与 `event_ts` 都可能相同，只有
+    加它才是**确定**序（同 `window_items` 对确定序的要求）。
+
+    ⚠️ **不许**在这里写 `date(deadline_ts,'unixepoch','+8 hours')`：本地日口径的
+    唯一定义处是 `api._day_start` / `api._day_of`（E5）。这里只比原始 epoch 秒。
+    """
+    _ensure_overlay(conn)
+    where = ["i.deadline_ts IS NOT NULL", _NOT_DELETED]
+    params: list[int] = []
+    if since is not None:
+        where.append("i.deadline_ts >= ?")
+        params.append(since)
+    if until is not None:
+        where.append("i.deadline_ts < ?")
+        params.append(until)
+    clause = " WHERE " + " AND ".join(where)
+    rows = conn.execute(
+        f"SELECT {_ITEM_COLS}{_ITEM_JOINS}{clause}"
+        " ORDER BY i.deadline_ts ASC, i.event_ts ASC, i.item_id ASC",
+        params,
+    ).fetchall()
+    return [_to_api_item(r) for r in rows]
+
+
 def get_item(conn: sqlite3.Connection, item_id: int) -> ApiItem | None:
     """单条条目；不存在返回 None（由调用方决定 404 的形状）。"""
     _ensure_overlay(conn)
