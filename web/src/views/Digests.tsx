@@ -13,20 +13,32 @@ import type { DigestDetail, DigestSummary } from '../types.ts'
 // 把「不知道」渲染成一篇没有内容的日报，就是拿失败冒充内容。
 type Opened = { id: number; detail: DigestDetail | null }
 
+/**
+ * 屏幕上这份**日报列表**，连同**它是实时还是快照**一起存。
+ *
+ * ⚠️ 为什么合成**一个** state（不是 `list` + `snapshotAt` 两个，F2 的根因）：
+ * 两个 state 靠"每一次 setList 都记得同时 setSnapshotAt"这条**纪律**维持一致
+ * ——纪律不是结构。T5-concern 记下的"恢复在线后横幅消失而数据仍是快照"，
+ * 就是这条纪律被 `online` 单独翻转打断的形态（屏幕上是旧数据，却不再声明它是旧数据）。
+ * 出口标准 5 的两半（有快照数据 ⇔ 有横幅）由这个形状**结构性**保证。
+ * `Feed.tsx` 的 `Shown` 是这个形状的原始出处。
+ *
+ * ⚠️ 也不要试图让横幅直接读 `!online` 就完事：那是另一种半新半旧——"离线读到了
+ * 实时数据"（浏览器误报 offline）时，屏幕上是实时数据却被说成快照。
+ */
+type ListShown = {
+  list: DigestSummary[]
+  /** 列表数据来自快照时的同步时刻；实时数据时为 null。 */
+  snapshotAt: number | null
+}
+
 export default function Digests() {
   // null = 还没读到过（请求在飞 / 列表读取失败）。
   // 它必须与「读到了、结果是 0 篇」分开：前者只能说「不确定」，
   // 后者才有资格说「还没有日报」。
-  const [list, setList] = useState<DigestSummary[] | null>(null)
+  const [listShown, setListShown] = useState<ListShown | null>(null)
   const [opened, setOpened] = useState<Opened | null>(null)
   const [err, setErr] = useState<string | null>(null)
-  /**
-   * 列表数据来自快照时的同步时刻；实时数据时为 null。
-   *
-   * ⚠️ 读它的是**渲染**（横幅），不是某个回调：状态必须与 `list` 同生同死，
-   * 所以每一次 `setList(...)` 都必须同时把这一项设对（下面三处各一次）。
-   */
-  const [snapshotAt, setSnapshotAt] = useState<number | null>(null)
   // 重跑列表请求的手动扳机：没有它，列表读取失败后就没有可见的恢复入口
   const [reloadTick, setReloadTick] = useState(0)
 
@@ -43,6 +55,30 @@ export default function Digests() {
   // 谎报成"离线"——一句用户无从分辨的假话。
   const [online, setOnline] = useState(isOnline)
   useEffect(() => subscribeConnectivity(() => setOnline(isOnline())), [])
+  /**
+   * ⚠️ 由 `online` 派生的"重取一次"扳机，**专供下面那个 effect 的依赖数组**（F2）。
+   *
+   * 出口标准 4 要求"网络恢复后**自动**回到实时数据"——列表 effect 原本只依赖
+   * `[reloadTick]`，**不听 online 边沿** ⇒ 离线打开日报页、网络恢复后**一直卡在
+   * 快照上**（审查实测 `afterStale=true`）。
+   *
+   * 为什么不直接依赖 `online`：true→false 也会让 effect 重跑，那是离线时白发
+   * 一次必然失败的请求（还会 `noteFetchResult(false)` 把状态机再按一次离线）。
+   * 为什么不写成「订阅回调里直接 `setReloadTick`」：那样**首帧**的 `isOnline()`
+   * 初值就不生效了——初值是"挂载那一刻的真相"，依赖变化是"之后每一次变化"。
+   *
+   * ⚠️⚠️ 判据里 **`online` 是承重的**：`seenOnline.current` 记的是"上一次算这个值
+   * 时在不在线"，所以只有**真的从离线变成在线**才会 `+1`。少了它，任何一次无关
+   * 的重渲染都会把 `online` 重新算成 `true` 并 `+1` ⇒ 每次渲染白拉一次列表
+   * （`Feed.tsx` 的同一条注释，变异 E 的教训）。
+   */
+  const [onlineEpoch, setOnlineEpoch] = useState(0)
+  const seenOnline = useRef(online)
+  useEffect(() => {
+    const wasOnline = seenOnline.current
+    seenOnline.current = online
+    if (online && !wasOnline) setOnlineEpoch((t) => t + 1)
+  }, [online])
   // 请求序号：连点两篇日报时，慢的先发请求不许晚到覆盖后点的
   const seq = useRef(0)
   /**
@@ -63,8 +99,7 @@ export default function Digests() {
     fetchDigests()
       .then((r) => {
         if (mine !== seq.current) return
-        setList(r.digests)
-        setSnapshotAt(null)
+        setListShown({ list: r.digests, snapshotAt: null })
         snapDigests.current = null
       })
       .catch((e: unknown) => {
@@ -74,8 +109,8 @@ export default function Digests() {
         if (snap !== null && snap.digests.length > 0) {
           // `DigestDetail` 是 `DigestSummary` 的超集 ⇒ 显式挑字段而不是硬转类型
           //（多出来的是 `body_md`/`items`，留着给下面"打开"用）。
-          setList(
-            snap.digests.map((d) => ({
+          setListShown({
+            list: snap.digests.map((d) => ({
               digest_id: d.digest_id,
               day: d.day,
               window_from: d.window_from,
@@ -83,24 +118,26 @@ export default function Digests() {
               created_at: d.created_at,
               item_count: d.item_count,
             })),
-          )
-          setSnapshotAt(snap.synced_at)
+            snapshotAt: snap.synced_at,
+          })
           snapDigests.current = new Map(snap.digests.map((d) => [d.digest_id, d]))
           // ⚠️⚠️ F2：**在线**失败（4xx）时保留错误（与 Feed 同一形状）。回落到
           // 快照 == "有东西看"，不是"什么都没发生"；吞掉它，在线 404 的用户会
           // 以为眼前这份快照就是实时的日报列表。离线时清掉（必然失败是已知前提）。
           setErr(isOnline() ? (e instanceof Error ? e.message : String(e)) : null)
         } else {
-          setList(null)
-          setSnapshotAt(null)
+          setListShown(null)
           snapDigests.current = null
           setErr(e instanceof Error ? e.message : String(e))
         }
-        // ⚠️ 判为"没有快照"时这里**不写 setList([])**：请求失败说的是「不知道有几篇」，
-        // 写下 [] 就是把它记成「读到了 0 篇」，下一帧会渲染出
-        // 「还没有日报。生成：`vigil digest`」——一句没有依据的话。
+        // ⚠️ 判为"没有快照"时这里**不写 setListShown({list: [], ...})**：请求失败
+        // 说的是「不知道有几篇」，写下 [] 就是把它记成「读到了 0 篇」，下一帧会
+        // 渲染出「还没有日报。生成：`vigil digest`」——一句没有依据的话。
       })
-  }, [reloadTick])
+    // ⚠️ `onlineEpoch` **承重**（F2 / 出口标准 4）：它只在"离线→在线"那个边沿
+    // +1 ⇒ 网络恢复时重跑列表请求，回到实时数据，而不是**卡在快照上**
+    //（且不会把 `online` 的 true→false 也接进来白发一次请求）。
+  }, [reloadTick, onlineEpoch])
 
   function open(id: number) {
     const mine = ++seq.current
@@ -241,9 +278,9 @@ export default function Digests() {
           ⚠️⚠️ `!online` 是承重的（F2）：4xx 保持 `online===true`（`api.ts`），
           回落到快照 **!=** 离线。少了它，"后端活着但回 4xx"时会把"读不到"
           谎报成"离线"。 */}
-      {snapshotAt !== null && !online && (
+      {listShown !== null && listShown.snapshotAt !== null && !online && (
         <p className="mb-3 rounded-lg bg-vigil-warn-soft p-3 text-sm text-vigil-warn">
-          离线：显示的是本地快照（{fmtDateTime(snapshotAt)} 同步）。
+          离线：显示的是本地快照（{fmtDateTime(listShown.snapshotAt)} 同步）。
         </p>
       )}
 
@@ -267,16 +304,16 @@ export default function Digests() {
         </div>
       )}
 
-      {list === null ? (
+      {listShown === null ? (
         // 失败时横幅已经说了原因，这里不再说「读取中」——那会是一句谎话
         err === null && <p className="text-sm text-vigil-fg-4">读取日报列表…</p>
-      ) : list.length === 0 ? (
+      ) : listShown.list.length === 0 ? (
         <p className="text-center text-sm text-vigil-fg-4">
           还没有日报。生成：<code className="text-vigil-fg-2">vigil digest</code>
         </p>
       ) : (
         <ul className="space-y-2">
-          {list.map((d) => (
+          {listShown.list.map((d) => (
             <li key={d.digest_id}>
               <button
                 onClick={() => open(d.digest_id)}

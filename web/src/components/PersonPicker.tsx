@@ -15,9 +15,23 @@ import type { Person } from '../types.ts'
 export default function PersonPicker({
   selected,
   onChange,
+  offline,
 }: {
   selected: number[]
   onChange: (uins: number[]) => void
+  /**
+   * 离线（G9 / spec §3.3 / 出口标准 3）：**新增/删除人物是写操作**，
+   * 离线时必须置灰并说明原因。
+   *
+   * ⚠️ **可选**，且判据一律写成 `=== true`（与 `ItemCard` 逐字同一条规矩）：
+   * 缺省是 `undefined` ⇒ 每一处判断都为假 ⇒ 与加这个 prop 之前**一字不差**。
+   *
+   * ⚠️ 只影响**写**的两处（`新增` 与每个人物后面的 `×`）：左半边那个
+   * 「选中/取消选中」按钮改的是**本地的筛选条件**（`onChange`），不发任何请求
+   * ⇒ 离线时它照常可用（把筛选也灰掉是另一回事：那会让离线用户连
+   * "看某个人发的东西"都做不到——而这条路径完全不需要网络）。
+   */
+  offline?: boolean
 }) {
   const [people, setPeople] = useState<Person[] | null>(null)
   const [err, setErr] = useState<string | null>(null)
@@ -126,9 +140,13 @@ export default function PersonPicker({
                     </button>
                     <button
                       onClick={() => drop(p.uin)}
-                      disabled={busy}
+                      // ⚠️ 删人是**写**操作：离线时置灰（G9 / 出口标准 3）。
+                      // ⚠️ `disabled:opacity-40` 是「置灰」的一半——只加 `disabled`
+                      // 属性的话这个 × 在视觉上与可点的一模一样（它的类名里本没有
+                      // 禁用态样式），用户看到的是"点不动但看不出为什么"。
+                      disabled={busy || offline === true}
                       title={`不再监视 ${p.uin}`}
-                      className="rounded-r-full bg-vigil-surface px-2 py-1 text-xs text-vigil-fg-4 active:bg-vigil-surface-2"
+                      className="rounded-r-full bg-vigil-surface px-2 py-1 text-xs text-vigil-fg-4 active:bg-vigil-surface-2 disabled:opacity-40"
                     >
                       ×
                     </button>
@@ -154,11 +172,18 @@ export default function PersonPicker({
             />
             <button
               onClick={add}
-              disabled={busy}
+              // ⚠️ 加人是**写**操作：离线时置灰（G9 / 出口标准 3）。
+              disabled={busy || offline === true}
               className="rounded-lg bg-vigil-accent-soft px-3 py-1 text-xs text-vigil-accent-text disabled:opacity-40"
             >
               新增
             </button>
+            {/* ⚠️ 置灰之外**必须**说一句「需要联网」：只置灰的话，用户看到的是
+                一个点不动的按钮，而不知道是"这里坏了"还是"我现在没法改"
+                （与 `ItemCard` 的操作条同一条规矩，逐字复用那句话）。 */}
+            {offline === true && (
+              <span className="text-vigil-fg-4">需要联网</span>
+            )}
           </div>
         </div>
       )}

@@ -354,7 +354,10 @@ export default function Feed({
         ))}
       </div>
 
-      <PersonPicker selected={persons} onChange={onPersons} />
+      {/* ⚠️ `offline={!online}`（不是 `shown.snapshotAt !== null`）：置灰的理由是
+          "**写**操作需要联网"，而这句话的真假只取决于网通不通（F4）。
+          用 `snapshotAt` 的话，在线 4xx 回落快照时会把能用的写操作灰掉（F3 的同一条）。 */}
+      <PersonPicker selected={persons} onChange={onPersons} offline={!online} />
 
       {/* ⚠️ 快照横幅：**必须**说清这是何时同步的，不许假装实时
           （G10 / 出口标准 2）。只认 `shown.snapshotAt`——离线但**读到了实时数据**
@@ -478,9 +481,17 @@ export default function Feed({
               onMutated={reload}
               onSelect={toggleSelect}
               selected={selected.has(it.item_id)}
-              // ⚠️ 只认 `shown.snapshotAt`，不认 `!online`：一个离线但**读到了实时数据**
-              // 的窗口（浏览器误报）不该把能用的控件灰掉。
-              offline={shown.snapshotAt !== null}
+              // ⚠️⚠️ F3：判据是**连接性**（`!online`），**不是**"这份数据是不是快照"。
+              // 置灰的理由是"**写**操作需要联网"——而网通不通只由 `connectivity.ts`
+              // 说了算。写成 `shown.snapshotAt !== null` 会漏掉"在线 4xx"这一支：
+              // 4xx 时快照照样回落（`snapshotAt` 非 null），但后端**是活的**，
+              // 于是能用的写操作被灰掉、还挂着"需要联网"——三句假话连成一串。
+              //
+              // ⚠️ 反过来的那一支（离线但**读到了**实时数据：浏览器误报 offline 后
+              // 又被 `noteFetchResult(true)` 纠正回在线）也确实存在——它的正确答案
+              // 同样是 `!online`（此刻就是在线的），所以这一改对它是**顺带修好的**，
+              // 不是回归（见本节末端那条"阴性对照"用例）。
+              offline={!online}
             />
           ))}
       </ul>

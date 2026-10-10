@@ -1,6 +1,7 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { fetchCalendar } from '../api.ts'
 import ItemCard from '../components/ItemCard.tsx'
+import { isOnline, subscribeConnectivity } from '../connectivity.ts'
 import { readSnapshot } from '../snapshot.ts'
 import type { Item } from '../types.ts'
 
@@ -24,13 +25,62 @@ function monthGrid(year: number, month: number): Date[] {
   return Array.from({ length: 42 }, (_, i) => new Date(year, month, 1 - offset + i))
 }
 
+/**
+ * 屏幕上这批日历数据，连同**它是实时还是快照**一起存。
+ *
+ * ⚠️ 为什么合成**一个** state（不是 `items` + `snapshotAt` 两个）：两个 state
+ * 靠"每一次 setItems 都记得同时 setSnapshotAt"这条**纪律**维持一致——纪律不是
+ * 结构，漏一处就会出现「快照的数据 + 实时的结论」这种半新半旧的屏幕。
+ * 出口标准 5 的两半（有快照数据 ⇔ 有横幅）正是被这个形状**结构性**保证的。
+ * `Feed.tsx` 的 `Shown` 是这个形状的原始出处（T5 做对了的那一份）。
+ */
+type Shown = {
+  items: Item[]
+  /** 这批数据来自快照时的同步时刻；实时数据时为 null。 */
+  snapshotAt: number | null
+}
+
 export default function Calendar() {
   // null = 还没读到（请求在飞）；与「读到了、0 条」分开（G10 的同一条判据）
-  const [items, setItems] = useState<Item[] | null>(null)
+  const [shown, setShown] = useState<Shown | null>(null)
   const [err, setErr] = useState<string | null>(null)
-  /** 数据来自快照时的同步时刻；实时数据时为 null。 */
-  const [snapshotAt, setSnapshotAt] = useState<number | null>(null)
   const [reloadTick, setReloadTick] = useState(0)
+
+  // ── 在线/离线（F1/F2）：`connectivity.ts` 是状态的单一真相源 ─────────────
+  //
+  // ⚠️ 与 `Feed.tsx`/`Digests.tsx` 同一形状（spec R4：别让两个组件各自探测）。
+  // ⚠️ effect **返回**退订函数 ⇒ 卸载时摘掉订阅，且 `StrictMode`（挂→卸→挂）
+  //   下净剩**一个**订阅（「卸」摘掉第一个、「挂」再装一个）。
+  //
+  // ⚠️⚠️ 这一条状态**必须**有（F1）：`api.ts` 对 **4xx** 保持 `online===true`
+  //   （`noteFetchResult(r.status < 500)`）⇒ 失败**不等于**离线。少了它，
+  //   "后端活着但回 404"时下面两处会把"读不到"谎报成"离线"——一句
+  //   用户无从分辨的假话（出口标准 5 /「只说自己有资格说的话」的反面）。
+  const [online, setOnline] = useState(isOnline)
+  useEffect(() => subscribeConnectivity(() => setOnline(isOnline())), [])
+
+  /**
+   * ⚠️ 由 `online` 派生的"重取一次"扳机，**专供下面那个 effect 的依赖数组**。
+   *
+   * 为什么不直接依赖 `online`：`online` 从 true→false 也会让 effect 重跑——
+   * 那是**离线时白发一次必然失败的请求**（还会 `noteFetchResult(false)`
+   * 把状态机再按一次离线）。
+   * 为什么不写成「订阅回调里直接 `setReloadTick`」：那样**首帧**的 `isOnline()`
+   * 初值就不生效了——初值本身是"挂载那一刻的真相"，而 effect 的依赖变化是
+   * "之后每一次变化"，两个来源各管一段，才不会漏。
+   *
+   * ⚠️⚠️ 判据里 **`online` 是承重的**：`seenOnline.current` 记的是"上一次算这个
+   * 值时在不在线"，所以只有**真的从离线变成在线**才会 `+1`。少了这个判据，
+   * 任何一次无关的重渲染都会把 `online` 重新算成 `true` 并 `+1` ⇒ 每次渲染
+   * 白拉一次日历（`Feed.tsx` 的同一条注释，变异 E 的教训）。
+   */
+  const [onlineEpoch, setOnlineEpoch] = useState(0)
+  const seenOnline = useRef(online)
+  useEffect(() => {
+    const wasOnline = seenOnline.current
+    seenOnline.current = online
+    if (online && !wasOnline) setOnlineEpoch((t) => t + 1)
+  }, [online])
 
   const today = dayKey(new Date())
   const [cursor, setCursor] = useState(() => {
@@ -41,36 +91,46 @@ export default function Calendar() {
 
   useEffect(() => {
     let alive = true
+    // 新一轮读取开始，上一次的失败结论即刻作废：留着它，重试成功后横幅会
+    // 继续描述一个已经不存在的状态。
     setErr(null)
     fetchCalendar()
       .then((r) => {
         if (!alive) return
-        setItems(r.items)
-        setSnapshotAt(null)
+        // ⚠️ 数据与"它是不是快照"**同时**写（同一个 `Shown`）：实时 ⇒ 两项一起
+        // 换新，屏幕上不会出现"新数据 + 旧快照结论"的中间帧。
+        setShown({ items: r.items, snapshotAt: null })
       })
       .catch((e: unknown) => {
         if (!alive) return
-        // ⚠️ 失败了才回落快照。**三态必须分开**（spec 出口标准 5）：
+        // ⚠️ 失败了**才**回落快照。**三态必须分开**（spec 出口标准 5）：
         // 网络通没数据 / 断网有快照 / 断网无快照
         const snap = readSnapshot()
         if (snap !== null) {
-          setItems(snap.calendar)
-          setSnapshotAt(snap.synced_at)
-          setErr(null)
+          setShown({ items: snap.calendar, snapshotAt: snap.synced_at })
+          // ⚠️⚠️ F1：**在线**失败（4xx：后端活着、这个请求有问题）时**保留**错误
+          // ——回落到快照 == "屏幕上有东西看"，**不是**"什么都没发生"。少了这一行，
+          // 在线 404 会既不说"离线"（横幅已被 `!online` 挡掉）又不报错 ⇒ 屏幕上
+          // 只剩快照，用户以为那就是最新的实时日历。
+          // 离线时清掉：那时**必然**失败是已知事实，横幅已说清"这是快照"，
+          // 再挂一条"读取失败"是把预期内的离线报成意外。
+          setErr(isOnline() ? (e instanceof Error ? e.message : String(e)) : null)
         } else {
-          setItems(null)
+          setShown(null)
           setErr(e instanceof Error ? e.message : String(e))
         }
       })
     return () => {
       alive = false
     }
-  }, [reloadTick])
+    // ⚠️ `onlineEpoch` **承重**（F2 / 出口标准 4）：它只在"离线→在线"那个边沿
+    // +1 ⇒ 网络恢复时重取一次实时数据，而不是**卡在快照上**。
+  }, [reloadTick, onlineEpoch])
 
   // 按本地日分桶（⚠️ 与后端 `_day_start`/`_day_of` 同一个口径：本机时区）
   const byDay = useMemo(() => {
     const m = new Map<string, Item[]>()
-    for (const it of items ?? []) {
+    for (const it of shown?.items ?? []) {
       if (it.deadline_ts === null) continue
       const k = dayKey(new Date(it.deadline_ts * 1000))
       const arr = m.get(k)
@@ -78,24 +138,31 @@ export default function Calendar() {
       else m.set(k, [it])
     }
     return m
-  }, [items])
+  }, [shown])
 
   const grid = useMemo(() => monthGrid(cursor.y, cursor.m), [cursor])
   const dayItems = picked !== null ? (byDay.get(picked) ?? []) : []
 
   return (
     <div>
-      {/* ⚠️ 快照横幅：**必须**说清这是何时同步的，不许假装实时（G10 / 出口标准 5） */}
-      {snapshotAt !== null && (
+      {/* ⚠️ 快照横幅：**必须**说清这是何时同步的，不许假装实时（G10 / 出口标准 5）。
+          ⚠️⚠️ `!online` 是**承重**的（F1）：4xx 保持 `online===true`，回落快照
+          **!=** 离线；少了它，在线 404 会把"读不到"谎报成"离线"（T5 在 Feed/Digests
+          修掉的同一个缺陷，这里是第四个消费者）。 */}
+      {shown !== null && shown.snapshotAt !== null && !online && (
         <div className="mb-3 rounded-lg bg-vigil-warn-soft p-3 text-sm text-vigil-warn">
-          离线：下面是 <SnapshotTime ts={snapshotAt} /> 同步的快照。
+          离线：下面是 <SnapshotTime ts={shown.snapshotAt} /> 同步的快照。
         </div>
       )}
 
       {err !== null && (
         <div className="mb-3 rounded-lg bg-vigil-danger-soft p-3 text-sm text-vigil-danger">
           <p>日历读取失败：{err}</p>
-          <p className="mt-1 text-xs">离线，且还没有本地快照。</p>
+          {/* ⚠️ 三态分开（G10 / 出口标准 5）：读到**没有快照**时，必须明说"离线"，
+              而不是让用户把"读不到"读成"没有条目"。
+              ⚠️⚠️ `!online` 是**承重**的（F1）：失败横幅对"在线 4xx"同样会出现
+              （那**是**错误，该出现），但"离线"这一句只有 `!online` 才配说。 */}
+          {!online && <p className="mt-1 text-xs">离线，且还没有本地快照。</p>}
           <button
             onClick={() => setReloadTick((t) => t + 1)}
             className="mt-2 rounded-lg bg-vigil-danger-btn px-3 py-1.5 text-xs text-vigil-danger-text active:bg-vigil-danger-btn-active"

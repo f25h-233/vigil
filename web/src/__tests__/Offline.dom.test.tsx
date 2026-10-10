@@ -4,6 +4,7 @@ import userEvent from '@testing-library/user-event'
 import { afterEach, expect, test, vi } from 'vitest'
 import App from '../App.tsx'
 import ItemCard from '../components/ItemCard.tsx'
+import PersonPicker from '../components/PersonPicker.tsx'
 import { _resetForTests, noteFetchResult } from '../connectivity.ts'
 import { readSnapshot, writeSnapshot } from '../snapshot.ts'
 import { VIEW_STORAGE_KEY } from '../uiState.ts'
@@ -342,6 +343,53 @@ test('⚠️ 在线 4xx + 盘上有快照 ⇒ 如实报错,不许说"离线"、�
   expect(screen.queryByText(/离线/)).toBeNull()
 })
 
+test('⚠️ F3:在线 4xx + 快照回落 ⇒ 卡片**不许**被灰、也不许说"需要联网"', async () => {
+  /**
+   * ⭐ F3 —— 置灰的判据原本是 `shown.snapshotAt !== null`(="这份数据是不是快照"),
+   * 而 `snapshotAt` 在**在线 4xx** 下也非 null(4xx 有意回落快照)⇒ 卡片被灰掉、
+   * 说"需要联网",而后端**是活的**(审查实测 `needsNet=true delDisabled=true`)。
+   * 谎报从"离线横幅"挪到了"写操作为什么不能点"。
+   *
+   * ⚠️ 根因是一条**范畴错误**:置灰的理由是"**写**操作需要联网",而这句话的真假
+   * 只取决于网通不通(`connectivity.ts` 说了算),与"手里这份数据从哪来"无关。
+   *
+   * ⚠️ 变异反证:把 `Feed.tsx` 的 `offline={!online}` 改回
+   * `offline={shown.snapshotAt !== null}` ⇒ 卡片的删除被灰、"需要联网"出现 ⇒ 本条必红。
+   */
+  writeSnapshot({
+    synced_at: SNAPSHOT_TS,
+    feed: [item(7, '快照里的停水通知')],
+    calendar: [],
+    digests: [],
+  })
+  stub404Api()
+  render(<Feed {...feedProps} />)
+
+  // 快照照常回落(与 F2 那条同一前提),但此刻**在线**:
+  await screen.findByText('快照里的停水通知')
+  expect(screen.getByText(/读取失败/)).toBeTruthy() // 错误如实报出
+  // ⭐ 卡片**不许**被灰:写操作此刻是能用的
+  expect(
+    (screen.getByRole('button', { name: '删除' }) as HTMLButtonElement).disabled,
+    '在线 4xx 时写操作不该被灰(网是通的)',
+  ).toBe(false)
+  expect(screen.queryByText('需要联网'), '在线时不许说"需要联网"').toBeNull()
+})
+
+test('⚠️ F3 阴性对照:真离线 + 快照 ⇒ 卡片**确实**被灰且说"需要联网"(不是"恒不灰")', async () => {
+  // ⚠️ 没有这一条,把 `offline` 恒传 `false` 也能让 F3 那条绿——那是假绿。
+  writeSnapshot({
+    synced_at: SNAPSHOT_TS,
+    feed: [item(7, '快照里的停水通知')],
+    calendar: [],
+    digests: [],
+  })
+  stubDeadApi()
+  render(<Feed {...feedProps} />)
+  await screen.findByText('需要联网')
+  expect((screen.getByRole('button', { name: '删除' }) as HTMLButtonElement).disabled).toBe(true)
+})
+
 test('⚠️ 在线 4xx 且**无**快照 ⇒ 只说错误,不许说"离线,且还没有本地快照"(F2 / G10)', async () => {
   // ③句那一处修复前无条件挂在 `err !== null` 下 ⇒ 在线 4xx 也会说"离线"。
   stub404Api()
@@ -500,6 +548,162 @@ test('⚠️ 离线且无快照 ⇒ 说"离线，且还没有本地快照",不�
   render(<Digests />)
   expect(await screen.findByText(/离线，且还没有本地快照/)).toBeTruthy()
   expect(screen.queryByText(/还没有日报/)).toBeNull()
+})
+
+test('⚠️ F2：网络恢复 ⇒ Digests **自动重取**列表、回到实时、横幅消失(出口标准 4)', async () => {
+  /**
+   * ⭐ F2 —— 出口标准 4 原本**只在 Feed 实现**:Digests 的取数 effect 只依赖
+   * `[reloadTick]`,**不听 online 边沿** ⇒ 离线打开日报页、网络恢复后
+   * **一直卡在快照上**;更糟的是 `online` 变真会把横幅**藏起来**,
+   * 而列表仍是快照(审查实测 `afterLive=false afterStale=true afterBanner=false`)
+   * ⇒ 屏幕上是旧数据,却不再声明它是旧数据(出口标准 2/4/5 同时被破)。
+   *
+   * ⚠️ 网络那份列表是**空**的(与快照里那一篇不同)⇒ 能一眼分辨"到底重取没有"。
+   * ⚠️ 关键断言是**数据**(不是横幅):F2 的半新半旧形态下横幅**本来就会消失**,
+   * 只断言横幅会让这一条在缺陷版上照样绿(假绿)。所以钉的是"快照那一篇不见了 +
+   * 说的是'还没有日报'"。
+   *
+   * ⚠️ 变异反证:把 `[reloadTick, onlineEpoch]` 改回 `[reloadTick]` ⇒ 恢复后
+   * 屏幕仍是 `2026-10-05`、不说"还没有日报" ⇒ 本条必红。
+   */
+  writeSnapshot({ synced_at: SNAPSHOT_TS, feed: [], calendar: [], digests: [DIGEST] })
+  _resetForTests()
+  noteFetchResult(false) // 离线:挂载时 online 为 false(用户离线打开)
+  stubDeadApi()
+  render(<Digests />)
+  expect(await screen.findByText('2026-10-05')).toBeTruthy()
+  expect(screen.getByText(/本地快照（/), '先落到快照横幅上').toBeTruthy()
+
+  // 恢复:换一个活的后端(列表为空),再派发浏览器的 online 事件
+  stubOkApi()
+  await act(async () => {
+    window.dispatchEvent(new Event('online'))
+  })
+
+  expect(await screen.findByText(/还没有日报/), '应重取到网络那份(空列表)').toBeTruthy()
+  expect(screen.queryByText('2026-10-05'), '快照那一篇该被换掉').toBeNull()
+  expect(screen.queryByText(/快照/), '回到实时后横幅必须消失').toBeNull()
+})
+
+test('⚠️ F2：**离线挂载** Digests ⇒ `online &&` 那一半承重：不许白发第二次列表请求', async () => {
+  /**
+   * ⭐⭐ 反问「新加的 `onlineEpoch` 会不会在**离线挂载**时多跑一次」。
+   *
+   * ⚠️ `onlineEpoch` 的判据是 `if (online && !wasOnline)`——**两半都要有人守**。
+   * 离线挂载（用户离线打开 PWA）时 `useRef(online)` 的初值就是 `false`，而
+   * effect 在**挂载时也会跑一次**（此时 `wasOnline === online === false`）：
+   *   · 根治版 `if (online && !wasOnline)` ⇒ 为假 ⇒ **不**+1
+   *   · 只留 `!wasOnline` 版 ⇒ `!wasOnline` 为真 ⇒ **+1** ⇒ 取数 effect 多跑一次
+   *     （一次必然失败的请求）。
+   * ⚠️ 上一条 F2 用例**测不出**这个：它只看最终数据，多一次失败请求照样绿
+   * ——这正是"反着再问一句"要抓的那一类（新测试自己也漏掉的守卫）。
+   *
+   * ⚠️ 必须**先 `noteFetchResult(false)` 再 render**：否则挂载那一刻
+   * `navigator.onLine`（jsdom 默认 true）让 `online===true`，两版**同绿**。
+   *
+   * ⚠️ 变异反证：`if (online && !wasOnline)` → `if (!wasOnline)` ⇒ 本条必红（请求数 2）。
+   */
+  _resetForTests()
+  noteFetchResult(false) // 离线：挂载时 online 为 false
+  const calls = stubDeadApi()
+  render(<Digests />)
+  expect(await screen.findByText(/离线，且还没有本地快照/)).toBeTruthy()
+  // 给"派生 effect"足够时间走完（它若 +1，取数 effect 会再发一次）
+  await act(async () => {
+    await new Promise((r) => setTimeout(r, 0))
+  })
+  expect(calls.filter((u) => u.startsWith('/api/digests')).length).toBe(1)
+})
+
+// ── PersonPicker:离线时加/删人物不可用(F4 / 出口标准 3)──────────────────
+
+const PERSON = { uin: 10001, label: '辅导员某辅导员', note: '', count: 3 }
+
+/** 一个只有人物名单的假后端(其余端点回空/空数组)。 */
+function stubPersonsApi() {
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input)
+      const ok = (body: unknown) => ({ ok: true, status: 200, json: async () => body })
+      if (url.startsWith('/api/persons')) return ok({ persons: [PERSON] })
+      if (url.startsWith('/api/categories')) return ok({ categories: [] })
+      if (url.startsWith('/api/items')) return ok({ items: [], total: 0, limit: 50, offset: 0 })
+      return ok({})
+    }),
+  )
+}
+
+test('⚠️ F4：离线 ⇒ 人物筛选的"添加/删除"都置灰 + 说"需要联网"(出口标准 3)', async () => {
+  /**
+   * ⭐ F4 —— 出口标准 3 的**第四类写操作**:`ItemCard`/批量改/撤销都置灰了,
+   * 而 `PersonPicker` 的加/删人物此前只 `disabled={busy}` ⇒ 离线仍可点
+   * (审查实测 `addDisabled=false`)。"无单一所有者的缺陷"的教科书形态。
+   *
+   * ⚠️ 变异反证:把两处的 `|| offline === true` 去掉 ⇒ 两个 `disabled` 都变 false
+   * ⇒ 本条必红。
+   */
+  stubPersonsApi()
+  render(<PersonPicker selected={[]} onChange={() => {}} offline />)
+  await userEvent.click(screen.getByRole('button', { name: /按人物筛选/ }))
+  await screen.findByText(/辅导员某辅导员/)
+
+  expect(
+    (screen.getByRole('button', { name: '新增' }) as HTMLButtonElement).disabled,
+    '离线时"新增"必须置灰',
+  ).toBe(true)
+  expect(
+    (screen.getByTitle('不再监视 10001') as HTMLButtonElement).disabled,
+    '离线时"删除(×)"必须置灰',
+  ).toBe(true)
+  expect(screen.getByText('需要联网'), '置灰之外必须说明原因').toBeTruthy()
+  // ⚠️ 左半边(选中/取消选中)改的是**本地筛选条件**、不发请求 ⇒ 离线照常可用。
+  // 把它也灰掉会让离线用户连"看某个人发的东西"都做不到,而那条路完全不需要网络。
+  expect(
+    (screen.getByRole('button', { name: /辅导员某辅导员/ }) as HTMLButtonElement).disabled,
+    '离线不该连"筛选"也灰掉(它不发请求)',
+  ).toBe(false)
+})
+
+test('⚠️ 不传 offline ⇒ PersonPicker 与今天一字不差(F4 的阴性对照)', async () => {
+  // ⚠️ 钉的是"可选 prop 缺省时行为不变":漏了这一条,把 `offline` 写成必填/默认 true
+  // 会让**所有**调用方(包括将来只在只读页复用它的人)悄悄变灰。
+  stubPersonsApi()
+  render(<PersonPicker selected={[]} onChange={() => {}} />)
+  await userEvent.click(screen.getByRole('button', { name: /按人物筛选/ }))
+  await screen.findByText(/辅导员某辅导员/)
+
+  expect((screen.getByRole('button', { name: '新增' }) as HTMLButtonElement).disabled).toBe(false)
+  expect((screen.getByTitle('不再监视 10001') as HTMLButtonElement).disabled).toBe(false)
+  expect(screen.queryByText('需要联网')).toBeNull()
+})
+
+test('⚠️ F4(集成)：Feed 离线 ⇒ 人物筛选的"新增"也置灰(Feed 真的把 offline 传下去了)', async () => {
+  /**
+   * ⚠️ 这一条与上面那条**故意分开**:单元用例只证明 `PersonPicker` 收到 `offline`
+   * 后会置灰,证明不了**调用方传了**。`Feed` 传错(`offline={false}` / 不传)时
+   * 单元用例照样全绿——而屏幕上的按钮照样可点(这正是 F4 在真实 App 里的形态)。
+   * ⚠️ 变异反证:把 `Feed.tsx` 的 `offline={!online}` 改成 `offline={false}` ⇒ 本条必红。
+   */
+  writeSnapshot({
+    synced_at: SNAPSHOT_TS,
+    feed: [item(7, '快照里的停水通知')],
+    calendar: [],
+    digests: [],
+  })
+  stubDeadApi()
+  render(<Feed {...feedProps} />)
+  await screen.findByText('快照里的停水通知')
+
+  await userEvent.click(screen.getByRole('button', { name: /按人物筛选/ }))
+  expect(
+    (screen.getByRole('button', { name: '新增' }) as HTMLButtonElement).disabled,
+    'Feed 离线时"新增"必须置灰——它证明 Feed 真的把 offline 传下去了',
+  ).toBe(true)
+  // ⚠️ `getAllByText`(不是 `getByText`):离线快照态下屏幕上同时有**两处**
+  // "需要联网"——`ItemCard` 的操作条(快照卡片)与 `PersonPicker` 的表单。
+  // 用单数版会以"Found multiple elements"失败(是**测试脆弱**,不是行为错)。
+  expect(screen.getAllByText('需要联网').length).toBeGreaterThanOrEqual(1)
 })
 
 // ── App:同步时机 + 离线横幅 + 撤销置灰 ────────────────────────────────

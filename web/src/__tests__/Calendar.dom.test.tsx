@@ -1,7 +1,8 @@
-import { render, screen, waitFor, within } from '@testing-library/react'
+import { act, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { afterEach, expect, test, vi } from 'vitest'
 import Calendar from '../views/Calendar.tsx'
+import { _resetForTests, noteFetchResult } from '../connectivity.ts'
 import { SNAPSHOT_STORAGE_KEY } from '../snapshot.ts'
 import type { Item } from '../types.ts'
 
@@ -9,6 +10,10 @@ afterEach(() => {
   localStorage.clear()
   vi.unstubAllGlobals()
   vi.useRealTimers()
+  // ⚠️ 必须**最后**复位（`connectivity.ts` 的 `online` 是模块级状态）：
+  // 顺序反了的话 `initial()` 读到的是被 stub 的 navigator。T5 新增的用例会
+  // 派发 online/offline 事件，不复位就会跨用例串（与 Offline.dom.test.tsx 同一条注释）。
+  _resetForTests()
 })
 
 function item(id: number, deadline: number | null): Item {
@@ -220,4 +225,156 @@ test('⭐ 三态②：有快照但网络通 ⇒ 显示**网络**数据、不挂�
   await waitFor(() => expect(dotOf('10 月 20 日'), '应显示网络数据(10-20 有点)').toBeTruthy())
   expect(dotOf('10 月 5 日'), '快照那份(10-05)不许出现').toBeUndefined()
   expect(screen.queryByText(/快照/), '网络通时不挂横幅').toBeNull()
+})
+
+/* ──────────────────────────────────────────────────────────────────────────
+ * 终审 F1/F2（跨任务的缝：`online` 这条契约在 Calendar 上从未被消费）
+ * ────────────────────────────────────────────────────────────────────────── */
+
+/** 盘上一份快照，日历里只有 10-05 这一天（一个**可辨认的指纹**）。 */
+function writeCalendarSnapshot() {
+  localStorage.setItem(
+    SNAPSHOT_STORAGE_KEY,
+    JSON.stringify({
+      synced_at: Math.floor(new Date(2026, 9, 9, 8, 30).getTime() / 1000),
+      feed: [],
+      calendar: [item(888, at(2026, 10, 5))],
+      digests: [],
+    }),
+  )
+}
+
+/** 一个**活着但每个请求都 404** 的假后端（F1 的入口：4xx 保持 `online===true`）。 */
+function stub404(detail = '订单不存在') {
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(async () => ({ ok: false, status: 404, json: async () => ({ detail }) })),
+  )
+}
+
+/** fetch **本身抛** = 网络层没通（真离线）。返回值同 `installFetch`：收到的 URL 列表。 */
+function stubDead() {
+  const calls: string[] = []
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(async (input: RequestInfo | URL) => {
+      calls.push(String(input))
+      throw new TypeError('Failed to fetch')
+    }),
+  )
+  return calls
+}
+
+test('⭐ F1：在线 4xx + 盘上有快照 ⇒ **不许说"离线"**、错误框要在', async () => {
+  /**
+   * ⭐ F1 —— T5-F2 那个缺陷在**第四个消费者**上被漏掉：`api.ts` 对 4xx 保持
+   * `online===true`，而 `Calendar` 全文不 import connectivity ⇒ 屏幕把
+   * "读不到"（后端活着）谎报成"离线，且还没有本地快照。"。
+   *
+   * ⚠️ 前置：jsdom 的 `navigator.onLine` 默认 true，且 404 会 `noteFetchResult(true)`
+   * ⇒ `online` 保持真（这正是 F1 的入口：失败 **!=** 离线）。
+   *
+   * ⚠️ 变异反证：把 Calendar 的 `!online` 守卫删掉（回到"只要有 snapshotAt 就挂横幅"）
+   * ⇒ `queryByText(/离线/)` 非空 ⇒ 本条必红。
+   */
+  vi.useFakeTimers({ shouldAdvanceTime: true })
+  vi.setSystemTime(new Date(2026, 9, 10, 12, 0, 0))
+  writeCalendarSnapshot()
+  stub404('日历炸了')
+  render(<Calendar />)
+
+  // ⭐ 在线 4xx **仍是错误** ⇒ 错误框在场（不许因为回落到快照就把在线错误吞掉）
+  expect(await screen.findByText(/日历读取失败/)).toBeTruthy()
+  expect(screen.getByText(/日历炸了/)).toBeTruthy()
+  // ⭐ 快照照常回落（fallback 由"失败"决定，不由"离线"决定）
+  expect(screen.getByLabelText('1 条到期'), '快照那份(10-05)照常渲染').toBeTruthy()
+  // ⭐ 屏幕上**不许**出现任何"离线"字样
+  expect(screen.queryByText(/离线/), '在线 4xx 不许说"离线"').toBeNull()
+})
+
+test('⭐ F1 阴性对照：**真离线**失败 ⇒ 横幅与"离线"句确实出现（不是"恒不出现"）', async () => {
+  vi.useFakeTimers({ shouldAdvanceTime: true })
+  vi.setSystemTime(new Date(2026, 9, 10, 12, 0, 0))
+  writeCalendarSnapshot()
+  stubDead()
+  render(<Calendar />)
+
+  // 有快照 ⇒ 横幅必须说清"何时同步的"（出口标准 5）
+  expect(await screen.findByText(/快照/)).toBeTruthy()
+  expect(screen.getByText(/10月9日 08:30/)).toBeTruthy()
+})
+
+test('⭐ F1 阴性对照：真离线且**无**快照 ⇒ 说"离线，且还没有本地快照"', async () => {
+  vi.useFakeTimers({ shouldAdvanceTime: true })
+  vi.setSystemTime(new Date(2026, 9, 10, 12, 0, 0))
+  stubDead()
+  render(<Calendar />)
+  expect(await screen.findByText(/离线，且还没有本地快照/)).toBeTruthy()
+})
+
+test('⭐ F2：离线→在线 ⇒ **自动重取**、回到网络数据、横幅消失（出口标准 4）', async () => {
+  /**
+   * ⭐ F2 —— 恢复在线只被 `Feed` 消费；Calendar 的取数 effect 原本只依赖
+   * `[reloadTick]`，**不听 online 边沿** ⇒ 网络恢复后**一直卡在快照上**
+   * （审查实测 `banner1=banner2=true`）。出口标准 4 因此不成立。
+   *
+   * ⚠️ 快照与网络数据必须**不同**（10-05 vs 10-20 两个日子当指纹），否则测不出
+   * "到底重取没有"。
+   * ⚠️ 判据一次钉两件事：① 重取到了网络数据 ② 横幅消失 —— 后者正是出口标准 5
+   * 要的"有快照数据 ⇔ 有横幅"（不许出现"实时数据 + 快照横幅"或反过来）。
+   *
+   * ⚠️ 变异反证：把 `[reloadTick, onlineEpoch]` 改回 `[reloadTick]`（或不加
+   * `onlineEpoch`）⇒ 网络恢复后屏幕仍是 10-05 的快照、横幅还在 ⇒ 本条必红
+   *（两处断言各自都红）。
+   */
+  vi.useFakeTimers({ shouldAdvanceTime: true })
+  vi.setSystemTime(new Date(2026, 9, 10, 12, 0, 0))
+  writeCalendarSnapshot()
+  // 离线挂载（用户离线打开 PWA —— 出口标准 2/3 的场景本身）
+  _resetForTests()
+  noteFetchResult(false)
+  stubDead()
+  render(<Calendar />)
+  expect(await screen.findByText(/快照/), '先落到快照上').toBeTruthy()
+  expect(dotOf('10 月 5 日'), '快照那份(10-05)已渲染').toBeTruthy()
+
+  // 恢复：换一个活的后端，再派发浏览器的 online 事件
+  installFetch([item(7, at(2026, 10, 20))])
+  await act(async () => {
+    window.dispatchEvent(new Event('online'))
+  })
+
+  await waitFor(() => expect(dotOf('10 月 20 日'), '应重取到网络那份(10-20)').toBeTruthy())
+  expect(dotOf('10 月 5 日'), '快照那份(10-05)该被换掉').toBeUndefined()
+  expect(screen.queryByText(/快照/), '回到实时后横幅必须消失').toBeNull()
+})
+
+test('⭐ F2：**离线挂载** ⇒ 那个 `online &&` 合取项是承重的：不许白发第二次首屏', async () => {
+  /**
+   * ⭐⭐ `onlineEpoch` 的判据是 `if (online && !wasOnline)`——**两半都承重**。
+   * 这一条钉的是 `online &&` 那一半（上一条钉的是 `!wasOnline` 那一半）。
+   *
+   * ⚠️ 关键前提是**离线挂载**（用户离线时打开 PWA —— 出口标准 2/3 的场景本身）：
+   * 此时 `useRef(online)` 的初值就是 `false` ⇒ 派生 effect 第一次跑时
+   * `wasOnline === false`。
+   *   · 根治版 `if (online && !wasOnline)`：当前也离线 ⇒ 为假 ⇒ **不**+1
+   *   · 只留 `!wasOnline` 版：`!wasOnline` 为真 ⇒ **+1** ⇒ 把取数 effect 多跑一次
+   *     （一次必然失败的请求）。
+   *
+   * ⚠️ 必须**先 `noteFetchResult(false)` 再 render**：否则挂载那一刻
+   * `navigator.onLine`（jsdom 默认 true）让 `online===true`，两版**同绿**
+   * ——这正是 Feed 那边上一轮误判"不可观测"的由来。
+   *
+   * ⚠️ 变异反证：`if (online && !wasOnline)` → `if (!wasOnline)` ⇒ 本条必红（请求数 2）。
+   */
+  _resetForTests()
+  noteFetchResult(false) // 离线：挂载时 online 为 false
+  const calls = stubDead()
+  render(<Calendar />)
+  expect(await screen.findByText(/离线，且还没有本地快照/)).toBeTruthy()
+  // 给"派生 effect"足够时间走完（它若 +1，取数 effect 会再发一次）
+  await act(async () => {
+    await new Promise((r) => setTimeout(r, 0))
+  })
+  expect(calls.filter((u) => u.startsWith('/api/calendar')).length).toBe(1)
 })
