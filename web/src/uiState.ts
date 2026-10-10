@@ -4,13 +4,18 @@
  * 修掉 spec §1.5 点名的「刷新后 tab 与 kind 全部重置」。
  * ⚠️ 与主题分**两个 key**（`vigil.view` / `vigil.theme`）：清一个不该带上另一个。
  */
-export type Tab = 'feed' | 'cats' | 'digests' | 'settings'
+export type Tab = 'feed' | 'cats' | 'digests' | 'settings' | 'calendar'
 
 export const TABS: { key: Tab; label: string }[] = [
   { key: 'feed', label: '信息流' },
   { key: 'cats', label: '类目' },
   { key: 'digests', label: '日报' },
   { key: 'settings', label: '配置' },
+  // ⚠️ 日历**追加在末尾**（用户 2026-10-10 裁定「日历落第 5 个 tab」、spec §3.2
+  // 「「日历」tab（第 5 个）」）——**不是**插在「配置」前当第 4 个。追加还避免
+  // 改动 `argusLabel` 那套 `[n]` 序号（`argusBrand.dom.test.tsx` 钉死了
+  // `[1]信息流…[4]配置`；插在中间会把它们全推后一位）。
+  { key: 'calendar', label: '日历' },
 ]
 
 export type View = { tab: Tab; kinds: string[]; persons: number[] }

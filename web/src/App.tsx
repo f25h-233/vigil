@@ -6,6 +6,7 @@ import ThemePicker from './components/ThemePicker.tsx'
 import { applyTheme, readTheme, type ThemeId } from './theme.ts'
 import { readView, writeView, TABS, type Tab } from './uiState.ts'
 import Categories from './views/Categories.tsx'
+import Calendar from './views/Calendar.tsx'
 import Digests from './views/Digests.tsx'
 import Feed from './views/Feed.tsx'
 import Settings from './views/Settings.tsx'
@@ -187,6 +188,7 @@ export default function App() {
           />
         )}
         {tab === 'digests' && <Digests />}
+        {tab === 'calendar' && <Calendar />}
         {tab === 'settings' && <Settings />}
       </main>
     </div>
