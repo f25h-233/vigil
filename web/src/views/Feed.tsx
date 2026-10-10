@@ -416,11 +416,18 @@ export default function Feed({
         <div className="mt-2 flex flex-wrap items-center gap-2 text-xs">
           <button
             onClick={undoBulk}
-            disabled={bulkBusy}
+            // ⚠️⚠️ G9 / 出口标准 3 的**第五个消费者**（终审 re-review 探针 `RR-P6`
+            // 抓到的漏网）：撤销批量改是**写**操作（`POST /api/bulk-undo`），
+            // 离线时同样必须置灰。同一个条里的「改类目」早就带了 `|| !online`，
+            // 撤销这一半漏了——而它恰恰是"改错了想退回去"时才点的那个按钮。
+            disabled={bulkBusy || !online}
             className="rounded-lg bg-vigil-surface px-3 py-1.5 text-vigil-fg-2 disabled:opacity-40"
           >
             ↶ 撤销这次批量改（{bulkCount} 条）
           </button>
+          {/* ⚠️ 置灰之外明写原因（只置灰的话用户不知道是"坏了"还是"现在不行"），
+              与「改类目」那一句同一个形状。 */}
+          {!online && <span className="text-vigil-fg-4">撤销需要联网</span>}
           {/* ⚠️ 说清这个按钮的**范围**：它只拿着最近一批的键，再改一批就换掉了。 */}
           <span className="text-vigil-fg-4">
             它只认最近这一批；再改一批，这一批就撤不回来了。

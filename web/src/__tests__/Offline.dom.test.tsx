@@ -94,6 +94,11 @@ function stubOkApi(feed: Item[] = []): string[] {
         })
       }
       if (url.startsWith('/api/persons')) return ok({ persons: [] })
+      // ⚠️ 批量改类目（G9 第五消费者的用例要**先改出一批**，那个撤销按钮才出现；
+      // 没有它，"撤销离线置灰"这一条根本走不到按钮跟前）。
+      // 加在这里**不影响**任何既有用例：它们一个都没发过 `/api/items/kinds`
+      //（原先落到末尾的 `ok({})`，那是个没有 `actor` 的假响应，谁也点不出撤销条）。
+      if (url.startsWith('/api/items/kinds')) return ok({ actor: 'a1', count: 1 })
       if (url.startsWith('/api/calendar')) return ok({ items: [], total: 0 })
       if (url.startsWith('/api/digests/')) return ok(DIGEST)
       if (url.startsWith('/api/digests')) return ok({ digests: [] })
@@ -247,6 +252,70 @@ test('⚠️ 离线 ⇒ 批量条置灰:批量改是**写**操作(G9)', async ()
   })
   expect((screen.getByRole('button', { name: '改类目' }) as HTMLButtonElement).disabled).toBe(true)
   expect(screen.getByText('批量改需要联网')).toBeTruthy()
+})
+
+test('⚠️ G9 第五个消费者:离线 ⇒「撤销这次批量改」置灰 + 说"撤销需要联网"', async () => {
+  /**
+   * ⭐ 终审 fix 的 re-review 探针 `RR-P6` 抓到的漏网:出口标准 3 在批量条上有
+   * **两个**按钮,「改类目」带了 `|| !online`,而**同一个 div 里**的
+   * 「撤销这次批量改」只 `disabled={bulkBusy}` ⇒ 离线仍可点,会发
+   * `POST /api/bulk-undo`。它是"无单一所有者的缺陷"的**第五个**形态
+   * (ItemCard / 改类目 / App 撤销 / PersonPicker 之后的又一个)。
+   *
+   * ⚠️ 与上面那条同一条理由:必须**先在线改出一批**(撤销条才会出现),
+   * 再断网——这也是它在现实里的唯一形态("改错了想退回去"发生在联网时)。
+   *
+   * ⚠️ 变异反证:把 `disabled={bulkBusy || !online}` 改回 `disabled={bulkBusy}`
+   * ⇒ 断网后按钮仍可点 ⇒ 本条必红。
+   */
+  stubOkApi([item(7, '实时读到的条目')])
+  render(<Feed {...feedProps} />)
+  await screen.findByText('实时读到的条目')
+
+  await userEvent.click(screen.getByRole('checkbox', { name: '选择 实时读到的条目' }))
+  const bulkSel = screen.getByLabelText('批量改成的类目') as HTMLSelectElement
+  await waitFor(() => expect(bulkSel.options.length).toBeGreaterThan(1))
+  await userEvent.selectOptions(bulkSel, 'notice')
+  await userEvent.click(screen.getByRole('button', { name: '改类目' }))
+
+  // 撤销条出现(前提:上面那一批成功了)
+  const undo = (await screen.findByRole('button', {
+    name: /撤销这次批量改/,
+  })) as HTMLButtonElement
+  // 阴性对照:在线时它是可用的(否则下面那条断言可能只是因为别的原因恒真)
+  expect(undo.disabled, '在线时撤销应可用').toBe(false)
+
+  await act(async () => {
+    window.dispatchEvent(new Event('offline'))
+  })
+  expect(undo.disabled, '离线时「撤销这次批量改」必须置灰').toBe(true)
+  expect(screen.getByText('撤销需要联网')).toBeTruthy()
+})
+
+test('⚠️「清空选择」**不**随离线置灰:它是纯本地动作(不发请求,与 G9 无关)', async () => {
+  /**
+   * ⭐ 反向把守:批量条上**三**个控件里只有两个是**写**操作。「清空选择」改的是
+   * 本地的 `selected`、一个字节都不写(`Reorder.dom.test.tsx` 已有一条
+   * "它一个请求都不该发"的用例)。把"离线⇒批量条整体置灰"理解成"三个都灰"
+   * 就会顺手把这个本地动作也锁掉——那是**过度**置灰,而它并不是 G9 要求的。
+   *
+   * ⚠️ 变异反证:给「清空选择」也加 `disabled={!online}` ⇒ 本条必红
+   * (在线时可点、断网后该仍可点,两个断言各钉一半)。
+   */
+  stubOkApi([item(7, '实时读到的条目')])
+  render(<Feed {...feedProps} />)
+  await screen.findByText('实时读到的条目')
+  await userEvent.click(screen.getByRole('checkbox', { name: '选择 实时读到的条目' }))
+  const clear = screen.getByRole('button', { name: '清空选择' }) as HTMLButtonElement
+  expect(clear.disabled, '在线时可点').toBe(false)
+
+  await act(async () => {
+    window.dispatchEvent(new Event('offline'))
+  })
+  expect(clear.disabled, '离线时"清空选择"仍应可点(它不发请求)').toBe(false)
+  // 它**仍然真的清空**:断网后点一下,选中条消失(功能没被我的置灰改动波及)
+  await userEvent.click(clear)
+  expect(screen.queryByText(/已选 \d+ 条/), '点了就该真的清空').toBeNull()
 })
 
 test('⚠️ 带筛选时失败 ⇒ 如实报错,不许拿"不匹配的快照"冒充答案(unfiltered 守卫)', async () => {
