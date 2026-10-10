@@ -10,6 +10,7 @@ import {
   undoLast,
   updateCategory,
 } from '../api'
+import { _resetForTests, isOnline, noteFetchResult } from '../connectivity.ts'
 
 describe('fetchItems 的查询串', () => {
   it('丢掉 undefined / 空串，不发出空参数', async () => {
@@ -257,4 +258,65 @@ it('删类目：slug 同理（与上一条逐字对照）', async () => {
 
   await removeCategory('a/b', 'life')
   expect(spy.mock.calls[0][0]).toBe('/api/categories/a%2Fb?migrate_to=life')
+})
+
+// ── T2 加固（review）：`getJSON` 的**分类**——它怎么调 `noteFetchResult` ──
+//
+// ⚠️ 为什么非补不可：`connectivity.test.ts` 测的是 `noteFetchResult` **这个函数
+// 本身**（给它 false 就变离线），而**没有任何测试过 `getJSON` 是怎么调它的**。
+// 于是 `getJSON` 里那句分类判断可以整句写错（或干脆不调）而测试全绿——
+// 那正是 M4「设置对了 ≠ 行为对了」的反面：状态机是**行为**，这一组测试是唯一
+// 把"设置"（HTTP 状态码 / fetch 是否抛）接到"行为"（isOnline）的关卡。
+//
+// 三档分类（与 `api.ts` 里 getJSON 的注释逐条对应）：
+//   5xx ⇒ 后端不可达 ⇒ 离线；4xx ⇒ 服务器活着 ⇒ **保持在线**；fetch 抛 ⇒ 网络层没通 ⇒ 离线。
+//
+// ⚠️ 每条都要先 `_resetForTests()`：`connectivity` 的 `online` 是**模块级状态**，
+// 不重置就会把上一档的结论带进下一档（"5xx 变离线"之后，"4xx 保持在线"其实在
+// 测"它还是一直离线"，三档就互相串味了）。
+
+describe('getJSON 把请求结局分类上报给 connectivity', () => {
+  it('5xx ⇒ 抛错 + 离线（后端活着但不可用：502/503）', async () => {
+    _resetForTests()
+    expect(isOnline()).toBe(true) // 先证实起点在线，否则"变 false"无从谈起
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+      ok: false,
+      status: 500,
+      json: async () => ({ detail: '内部错误' }),
+    }))
+    await expect(fetchItems({ limit: 1 })).rejects.toThrow()
+    expect(isOnline()).toBe(false)
+    vi.unstubAllGlobals()
+  })
+
+  it('400/404 ⇒ 抛错但**回到在线**（4xx = 服务器活着，这不是离线）', async () => {
+    // ⚠️ 必须**先落到离线**再断言它翻回在线。否则"4xx 上报 true"与
+    // "4xx 干脆不上报"在起点已在线时**不可区分**——这是本仓 M4「设置对了≠
+    // 行为对了」的同一形状，我在加固时自己踩过一次：初版这条起点是
+    // `_resetForTests()` 后的在线态，于是把 getJSON 改成"4xx 不报"仍全绿。
+    // 落到离线后，"不上报"会让断言红，"上报 true"才会绿。
+    _resetForTests()
+    noteFetchResult(false) // 造一个真实的离线态（比如刚才一次 5xx / 断网）
+    expect(isOnline()).toBe(false)
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+      ok: false,
+      status: 404,
+      json: async () => ({ detail: '没有这条条目：999' }),
+    }))
+    await expect(fetchItem(999)).rejects.toThrow('没有这条条目：999')
+    // ⚠️ 这条是"假离线横幅"与"假在线"的守门员：把 4xx 也算成离线，用户会在
+    // 一次 bad date / 404 之后看到莫名其妙的"离线"横幅；而不上报 4xx，
+    // 用户会在后端其实已经恢复后一直卡在离线态。
+    expect(isOnline()).toBe(true)
+    vi.unstubAllGlobals()
+  })
+
+  it('fetch 本身抛 ⇒ 抛错 + 离线（网络层就没通：离线 / DNS / 连接被拒）', async () => {
+    _resetForTests()
+    expect(isOnline()).toBe(true)
+    vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new TypeError('Failed to fetch')))
+    await expect(fetchItems({ limit: 1 })).rejects.toThrow()
+    expect(isOnline()).toBe(false)
+    vi.unstubAllGlobals()
+  })
 })
