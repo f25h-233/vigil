@@ -2,6 +2,9 @@ import { useEffect, useRef, useState } from 'react'
 import { bulkSetKind, bulkUndo, fetchCategories, fetchItems } from '../api.ts'
 import ItemCard from '../components/ItemCard.tsx'
 import PersonPicker from '../components/PersonPicker.tsx'
+import { isOnline, subscribeConnectivity } from '../connectivity.ts'
+import { fmtDateTime } from '../format.ts'
+import { readSnapshot } from '../snapshot.ts'
 import type { Category, Item } from '../types.ts'
 
 const PAGE = 50
@@ -17,6 +20,12 @@ type Shown = {
   kindsKey: string
   personsKey: string
   q: string
+  /**
+   * 这批数据来自快照时的同步时刻；实时数据时为 null。
+   * ⚠️ 它必须与 `items` 同生同死（同一个 `Shown`）：拆成两个 state 就会出现
+   * 「快照的数据 + 实时数据的结论」这种半新半旧的句子（与顶部那条注释同一个理由）。
+   */
+  snapshotAt: number | null
 }
 
 export default function Feed({
@@ -47,6 +56,37 @@ export default function Feed({
   const [reloadTick, setReloadTick] = useState(0)
   // 请求序号：慢的旧请求晚于新请求返回时，不许覆盖新结果
   const seq = useRef(0)
+
+  // ── 在线/离线（T3 的状态机是单一真相源）────────────────────────────────
+  //
+  // ⚠️ effect **返回**退订函数（`useEffect(() => subscribeConnectivity(...), [])`）：
+  // 这既是"卸载时摘掉订阅"，也是 `StrictMode`（挂→卸→挂）下净剩**一个**订阅的原因
+  // ——「卸」把第一个摘掉、「挂」再装一个。
+  const [online, setOnline] = useState(isOnline)
+  useEffect(() => subscribeConnectivity(() => setOnline(isOnline())), [])
+
+  /**
+   * ⚠️ 由 `online` 派生的"重取一次"扳机，**专供下面那个 effect 的依赖数组**。
+   *
+   * 为什么不直接把 `online` 写进依赖：`online` 从 true→false 也会让那个 effect
+   * 重跑——那是**离线时白发一次必然失败的请求**（还会 `noteFetchResult(false)`
+   * 把状态机再按一次离线）。
+   * 为什么不写成「订阅回调里直接 `setReloadTick`」：那样**首帧**的 `isOnline()`
+   * 初值就不生效了——初值本身是"挂载那一刻的真相"，而下面那个 effect 的依赖
+   * 变化是"之后每一次变化"；两个来源各管一段，才不会漏。
+   *
+   * ⚠️ 判据里 **`online` 是承重的**：`seenOnline.current` 记的是"上一次算这个值时
+   * 在不在线"，所以只有**真的从离线变成在线**才会 `+1`。少了这个判据，
+   * 任何一次无关的重渲染（父组件传下来的新函数、点一下复选框）都会把
+   * `online` 重新算成 `true` 并 `+1` ⇒ 每次渲染白拉一次列表。
+   */
+  const [onlineEpoch, setOnlineEpoch] = useState(0)
+  const seenOnline = useRef(online)
+  useEffect(() => {
+    const wasOnline = seenOnline.current
+    seenOnline.current = online
+    if (online && !wasOnline) setOnlineEpoch((t) => t + 1)
+  }, [online])
 
   // ── 多选批量改类目（M6 T11；D16 的「界面上多选批量改」那一半）──────────
   //
@@ -93,18 +133,42 @@ export default function Feed({
     })
       .then((page) => {
         if (mine !== seq.current) return
-        setShown({ items: page.items, total: page.total, kindsKey, personsKey, q })
+        setShown({
+          items: page.items,
+          total: page.total,
+          kindsKey,
+          personsKey,
+          q,
+          snapshotAt: null,
+        })
       })
       .catch((e: unknown) => {
         if (mine !== seq.current) return
-        setErr(e instanceof Error ? e.message : String(e))
-        // 清空而不是留着旧数据：旧数据标的是上一个筛选，留着会被读成本次结果
-        setShown(null)
+        // ⚠️ 只在**无筛选**时回落快照：快照存的是"最近 N 天的全部条目"，
+        // 把它显示在一个**带筛选**的查询下，就是拿一张不匹配的清单回答
+        // 另一个问题（"只说自己有资格说的话"，M2）。带筛选时如实报错。
+        const unfiltered = kinds.length === 0 && persons.length === 0 && q === ''
+        const snap = unfiltered ? readSnapshot() : null
+        if (snap !== null && snap.feed.length > 0) {
+          setErr(null)
+          setShown({
+            items: snap.feed,
+            total: snap.feed.length,
+            kindsKey,
+            personsKey,
+            q,
+            snapshotAt: snap.synced_at,
+          })
+        } else {
+          setErr(e instanceof Error ? e.message : String(e))
+          // 清空而不是留着旧数据：旧数据标的是上一个筛选，留着会被读成本次结果
+          setShown(null)
+        }
       })
       .finally(() => {
         if (mine === seq.current) setLoading(false)
       })
-  }, [kindsKey, personsKey, q, reloadTick, reloadSignal])
+  }, [kindsKey, personsKey, q, reloadTick, reloadSignal, onlineEpoch])
 
   function loadMore() {
     // 没有可续的列表就不发请求：首屏失败后列表是空的，续页无从谈起
@@ -286,6 +350,16 @@ export default function Feed({
 
       <PersonPicker selected={persons} onChange={onPersons} />
 
+      {/* ⚠️ 快照横幅：**必须**说清这是何时同步的，不许假装实时
+          （G10 / 出口标准 2）。只认 `shown.snapshotAt`——离线但**读到了实时数据**
+          （比如只是浏览器误报 offline）时不显示，那时屏幕上确实是实时的。
+          ⚠️ 时刻用 `fmtDateTime`（本机时区），与它在别处的口径一致。 */}
+      {shown !== null && shown.snapshotAt !== null && (
+        <p className="mt-3 rounded-lg bg-vigil-warn-soft p-2 text-xs text-vigil-warn">
+          离线：显示的是本地快照（{fmtDateTime(shown.snapshotAt)} 同步）。
+        </p>
+      )}
+
       {/* 说清「这句话覆盖的是什么」：带上筛选条件，别让一个数字看起来像全部 */}
       <p className="mt-3 text-xs text-vigil-fg-4">{countLine}</p>
 
@@ -295,6 +369,9 @@ export default function Feed({
       {selected.size > 0 && (
         <div className="mt-3 flex flex-wrap items-center gap-2 rounded-lg bg-vigil-surface p-2.5 text-xs">
           <span className="text-vigil-fg-2">已选 {selected.size} 条</span>
+          {/* ⚠️ 批量改是**写**操作：离线时按钮置灰之外，这里也明写原因
+              （只置灰的话用户不知道是"坏了"还是"现在不行"）。 */}
+          {!online && <span className="text-vigil-fg-4">批量改需要联网</span>}
           <select
             value={bulkKind}
             onChange={(e) => setBulkKind(e.target.value)}
@@ -310,7 +387,7 @@ export default function Feed({
           </select>
           <button
             onClick={applyBulk}
-            disabled={bulkBusy || bulkKind === ''}
+            disabled={bulkBusy || bulkKind === '' || !online}
             className="rounded-lg bg-vigil-accent-soft px-3 py-1 text-xs text-vigil-accent-text disabled:opacity-40"
           >
             改类目
@@ -362,7 +439,12 @@ export default function Feed({
           <p className="mt-6 text-center text-sm text-vigil-fg-4">
             {/* 空结果必须说清「搜索范围」，否则会被读成「库里就没有这件事」。
                 ⚠️ 多选之后不能只报一个类目名：说出来的范围必须与上面那句
-                计数行描述的是同一件事（类目 ∧ 人物 ∧ 关键词）。 */}
+                计数行描述的是同一件事（类目 ∧ 人物 ∧ 关键词）。
+                ⚠️⚠️ **三态必须分开**（spec §3.3 / G10 / 出口标准 5）：
+                这里的 `shown !== null` 已经保证了"读到了、确实是 0 条"，
+                所以"还没有任何条目"在这一支里是**有依据**的——离线且读不到时
+                走的是上面的错误横幅（`err !== null`，那一支把"离线，且还没有
+                本地快照"明写出来），**不会**落到这里。 */}
             {shown.q !== ''
               ? `没有匹配「${shown.q}」的条目。`
               : scopeLabels.length > 0
@@ -370,6 +452,14 @@ export default function Feed({
                 : '还没有任何条目。'}
           </p>
         )}
+
+      {/* ⚠️ 离线且**没有快照**可回落 ⇒ 这是错误横幅那一支：必须说清"离线"，
+          不许落到上面的"还没有任何条目"（G10：空 ≠ 未知）。 */}
+      {err !== null && !online && (
+        <p className="mt-2 text-center text-xs text-vigil-fg-4">
+          离线，且还没有本地快照。
+        </p>
+      )}
 
       <ul className="mt-3 space-y-2">
         {shown !== null &&
@@ -380,6 +470,9 @@ export default function Feed({
               onMutated={reload}
               onSelect={toggleSelect}
               selected={selected.has(it.item_id)}
+              // ⚠️ 只认 `shown.snapshotAt`，不认 `!online`：一个离线但**读到了实时数据**
+              // 的窗口（浏览器误报）不该把能用的控件灰掉。
+              offline={shown.snapshotAt !== null}
             />
           ))}
       </ul>

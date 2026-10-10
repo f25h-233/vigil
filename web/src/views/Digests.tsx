@@ -2,6 +2,8 @@ import { useEffect, useRef, useState } from 'react'
 import Markdown from 'react-markdown'
 import { fetchDigest, fetchDigests } from '../api.ts'
 import ItemCard from '../components/ItemCard.tsx'
+import { fmtDateTime } from '../format.ts'
+import { readSnapshot } from '../snapshot.ts'
 import type { DigestDetail, DigestSummary } from '../types.ts'
 
 // 正在看的那一篇：id 与正文合成一个对象。拆成两个 state 的话，会出现
@@ -17,10 +19,26 @@ export default function Digests() {
   const [list, setList] = useState<DigestSummary[] | null>(null)
   const [opened, setOpened] = useState<Opened | null>(null)
   const [err, setErr] = useState<string | null>(null)
+  /**
+   * 列表数据来自快照时的同步时刻；实时数据时为 null。
+   *
+   * ⚠️ 读它的是**渲染**（横幅），不是某个回调：状态必须与 `list` 同生同死，
+   * 所以每一次 `setList(...)` 都必须同时把这一项设对（下面三处各一次）。
+   */
+  const [snapshotAt, setSnapshotAt] = useState<number | null>(null)
   // 重跑列表请求的手动扳机：没有它，列表读取失败后就没有可见的恢复入口
   const [reloadTick, setReloadTick] = useState(0)
   // 请求序号：连点两篇日报时，慢的先发请求不许晚到覆盖后点的
   const seq = useRef(0)
+  /**
+   * 快照里的日报（含正文），按 `digest_id` 索引。
+   *
+   * ⚠️ 它**不是** `list` 的副本：`list` 是喂给列表的 `DigestSummary[]`，
+   * 这一份留着 `body_md`/`items`，好在离线时"打开某篇"不必再发一个
+   * 必然失败的请求。离线读快照 = **一次性读一次**（读的时候判定），
+   * 而不是每次打开都去读盘。
+   */
+  const snapDigests = useRef<Map<number, DigestDetail> | null>(null)
 
   useEffect(() => {
     const mine = ++seq.current
@@ -31,11 +49,35 @@ export default function Digests() {
       .then((r) => {
         if (mine !== seq.current) return
         setList(r.digests)
+        setSnapshotAt(null)
+        snapDigests.current = null
       })
       .catch((e: unknown) => {
         if (mine !== seq.current) return
-        setErr(e instanceof Error ? e.message : String(e))
-        // ⚠️ 这里**不写 setList([])**：请求失败说的是「不知道有几篇」，
+        // ⚠️ 失败了**才**回落快照（spec §3.3 的回落顺序：先网络 → 失败 → 快照）。
+        const snap = readSnapshot()
+        if (snap !== null && snap.digests.length > 0) {
+          // `DigestDetail` 是 `DigestSummary` 的超集 ⇒ 显式挑字段而不是硬转类型
+          //（多出来的是 `body_md`/`items`，留着给下面"打开"用）。
+          setList(
+            snap.digests.map((d) => ({
+              digest_id: d.digest_id,
+              day: d.day,
+              window_from: d.window_from,
+              window_to: d.window_to,
+              created_at: d.created_at,
+              item_count: d.item_count,
+            })),
+          )
+          setSnapshotAt(snap.synced_at)
+          snapDigests.current = new Map(snap.digests.map((d) => [d.digest_id, d]))
+        } else {
+          setList(null)
+          setSnapshotAt(null)
+          snapDigests.current = null
+          setErr(e instanceof Error ? e.message : String(e))
+        }
+        // ⚠️ 判为"没有快照"时这里**不写 setList([])**：请求失败说的是「不知道有几篇」，
         // 写下 [] 就是把它记成「读到了 0 篇」，下一帧会渲染出
         // 「还没有日报。生成：`vigil digest`」——一句没有依据的话。
       })
@@ -43,6 +85,15 @@ export default function Digests() {
 
   function open(id: number) {
     const mine = ++seq.current
+    // ⚠️ 快照里就有这一篇 ⇒ **直接用**，不发那个必然失败的请求：
+    // 发了它，失败回调会把用户刚点开的那一篇报成"读取失败"——而我们手里
+    // 明明有正文（自找的失败，且会盖掉列表）。
+    const cached = snapDigests.current?.get(id)
+    if (cached !== undefined) {
+      setErr(null)
+      setOpened({ id, detail: cached })
+      return
+    }
     setErr(null) // 请求一发，上一次的失败结论就不再描述当前状态
     // 只记「正在打开哪一篇」，不动 list：详情请求的抖动不该把用户
     // 正看着的列表从屏幕上抹掉（下面失败时仍渲染列表 + 一条横幅）。
@@ -166,12 +217,23 @@ export default function Digests() {
 
   return (
     <div>
+      {/* ⚠️ 快照横幅：**必须**说清这是何时同步的，不许假装实时（G10 / 出口标准 2）。
+          只认 `snapshotAt`（跟着列表数据走），不认"上次请求失败过"。 */}
+      {snapshotAt !== null && (
+        <p className="mb-3 rounded-lg bg-vigil-warn-soft p-3 text-sm text-vigil-warn">
+          离线：显示的是本地快照（{fmtDateTime(snapshotAt)} 同步）。
+        </p>
+      )}
+
       {/* 失败横幅与列表同时在场：一次请求的抖动只该占一条横幅，不该把
           用户已经读到的列表从屏幕上抹掉（抹掉了就再也渲染不出列表按钮，
           err 也就永远清不掉了）。 */}
       {err !== null && (
         <div className="mb-3 rounded-lg bg-vigil-danger-soft p-3 text-sm text-vigil-danger">
           <p>日报读取失败：{err}</p>
+          {/* ⚠️ 三态分开（G10 / 出口标准 5）：读到**没有快照**时，
+              必须明说"离线"，而不是让用户把"读不到"读成"没有日报"。 */}
+          <p className="mt-1 text-xs">离线，且还没有本地快照。</p>
           <button
             onClick={retry}
             className="mt-2 rounded-lg bg-vigil-danger-btn px-3 py-1.5 text-xs text-vigil-danger-text active:bg-vigil-danger-btn-active"

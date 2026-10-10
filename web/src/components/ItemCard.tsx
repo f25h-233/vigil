@@ -9,6 +9,7 @@ export default function ItemCard({
   onMutated,
   onSelect,
   selected,
+  offline,
 }: {
   item: Item
   /** 改动成功后通知父级重取列表。不传则只读（日报页就是这样用的）。 */
@@ -20,6 +21,17 @@ export default function ItemCard({
   onSelect?: (itemId: number) => void
   /** 只对 `onSelect` 有意义：这张卡片此刻是否被选中。 */
   selected?: boolean
+  /**
+   * 离线（G9 / spec §3.3）：快照**只读**，所以改动控件置灰并说明原因。
+   *
+   * ⚠️ **可选**，且判据一律写成 `=== true`（不是 `!offline`、不是 `offline ?? false`）：
+   * 缺省是 `undefined` ⇒ 每一处判断都为假 ⇒ 与加这个 prop 之前**一字不差**
+   * （日报页 / 日历页的只读用法不传它）。
+   *
+   * ⚠️ 置灰之外**必须**说一句「需要联网」：只置灰的话，用户看到的是一个
+   * 点不动的按钮，而不知道是"这张卡片坏了"还是"我现在没法改"。
+   */
+  offline?: boolean
 }) {
   const [open, setOpen] = useState(false)
   const [sources, setSources] = useState<Source[] | null>(null)
@@ -162,9 +174,9 @@ export default function ItemCard({
         <div className="mt-2 flex flex-wrap items-center gap-2 border-t border-vigil-border-soft pt-2 text-xs">
           <select
             value={item.kind}
-            disabled={busy}
+            disabled={busy || offline === true}
             onChange={(e) => changeKind(e.target.value)}
-            className="rounded-lg bg-vigil-inset px-2 py-1 text-xs text-vigil-fg-2 outline-none"
+            className="rounded-lg bg-vigil-inset px-2 py-1 text-xs text-vigil-fg-2 outline-none disabled:opacity-40"
           >
             {cats.map((c) => (
               <option key={c.slug} value={c.slug}>
@@ -174,11 +186,12 @@ export default function ItemCard({
           </select>
           <button
             onClick={remove}
-            disabled={busy}
+            disabled={busy || offline === true}
             className="rounded-lg bg-vigil-danger-soft px-2 py-1 text-vigil-danger disabled:opacity-40"
           >
             删除
           </button>
+          {offline === true && <span className="text-vigil-fg-4">需要联网</span>}
           {actErr !== null && <span className="text-vigil-danger">{actErr}</span>}
         </div>
       )}

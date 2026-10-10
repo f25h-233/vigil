@@ -3,6 +3,8 @@ import { undoLast } from './api.ts'
 import ArgusBrand from './components/ArgusBrand.tsx'
 import ArgusCommand from './components/ArgusCommand.tsx'
 import ThemePicker from './components/ThemePicker.tsx'
+import { isOnline, subscribeConnectivity } from './connectivity.ts'
+import { syncSnapshot } from './snapshot.ts'
 import { applyTheme, readTheme, type ThemeId } from './theme.ts'
 import { readView, writeView, TABS, type Tab } from './uiState.ts'
 import Categories from './views/Categories.tsx'
@@ -33,6 +35,26 @@ export default function App() {
   // 信号，条目不会回到屏幕上（实测：撤销成功了，界面却毫无变化，
   // 用户会以为撤销没生效，于是再点一次，把上一步也撤掉）。
   const [dataTick, setDataTick] = useState(0)
+
+  // ── 在线/离线 + 快照同步（T5）────────────────────────────────────────
+  //
+  // ⚠️ 状态机的**单一真相源**是 `connectivity.ts`（T3）：它收两路信号
+  //（浏览器事件 + 每个请求的真实结局），后者赢。这里只订阅、不自己探测——
+  // 两个组件各自探测就会各说各话（spec R4）。
+  const [online, setOnline] = useState(isOnline)
+  // ⚠️ effect **返回**退订函数：既保证卸载时摘掉订阅，也让 `StrictMode`
+  //（挂→卸→挂）下净剩**一个**订阅。
+  useEffect(() => subscribeConnectivity(() => setOnline(isOnline())), [])
+
+  useEffect(() => {
+    // ⚠️ 离线就该 `return`：离线时这一组请求**必然失败**，发出去只会
+    // ①白费一次超时等待 ②每个失败都会 `noteFetchResult(false)` 把状态机
+    // 又按回离线（自己给自己制造事件）。
+    if (!online) return
+    // ⚠️ 失败不打扰用户：快照是"锦上添花"，同步失败只意味着离线时少一份数据
+    //（真正的理由在 `syncSnapshot` 的 docstring 里）。
+    void syncSnapshot().catch(() => {})
+  }, [online])
 
   const { tab, kinds, persons } = view
   const setTab = (t: Tab) => setView((v) => ({ ...v, tab: t }))
@@ -83,7 +105,8 @@ export default function App() {
               <ArgusBrand />
               <button
                 onClick={undo}
-                className="ml-auto shrink-0 rounded-md px-2 py-1 text-xs text-vigil-fg-3 active:bg-vigil-surface"
+                disabled={!online}
+                className="ml-auto shrink-0 rounded-md px-2 py-1 text-xs text-vigil-fg-3 active:bg-vigil-surface disabled:opacity-40"
               >
                 ↶undo
               </button>
@@ -138,7 +161,8 @@ export default function App() {
                 （同一行里只有一个 `ml-auto` 起作用，两个都在会变成两段式布局）。 */}
             <button
               onClick={undo}
-              className="ml-auto rounded-lg px-2 py-1 text-xs text-vigil-fg-3 active:bg-vigil-surface"
+              disabled={!online}
+              className="ml-auto rounded-lg px-2 py-1 text-xs text-vigil-fg-3 active:bg-vigil-surface disabled:opacity-40"
             >
               ↶ 撤销
             </button>
@@ -164,6 +188,18 @@ export default function App() {
             ))}
           </nav>
         </header>
+      )}
+
+      {/* ⚠️ 离线横幅**一处**、在**头部下方**（brief Step 6 / G10 / 出口标准 2/3）。
+          ⚠️ 全仓只此一处：AR GUS 头部与默认头部里各放一条的话，同一句话就有了
+          两份真相（改一处漏一处），而且用户在同一个时刻**只看得到一条**
+          （当前主题只有一套头部）——判据于是还得写两个分支去够它，是纯负荷。 */}
+      {!online && (
+        <div className="border-b border-vigil-border bg-vigil-warn-soft">
+          <p className="mx-auto max-w-3xl px-4 py-1 text-xs text-vigil-warn">
+            离线：显示的是本地快照，写操作不可用。
+          </p>
+        </div>
       )}
 
       <main className="mx-auto max-w-3xl px-4 py-4 pb-24">
