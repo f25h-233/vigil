@@ -119,6 +119,27 @@ function stubDeadApi(): string[] {
   return calls
 }
 
+/**
+ * 一个**活着但每个请求都 404** 的假后端(F2 的场景:后端在线、只是这个请求有问题)。
+ *
+ * ⚠️ 它刻意**不是** `stubDeadApi`:后者 fetch 抛 ⇒ `noteFetchResult(false)`;
+ * 而 4xx 走的是 `noteFetchResult(r.status < 500)` = `true` ⇒ **`online` 保持真**
+ * (`api.ts` 的既定语义,正确)。这正是 F2 的入口:失败**不等于**离线。
+ * 同时记下 URL(与另两个桩同形)。
+ */
+function stub404Api(detail = '订单不存在'): string[] {
+  const calls: string[] = []
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(async (input: RequestInfo | URL) => {
+      calls.push(String(input))
+      // 形状与真后端同:4xx + `{detail}`(api.getJSON 会把它当错误文案)
+      return { ok: false, status: 404, json: async () => ({ detail }) }
+    }),
+  )
+  return calls
+}
+
 // ── ItemCard:可选的 `offline`(G9 / 出口标准 3)───────────────────────────
 
 test('⚠️ offline=true ⇒ 改动控件被禁用 + 提示需要联网(G9 / 出口标准 3)', () => {
@@ -175,7 +196,11 @@ test('⚠️ 离线但有快照 ⇒ 显示快照 + 同步时刻 + 横幅(出口�
   render(<Feed {...feedProps} />)
   expect(await screen.findByText('快照里的停水通知')).toBeTruthy()
   // ⚠️ 必须写清**何时**同步的,不许假装实时(G10 / 出口标准 2)。
-  expect(screen.getByText(/本地快照（/)).toBeTruthy()
+  // ⚠️ 断言**原文**(不是 `/本地快照（/`):正则会被"日报侧那条同形的横幅"就近满足
+  // (F4 的形状:一条弱断言被另一条新文案喂饱)。原文 + 时刻两个断言,改词就红。
+  expect(
+    screen.getByText(`离线：显示的是本地快照（${SNAPSHOT_LABEL} 同步）。`),
+  ).toBeTruthy()
   expect(screen.getByText(new RegExp(SNAPSHOT_LABEL))).toBeTruthy()
 })
 
@@ -288,6 +313,68 @@ test('⚠️ 在线首屏只取一次:订阅失败/重渲染都不许把列表�
   })
 })
 
+test('⚠️ 在线 4xx + 盘上有快照 ⇒ 如实报错,不许说"离线"、也不许拿快照冒充(F2)', async () => {
+  /**
+   * ⭐ F2:4xx 保持 `online===true`(`api.ts` 的 `noteFetchResult(r.status < 500)`)。
+   * 「失败」**不等于**「离线」⇒ 在线 4xx 该显示**真实错误**(而不是"离线"这句话),
+   * 也不该把快照冒充成本次的答案(那会同时把卡片灰掉、说"需要联网"——
+   * 三句假话连成一串)。离线回落只配用在**真的离线**时。
+   *
+   * ⚠️ 变异反证:把 Feed 的 `!isOnline()` 守卫去掉(回落重新回到"只要失败就上")
+   * 或把横幅的 `!online` 去掉 ⇒ 本条必红(屏幕上会出现快照条目 / "离线")。
+   */
+  writeSnapshot({
+    synced_at: SNAPSHOT_TS,
+    feed: [item(7, '快照里的停水通知')],
+    calendar: [],
+    digests: [],
+  })
+  stub404Api()
+  render(<Feed {...feedProps} />)
+
+  // ⭐ 快照照常回落(fallback 本身不变——它由"失败"决定,不由"离线"决定)
+  expect(await screen.findByText('快照里的停水通知')).toBeTruthy()
+  // ⭐ 在线 4xx **仍是错误** ⇒ 错误框在场(审查的验收要求:不许因为回落到快照
+  //    就把在线错误吞掉,屏幕只剩一份来路不明的旧数据)
+  expect(screen.getByText(/读取失败/)).toBeTruthy()
+  expect(screen.getByText(/订单不存在/)).toBeTruthy()
+  // ⭐ 屏幕上**不许**出现任何"离线"字样(快照横幅已被 `!online` 挡掉)
+  expect(screen.queryByText(/离线/)).toBeNull()
+})
+
+test('⚠️ 在线 4xx 且**无**快照 ⇒ 只说错误,不许说"离线,且还没有本地快照"(F2 / G10)', async () => {
+  // ③句那一处修复前无条件挂在 `err !== null` 下 ⇒ 在线 4xx 也会说"离线"。
+  stub404Api()
+  render(<Feed {...feedProps} />)
+  expect(await screen.findByText(/读取失败/)).toBeTruthy()
+  expect(screen.queryByText(/离线/)).toBeNull()
+})
+
+test('⚠️ 在线 4xx + 盘上有快照 ⇒ Digests 也如实报错、不说"离线"(F2:Digests 两处)', async () => {
+  writeSnapshot({ synced_at: SNAPSHOT_TS, feed: [], calendar: [], digests: [DIGEST] })
+  stub404Api()
+  render(<Digests />)
+  // ⭐ 快照照常回落,但**错误仍如实报出**(在线 4xx 不是"离线")
+  expect(await screen.findByText('2026-10-05')).toBeTruthy()
+  expect(screen.getByText(/日报读取失败/)).toBeTruthy()
+  expect(screen.queryByText(/离线/)).toBeNull()
+})
+
+test('⚠️ 在线 4xx 且**无**快照 ⇒ Digests 不说"离线,且还没有本地快照"(F2:③句那一处)', async () => {
+  stub404Api()
+  render(<Digests />)
+  expect(await screen.findByText(/日报读取失败/)).toBeTruthy()
+  expect(screen.queryByText(/离线/)).toBeNull()
+})
+
+test('⚠️ 在线 4xx ⇒ App 离线横幅**不出现**(F2:横幅只认 `!online`)', async () => {
+  // 阴性对照的一半:App 横幅本来就带 `!online`(审查 PROBE-D5 = 0)⇒ 在线 4xx 时不许出现。
+  stub404Api()
+  render(<App />)
+  expect(await screen.findByText(/读取失败/)).toBeTruthy()
+  expect(screen.queryByText(/写操作不可用/)).toBeNull()
+})
+
 test('⚠️ 网络通 ⇒ 用实时数据(快照只是备份,不是显示源)【上一条的阴性对照】', async () => {
   writeSnapshot({
     synced_at: SNAPSHOT_TS,
@@ -350,6 +437,39 @@ test('⚠️ StrictMode(挂→卸→挂)下订阅仍然活着:恢复在线时重
   })
 })
 
+test('⚠️ **离线挂载** Feed ⇒ 那个"在线"合取项是**承重**的(F1):不许白发第二次首屏', async () => {
+  /**
+   * ⭐⭐ F1 —— 审查**证伪**了上一轮报告里那句"变异 E 不可观测、`online &&`
+   * 纯防御性"。这里用**请求计数**把它钉成可观测:
+   *
+   * ⚠️ 关键前提是**离线挂载**(用户离线时打开 PWA —— 出口标准 2/3 的场景本身):
+   * 此时 `useRef(online)` 的初值就是 `false` ⇒ 派生 effect 第一次跑时
+   * `wasOnline === false`。
+   *   · 根治版 `if (online && !wasOnline)`:当前也离线 ⇒ 为假 ⇒ **不**+1
+   *   · E 版(只留 `!wasOnline`):`!wasOnline` 为真 ⇒ **+1** ⇒ 把首屏取数 effect
+   *     **多跑一次**(一次必然失败的请求)——审查探针实测 `expected 2 to be 1`
+   *
+   * ⚠️ 必须**先 `noteFetchResult(false)` 再 render**:否则挂载那一刻
+   * `navigator.onLine`(jsdom 默认 true)让 `online===true`,E 与根治版**同绿**
+   * ——这正是上一轮报告误判"不可观测"的由来(它在**在线挂载**的输入面上试的)。
+   *
+   * ⚠️ 变异反证:`if (online && !wasOnline)` → `if (!wasOnline)` ⇒ 本条必红
+   * (请求数 2 而非 1)。
+   */
+  _resetForTests()
+  noteFetchResult(false) // 离线:挂载时 `online` 为 false(用户离线打开)
+  const calls = stubDeadApi()
+  render(<Feed {...feedProps} />)
+  // 先等它能"停"下来:离线首屏失败后一定渲染出那条错误横幅
+  expect(await screen.findByText(/读取失败/)).toBeTruthy()
+  // 再给"派生 effect"足够时间走完(它若 +1,取数 effect 会再发一次)
+  await act(async () => {
+    await new Promise((r) => setTimeout(r, 0))
+  })
+  // 离线挂载该**只**取一次首屏:没有任何东西能证明"此刻在线"
+  expect(calls.filter((u) => u.startsWith('/api/items')).length).toBe(1)
+})
+
 // ── Digests:离线回落快照 ──────────────────────────────────────────────
 
 test('⚠️ 离线但有快照 ⇒ 日报列表与正文都从快照来,并写明同步时刻', async () => {
@@ -366,7 +486,10 @@ test('⚠️ 离线但有快照 ⇒ 日报列表与正文都从快照来,并写�
 
   expect(await screen.findByText('2026-10-05')).toBeTruthy()
   expect(screen.getByText(new RegExp(SNAPSHOT_LABEL))).toBeTruthy()
-  expect(screen.getByText(/本地快照（/)).toBeTruthy()
+  // ⚠️ 原文(不是 `/本地快照（/`):F2 的变异必须能让这里红 ⇒ 也用原文钉住。
+  expect(
+    screen.getByText(`离线：显示的是本地快照（${SNAPSHOT_LABEL} 同步）。`),
+  ).toBeTruthy()
 
   await userEvent.click(screen.getByRole('button', { name: /2026-10-05/ }))
   expect(await screen.findByText('快照里的日报正文。')).toBeTruthy()
@@ -447,6 +570,39 @@ test('⚠️ 在线 ⇒ 撤销可用(上一条的阴性对照)', async () => {
   render(<App />)
   await screen.findByText('还没有任何条目。')
   expect((screen.getByRole('button', { name: /撤销/ }) as HTMLButtonElement).disabled).toBe(false)
+})
+
+test('⚠️ ARGUS 主题 + 离线 ⇒ 头部那个 ↶undo 也置灰(F3:G9 的同一条要求)', async () => {
+  /**
+   * ⭐ F3 —— 上一轮**变异全绿**:把 `App.tsx` ARGUS 头部那个 `↶undo` 的
+   * `disabled={!online}` 删掉,205 全绿 ⇒ 该分支的置灰**没有任何判据**。
+   * brief Step 6 要求"撤销按钮加 `disabled={!online}`",ARGUS 分支属同一条要求。
+   *
+   * ⚠️ 起渲染的方式照 `argusBrand.dom.test.tsx`:`localStorage.setItem('vigil.theme','argus')`
+   * —— `App` 的 `useState(readTheme)` 是惰性初始化 ⇒ 挂载时读盘。
+   * ⚠️ ARGUS 那个按钮的名字是 `↶undo`(**不是**默认主题的 `↶ 撤销`),
+   * 所以 `queryByRole('button', {name:/撤销/})` 在 ARGUS 下恒为 null —— 必须按它自己的名字找。
+   */
+  localStorage.setItem('vigil.theme', 'argus')
+  _resetForTests()
+  noteFetchResult(false)
+  stubDeadApi()
+  render(<App />)
+  await screen.findByText(/离线/)
+  const undo = screen.getByRole('button', { name: /undo/ }) as HTMLButtonElement
+  expect(undo.disabled).toBe(true)
+  // ⚠️ 同时钉住"这确实是 ARGUS 那套头部":默认主题的按钮叫"↶ 撤销",不叫"↶undo"。
+  // 这是"判据够到了 ARGUS 分支"的证据(否则 find 到的可能是另一套头部的按钮)。
+  expect(screen.queryByRole('button', { name: /^↶ 撤销$/ })).toBeNull()
+})
+
+test('⚠️ ARGUS 主题 + 在线 ⇒ ↶undo 可用(上一条的阴性对照:F3 不是"恒置灰")', async () => {
+  localStorage.setItem('vigil.theme', 'argus')
+  stubOkApi([])
+  render(<App />)
+  await screen.findByText('还没有任何条目。')
+  const undo = screen.getByRole('button', { name: /undo/ }) as HTMLButtonElement
+  expect(undo.disabled).toBe(false)
 })
 
 test('⚠️ 快照同步失败不该影响页面(它是"锦上添花")', async () => {

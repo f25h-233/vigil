@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react'
 import Markdown from 'react-markdown'
 import { fetchDigest, fetchDigests } from '../api.ts'
 import ItemCard from '../components/ItemCard.tsx'
+import { isOnline, subscribeConnectivity } from '../connectivity.ts'
 import { fmtDateTime } from '../format.ts'
 import { readSnapshot } from '../snapshot.ts'
 import type { DigestDetail, DigestSummary } from '../types.ts'
@@ -28,6 +29,20 @@ export default function Digests() {
   const [snapshotAt, setSnapshotAt] = useState<number | null>(null)
   // 重跑列表请求的手动扳机：没有它，列表读取失败后就没有可见的恢复入口
   const [reloadTick, setReloadTick] = useState(0)
+
+  // ── 在线/离线（F2）：横幅里"离线"两字的**唯一**依据 ─────────────────────
+  //
+  // ⚠️ 与 `Feed.tsx` 同一形状：`connectivity.ts`（T3）是状态的单一真相源，
+  // 这里只订阅、不自己探测（两处各探就会各说各话，spec R4）。
+  // ⚠️ effect **返回**退订函数 ⇒ 卸载时摘掉订阅，且 `StrictMode`（挂→卸→挂）
+  // 下净剩**一个**订阅（「卸」摘掉第一个、「挂」再装一个）。
+  //
+  // ⚠️⚠️ 为什么这条状态**必需**（F2，不是装饰）：`api.ts` 对 **4xx** 保持
+  // `online===true`（`noteFetchResult(r.status < 500)`），回落到快照
+  // **不等于**离线。少了它，"后端活着但回 4xx"时下面的横幅会把"读不到"
+  // 谎报成"离线"——一句用户无从分辨的假话。
+  const [online, setOnline] = useState(isOnline)
+  useEffect(() => subscribeConnectivity(() => setOnline(isOnline())), [])
   // 请求序号：连点两篇日报时，慢的先发请求不许晚到覆盖后点的
   const seq = useRef(0)
   /**
@@ -71,6 +86,10 @@ export default function Digests() {
           )
           setSnapshotAt(snap.synced_at)
           snapDigests.current = new Map(snap.digests.map((d) => [d.digest_id, d]))
+          // ⚠️⚠️ F2：**在线**失败（4xx）时保留错误（与 Feed 同一形状）。回落到
+          // 快照 == "有东西看"，不是"什么都没发生"；吞掉它，在线 404 的用户会
+          // 以为眼前这份快照就是实时的日报列表。离线时清掉（必然失败是已知前提）。
+          setErr(isOnline() ? (e instanceof Error ? e.message : String(e)) : null)
         } else {
           setList(null)
           setSnapshotAt(null)
@@ -218,8 +237,11 @@ export default function Digests() {
   return (
     <div>
       {/* ⚠️ 快照横幅：**必须**说清这是何时同步的，不许假装实时（G10 / 出口标准 2）。
-          只认 `snapshotAt`（跟着列表数据走），不认"上次请求失败过"。 */}
-      {snapshotAt !== null && (
+          只认 `snapshotAt`（跟着列表数据走），不认"上次请求失败过"。
+          ⚠️⚠️ `!online` 是承重的（F2）：4xx 保持 `online===true`（`api.ts`），
+          回落到快照 **!=** 离线。少了它，"后端活着但回 4xx"时会把"读不到"
+          谎报成"离线"。 */}
+      {snapshotAt !== null && !online && (
         <p className="mb-3 rounded-lg bg-vigil-warn-soft p-3 text-sm text-vigil-warn">
           离线：显示的是本地快照（{fmtDateTime(snapshotAt)} 同步）。
         </p>
@@ -232,8 +254,10 @@ export default function Digests() {
         <div className="mb-3 rounded-lg bg-vigil-danger-soft p-3 text-sm text-vigil-danger">
           <p>日报读取失败：{err}</p>
           {/* ⚠️ 三态分开（G10 / 出口标准 5）：读到**没有快照**时，
-              必须明说"离线"，而不是让用户把"读不到"读成"没有日报"。 */}
-          <p className="mt-1 text-xs">离线，且还没有本地快照。</p>
+              必须明说"离线"，而不是让用户把"读不到"读成"没有日报"。
+              ⚠️⚠️ `!online` 是承重的（F2）：失败横幅对"在线 4xx"同样会出现
+              （那**是**错误，该出现），但"离线"这一句只有 `!online` 才配说。 */}
+          {!online && <p className="mt-1 text-xs">离线，且还没有本地快照。</p>}
           <button
             onClick={retry}
             className="mt-2 rounded-lg bg-vigil-danger-btn px-3 py-1.5 text-xs text-vigil-danger-text active:bg-vigil-danger-btn-active"

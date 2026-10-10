@@ -150,7 +150,13 @@ export default function Feed({
         const unfiltered = kinds.length === 0 && persons.length === 0 && q === ''
         const snap = unfiltered ? readSnapshot() : null
         if (snap !== null && snap.feed.length > 0) {
-          setErr(null)
+          // ⚠️⚠️ F2:**在线**失败(4xx:后端活着、请求有问题)时**保留**错误——
+          // 回落到快照 == "屏幕上有东西看",**不是**"什么都没发生"。少了这一行,
+          // 在线 404 会既不说"离线"(横幅已被 `!online` 挡掉)又不报错 ⇒
+          // 屏幕上只剩快照,用户以为那就是最新的实时数据。
+          // 离线时清掉:那时**必然**失败是已知事实,横幅已说清"这是快照",
+          // 再挂一条"读取失败"是把预期内的离线报成意外。
+          setErr(isOnline() ? (e instanceof Error ? e.message : String(e)) : null)
           setShown({
             items: snap.feed,
             total: snap.feed.length,
@@ -353,8 +359,10 @@ export default function Feed({
       {/* ⚠️ 快照横幅：**必须**说清这是何时同步的，不许假装实时
           （G10 / 出口标准 2）。只认 `shown.snapshotAt`——离线但**读到了实时数据**
           （比如只是浏览器误报 offline）时不显示，那时屏幕上确实是实时的。
-          ⚠️ 时刻用 `fmtDateTime`（本机时区），与它在别处的口径一致。 */}
-      {shown !== null && shown.snapshotAt !== null && (
+          ⚠️ 时刻用 `fmtDateTime`（本机时区），与它在别处的口径一致。
+          ⚠️⚠️ 且 **`!online` 是承重的（F2）**：4xx 保持 `online===true`，回落
+          快照 **!=** 离线；少了它，在线 4xx 会把"读不到"谎报成"离线"。 */}
+      {shown !== null && shown.snapshotAt !== null && !online && (
         <p className="mt-3 rounded-lg bg-vigil-warn-soft p-2 text-xs text-vigil-warn">
           离线：显示的是本地快照（{fmtDateTime(shown.snapshotAt)} 同步）。
         </p>
