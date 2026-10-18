@@ -2,6 +2,9 @@
 name = "vigil"
 version = "0.1.0"
 description = "VIGIL 守夜人 —— QQ 群信息聚合器（路线 C：本地数据库旁路）"
+license = "GPL-3.0-or-later"
+license-files = ["LICENSE"]
+authors = [{ name = "f25h-233" }]
 requires-python = ">=3.11"
 dependencies = [
     "fastapi>=0.141.1",
