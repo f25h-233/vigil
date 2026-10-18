@@ -1,43 +1,67 @@
-# 密钥——绝不提交
+# =============================================================================
+# VIGIL .gitignore —— 本仓库是 **PUBLIC**，这份文件是「什么绝不能进版本库」的清单
+#
+# 分四类：① 密钥 ② 私密数据 ③ 机器相关产物 ④ 编辑器/OS 噪声
+#
+# ⚠️ 自检（应当**无输出**）：
+#     git ls-files -i -c --exclude-standard
+#   输出了什么，就说明有文件被 force-add 绕过过规则——那是要单独查的事故。
+#
+# ⚠️ 改这份文件只影响**将来**的提交。已经进过历史的，.gitignore 挡不住，
+#   必须重写历史（见 docs/superpowers/progress/vigil-progress.md）。
+# =============================================================================
+
+# —— ① 密钥：绝不提交 ——
 .env
 
-# 数据产物（导出的明文库、缓存的解密副本）
+
+# —— ② 私密数据（本机产物，内容是私密信息，进 git 就留在历史里删不干净）——
+
+# 数据产物：主库 vigil.db（含全部群消息正文）、人工干预层、日志、图片缓存、
+# 以及常年积累的 .bak-* / .db-shm / .db-wal（SQLite 的姊妹文件）
 data/
 
-# 日报归档 —— ⛔ **不入库**（2026-09-28 用户裁定）
-#
-# 它们是 08:00 管线的正常产物，但内容是**私密信息**（群名、发信人、正文摘要）⇒
-# 一旦进 git 就留在历史里，删不干净。本机照常生成、照常读，只是不进版本库。
-# ⚠️ 因此 `.gitattributes` 里那条 `docs/digests/*.md text eol=lf` 也不再承担
-#   「逐字节归档不变量的免疫层」这个职责（那条不变量退化为**本机**性质，
-#   判据见 `docs/superpowers/progress/vigil-progress.md` §二 ①）。
+# 日报归档：群名、发信人、正文摘要。08:00 管线照常生成、本机照常读，只是不入库。
+# 2026-09-28 用户裁定；2026-10-18 重写历史清掉了此前误入库的 13 份。
 docs/digests/
+
+
+# —— ③ 机器相关产物（各机器各自重建，入库只会带来冲突与噪声）——
+
+# ⚠️ 注意：gitignore **不支持行内注释**——`foo/  # 说明` 会把整串当模式，
+# 于是这条规则静默失效。理由一律另起一行写。
 
 # Python
 __pycache__/
 *.py[oc]
 .venv/
-
-# editable 安装产生的构建元数据（uv pip install -e . 生成，机器相关）
 *.egg-info/
-
-# 下载的第三方工具（qqcli 60 MB，可从 release 重新获取——
-# 写进 git 历史后很难撤，所以不入库）
-.cache/
-
-# 测试产物
 .pytest_cache/
 
-# 前端依赖（M3 引入 React 时用；不挡的话 git add -A 会吞掉几百 MB）
+# 前端依赖与产物
 node_modules/
-
-# SDD 过程产物（ledger / brief / 报告 / review-package）——本地过程记忆，不入库
-.superpowers/
-
-# 冒烟运行的原始日志（每次重跑都会重建；归纳后的证据在 M2-验收材料.md）
-_smoke/
-
-# M3 前端产物（不入库）
 web/node_modules/
 web/dist/
 web/dev-dist/
+*.tsbuildinfo
+*.local
+
+# 下载的第三方工具（qqcli 60 MB，可从 release 重新获取——写进 git 历史很难撤）
+.cache/
+
+# SDD 过程产物（ledger / brief / 报告 / review-package）——本地过程记忆
+.superpowers/
+
+# 冒烟运行的原始日志（每次重跑重建；归纳后的证据在 M2-验收材料.md）
+_smoke/
+
+
+# —— ④ 编辑器 / 操作系统噪声 ——
+.DS_Store
+Thumbs.db
+desktop.ini
+*.swp
+*.swo
+*~
+*.orig
+*.rej
