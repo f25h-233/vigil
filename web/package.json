@@ -1,7 +1,7 @@
 {
   "name": "vigil-web",
   "private": true,
-  "version": "2.63.131",
+  "version": "2.63.132",
   "license": "GPL-3.0-or-later",
   "type": "module",
   "scripts": {
