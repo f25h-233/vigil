@@ -134,9 +134,21 @@ def list_group_message_counts(conn: sqlcipher.Connection) -> list[tuple[int, int
     """返回 [(群号, 消息数, 最新时间戳)]，按消息数降序。
 
     走 idx40027_* 索引，不触发表扫描——实测坏页不影响此查询。
+
+    ⚠️ **必须排除 "40027" 为 NULL 的行**（别名 group_id，两条理由都要成立才写这个
+    WHERE）：
+      · **正确性**：`GROUP BY` 会给 NULL 单建一组，于是 `int(g)` 拿到 None 直接抛
+        `TypeError`，整个 `vigil groups` 崩掉（2026-10-19 实测：对方环境有这种行，
+        本机 0 条——所以别用"我这儿没有"当判据）。即便不崩，群号为 NULL 的行
+        **无法归属任何群**，本来也不该进群清单。
+      · **性能**：`EXPLAIN QUERY PLAN` 实测——加了 `IS NOT NULL` 后由
+        `SCAN group_msg_table USING COVERING INDEX idx40027_40058`
+        变成 `SEARCH ... (40027>?)`，**仍走索引、且更快**。所以这不是"为了不崩
+        而牺牲性能"的妥协。
     """
     rows = conn.execute(
         'SELECT "40027", count(*), max("40058") FROM group_msg_table '
+        'WHERE "40027" IS NOT NULL '
         'GROUP BY "40027" ORDER BY count(*) DESC'
     ).fetchall()
     return [(int(g), int(n), int(t or 0)) for g, n, t in rows]

@@ -181,3 +181,66 @@ def test_temp_file_name_is_unique_per_process(tmp_path, monkeypatch):
     assert str(os.getpid()) in names[0], (
         f"临时文件名 {names[0]!r} 里没有 pid——固定名 `dst.tmp` 在并发下会互踩"
     )
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# list_group_message_counts —— 群号("40027") 为 NULL 的行必须被排除
+#
+# 2026-10-19 用户实测：对方环境的 nt_msg.db 里有 "40027" 为 NULL 的行，
+# `GROUP BY "40027"` 给 NULL 单建一组 ⇒ `int(None)` 抛 TypeError，
+# 整个 `vigil groups` 崩溃。（本机 4,418,195 行里 0 条——所以**不能**用
+# 「我这儿没有」当判据，必须有这条测试。）
+# ─────────────────────────────────────────────────────────────────────────
+
+def _counts_db(tmp_path, rows):
+    """造一张只有 "40027"/"40058" 两列的 group_msg_table，返回连接。"""
+    import sqlite3
+
+    conn = sqlite3.connect(":memory:")
+    conn.execute('CREATE TABLE group_msg_table ("40027" INTEGER, "40058" INTEGER)')
+    conn.executemany("INSERT INTO group_msg_table VALUES (?, ?)", rows)
+    conn.commit()
+    return conn
+
+
+def test_counts_skips_null_group_id(tmp_path):
+    """⭐ 复现并钉住崩溃：有 NULL 群号的行时，只返回有群号的那些。
+
+    不加 WHERE 的话这里会抛 `TypeError: int() argument ... not 'NoneType'`
+    ——即用户看到的那条栈。
+    """
+    conn = _counts_db(tmp_path, [
+        (100, 1_700_000_000), (100, 1_700_000_001),   # 群 100，两条
+        (None, 1_700_000_002),                         # ← 崩溃源
+        (200, 1_700_000_003),                          # 群 200，一条
+    ])
+    try:
+        got = qqdb.list_group_message_counts(conn)
+    finally:
+        conn.close()
+
+    assert got == [(100, 2, 1_700_000_001), (200, 1, 1_700_000_003)]
+    assert all(isinstance(g, int) for g, _, _ in got), "群号必须是 int，不能是 None"
+
+
+def test_counts_handles_null_timestamp(tmp_path):
+    """群号在、时间戳("40058")为 NULL 时不该崩，时间戳归 0。
+
+    （原实现已有 `t or 0`；这条把它钉住，免得将来"顺手简化"掉。）
+    """
+    conn = _counts_db(tmp_path, [(100, None), (100, 1_700_000_000)])
+    try:
+        got = qqdb.list_group_message_counts(conn)
+    finally:
+        conn.close()
+
+    assert got == [(100, 2, 1_700_000_000)]
+
+
+# ⚠️ 关于「过滤 NULL 后是否仍走索引」：不在单元测试里断言。
+# 真源库（4,418,195 行）上的 `EXPLAIN QUERY PLAN` 实测对照是：
+#     无过滤  → SCAN group_msg_table USING COVERING INDEX idx40027_40058
+#     加 IS NOT NULL → SEARCH group_msg_table USING COVERING INDEX idx40027_40058 (40027>?)
+# 两者的结论都写进了 `qqdb.list_group_message_counts` 的 docstring。
+# **不测**是因为合成的小表上没有那个索引、行数也少，SQLite 的优化器选择与
+# 真实大库不同——那种断言测的是优化器、不是本函数，且会随 SQLite 版本飘。

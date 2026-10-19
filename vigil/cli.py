@@ -124,8 +124,11 @@ def _cmd_groups_locked(args) -> int:
     # ⚠️ `except` 必须是 `Exception`、**不是** `OSError`（M6 T4 复审 Minor-2）：
     # 磁盘/权限之外的失败同样不该让整条命令中断——`collect()` 撞上形状不对的
     # `counts` 会抛 `TypeError`，而它对用户是同一条处置：表格照打、退出码照 0。
-    # 只捕 `OSError` 的话，「失败只警告不中断」就只覆盖了一半（实测：
-    # `TypeError` 会径直冒出 `_cmd_groups_locked`）。
+    # ⚠️ **但这段 try 只包住"快照写入"，包不住上面取 `counts` 的那一步**——
+    # 2026-10-19 对方环境实测：`list_group_message_counts` 自己抛 `TypeError`
+    # （"40027" 有 NULL 行），因为它在 try **之外**，直接冒出去崩了整条命令，
+    # 上面那句"表格照打"并没有兑现。**别把这条注释当成对整个函数的保证**：
+    # 取数那一步要么自己够稳（NULL 已在 qqdb 里挡掉），要么也得有同样的兜底。
     # ⚠️ 措辞也不能想当然：表格是在这段**之后**才打印的（M6 T4 复审 Minor-1），
     # 写「不影响上面的列表」是错的。
     try:
@@ -155,6 +158,8 @@ def _cmd_groups_locked(args) -> int:
         if args.only_watched and gid not in watched:
             continue
         mark = "★" if gid in watched else ("·" if gid in known else " ")
+        # _fmt_ts 已能处理 None/<=0（返回 "-"）：tmax 可能因与群号同类的库形状
+        # 而为 NULL，直插 f-string 会打出字面的 "None"。
         print(f"{mark:<3}{n:>9,}  {_fmt_ts(tmax):<11} {gid:<11} {names.get(str(gid), '?')}")
     print("-" * 76)
     print("★ = 已纳入监听   · = 在配置里但已停用   空格 = 未纳入")
