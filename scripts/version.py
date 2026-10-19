@@ -29,8 +29,10 @@ MAJOR = 2
 
 # conventional-commit 前缀；要求有冒号（裸 'feat' 这种不算）
 RE_CD = re.compile(r"^(feat|fix|test)(\(.*\))?!?:")
-# 发版提交：chore(release): v2.61.128e 这种 —— 从计数里排除
-RE_RELEASE = re.compile(r"^chore\(release\): v[0-9]")
+# 发版提交：chore(release): v2.61.128e 这种 —— 从计数里排除。
+# ⚠️ 不要求 `v` 前缀：`chore(release): 2.62.129`（无 v）也必须认，否则它会
+#    混进后缀，把 v2.62.129 算成 v2.62.129a（实测踩过）。
+RE_RELEASE = re.compile(r"^chore\(release\):")
 
 
 def _git(*args: str) -> str:
