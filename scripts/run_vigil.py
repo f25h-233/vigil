@@ -34,6 +34,7 @@ import webbrowser
 REPO = pathlib.Path(__file__).resolve().parent.parent
 ENV_FILE = REPO / ".env"
 ENV_EXAMPLE = REPO / ".env.example"
+GROUPS_TOML = REPO / "config" / "groups.toml"
 VIGIL_DB = REPO / "data" / "vigil.db"
 WEB_DIST_INDEX = REPO / "web" / "dist" / "index.html"
 
@@ -93,16 +94,16 @@ def check_env() -> bool:
                (("VIGIL_DB_KEY", db_key), ("SILICONFLOW_API_KEY", llm_key)) if not val]
 
     if ENV_FILE.is_file() and not missing:
-        _say("[1/4] .env 已就绪（两个 key 都已填写）。")
+        _say("[1/5] .env 已就绪（两个 key 都已填写）。")
         return True
 
     _say("", _BAR)
     if not ENV_FILE.is_file():
-        _say("[1/4] 还没建 .env —— 已从模板复制一份：", f"      {ENV_FILE}")
+        _say("[1/5] 还没建 .env —— 已从模板复制一份：", f"      {ENV_FILE}")
         ENV_FILE.write_text(ENV_EXAMPLE.read_text(encoding="utf-8"), encoding="utf-8")
         _open_path(ENV_FILE)
     else:
-        _say("[1/4] .env 里有 key 还没填：", "      " + "、".join(missing))
+        _say("[1/5] .env 里有 key 还没填：", "      " + "、".join(missing))
         _open_path(ENV_FILE)
 
     _say(
@@ -122,14 +123,42 @@ def check_env() -> bool:
     return False
 
 
-def check_data() -> bool:
-    """数据在不在。不在则告诉他先跑管线。"""
-    if VIGIL_DB.is_file():
-        _say(f"[2/4] 数据在（{VIGIL_DB}）。")
+def check_groups() -> bool:
+    """config/groups.toml 在不在。它不入库，新克隆没有——缺则说明怎么建。
+
+    ⚠️ 不自动复制成 groups.toml：模板里是**示例群号**，直接当真实配置会让
+    `vigil daily` 去解一个不存在的群。这里只复制到一个 *.example 旁边并说清
+    「改完再改名」，比自动生成一个假配置诚实。
+    """
+    if GROUPS_TOML.is_file():
+        _say("[2/5] config/groups.toml 在。")
         return True
     _say(
         "", _BAR,
-        "[2/4] 还没有数据 —— 找不到",
+        "[2/5] 还没有 config/groups.toml —— 找不到",
+        f"      {GROUPS_TOML}",
+        "",
+        "      它**不入库**（含真实群号群名），首次使用要自己建：",
+        "",
+        "          copy config\\groups.example.toml config\\groups.toml",
+        "",
+        "      然后：① 跑 `uv run vigil groups` 列出你 QQ 库里所有群，",
+        "            ② 把要监听的群号填进 groups.toml 的 [[groups]]，",
+        "            ③ `uv run vigil daily` 拉数据。",
+        "      详见 README「怎么跑」。",
+        _BAR, "",
+    )
+    return False
+
+
+def check_data() -> bool:
+    """数据在不在。不在则告诉他先跑管线。"""
+    if VIGIL_DB.is_file():
+        _say(f"[3/5] 数据在（{VIGIL_DB}）。")
+        return True
+    _say(
+        "", _BAR,
+        "[3/5] 还没有数据 —— 找不到",
         f"      {VIGIL_DB}",
         "",
         "      这个服务只**读**它；先把群消息导进来，再回来起服务：",
@@ -160,14 +189,14 @@ def _find_free_port(host: str, start: int, tries: int = 20) -> int | None:
 def resolve_port(want: int, allow_auto: bool) -> int | None:
     """返回可用的端口；不可用且不允许自动则返回 None。"""
     if not _port_in_use(HOST, want):
-        _say(f"[3/4] 端口 {want} 空闲。")
+        _say(f"[4/5] 端口 {want} 空闲。")
         return want
 
     # 端口被占。常见情况是 VIGIL 自己已经在跑（任务计划/另一个窗口）。
     alt = _find_free_port(HOST, want + 1) if allow_auto else None
     _say(
         "", _BAR,
-        f"[3/4] ⚠️ 端口 {want} 已被占用。",
+        f"[4/5] ⚠️ 端口 {want} 已被占用。",
         "",
         "      最可能的原因：VIGIL 服务**已经在跑**了（任务计划「VIGIL网页服务」",
         "      会在登录时自启，或你之前开的窗口还开着）。若是，直接访问：",
@@ -188,10 +217,10 @@ def resolve_port(want: int, allow_auto: bool) -> int | None:
 def warn_frontend() -> None:
     """前端没构建 —— 不致命，服务照起（会显示一行提示页），但要说清楚。"""
     if WEB_DIST_INDEX.is_file():
-        _say("[4/4] 前端已构建。")
+        _say("[5/5] 前端已构建。")
         return
     _say(
-        "[4/4] ⚠️ 前端还没构建 —— 服务仍会启动，但页面只会显示一行提示。",
+        "[5/5] ⚠️ 前端还没构建 —— 服务仍会启动，但页面只会显示一行提示。",
         "      两种补法（任选其一）：",
         "        · 用发行版附件里预构建好的 web/dist（解压到 web/ 下）",
         "        · 本机构建：cd web && npm install && npm run build",
@@ -209,6 +238,13 @@ def _wait_ready(host: str, port: int, timeout: float = 15.0) -> bool:
 
 
 def main(argv: list[str] | None = None) -> int:
+    # ⚠️ 让 `import vigil` 找到仓库根的源包。run.cmd 走 `uv run python` 时
+    #    当前目录已在 sys.path 上，这一步是幂等的；但直接用 `python
+    #    scripts/run_vigil.py` 跑时不会 —— 少了它就会在最后一行冒裸的
+    #    `ModuleNotFoundError: No module named 'vigil'`（本文件自己的测试踩过）。
+    if str(REPO) not in sys.path:
+        sys.path.insert(0, str(REPO))
+
     ap = argparse.ArgumentParser(description="VIGIL 一键启动器")
     ap.add_argument("--port", type=int,
                     default=int(os.environ.get("VIGIL_PORT", DEFAULT_PORT)),
@@ -222,6 +258,8 @@ def main(argv: list[str] | None = None) -> int:
 
     if not check_env():
         return 3
+    if not check_groups():
+        return 6
     if not check_data():
         return 4
 
@@ -235,7 +273,6 @@ def main(argv: list[str] | None = None) -> int:
     _say("", _BAR, f"  启动中：{url}", "  按 Ctrl-C 停止。", _BAR, "")
 
     from vigil.cli import main as cli_main  # 延迟导入：前面失败时不必付导入成本
-
     if not args.no_browser:
         # 等就绪再开——开早了用户只会看到「无法访问」。起不来就不开。
         if _wait_ready(HOST, port):
