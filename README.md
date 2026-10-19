@@ -135,10 +135,10 @@ run.cmd --port 8899     :: 换端口（被占时它会自动 +1 找一个，并�
 `.env` 从模板复制：`cp .env.example .env`。**两个 key 都不是能从仓库里拿到的**：
 
 - `SILICONFLOW_API_KEY`：去 [SiliconFlow](https://cloud.siliconflow.cn/account/ak) 自助申请。
-- `VIGIL_DB_KEY`：**你自己的 QQ 本地库解密密钥**（16 字节）。只能用
-  `windows_ntqq_get_key.ps1` 从本机 QQ 安装里提取——以调试器方式启动 QQ，
-  命中 `nt_sqlite3_key_v2` 断点后打印。步骤、工具链与风险知情见
-  [`docs/SETUP-ROUTE-C.md`](docs/SETUP-ROUTE-C.md) §五。
+- `VIGIL_DB_KEY`：**你自己的 QQ 数据库解密密钥**（16 字节）。它**只存在于你的电脑上**，
+  任何仓库都给不了——要用一个**不在本仓库**的第三方脚本，从你的 QQ 里提取出来。
+  **这一步有门槛（要动调试器），完整的分步教程——含前置、风险知情、抄错密钥怎么查、
+  以及卡住时的退路——见 [`docs/SETUP-密钥提取.md`](docs/SETUP-密钥提取.md)。**
 
 ```bash
 uv run vigil daily        # 管线：export → refine → digest（任务计划「VIGIL每日管线」每天 08:00 跑 scripts/vigil-daily.cmd）
