@@ -62,14 +62,23 @@ def _read_env_file() -> dict[str, str]:
 
 
 def _open_path(p: pathlib.Path) -> None:
-    """用系统默认程序打开一个文件/文件夹（失败不致命）。"""
+    """用系统默认程序打开一个文件/文件夹（失败不致命）。
+
+    ⚠️ **只在交互式控制台里自动打开**（`sys.stdout.isatty()`）。双击 run.cmd 时
+    这是真控制台 → 打开编辑器✓；但 stdout 被重定向到管道/文件时（CI、`| head`、
+    日志收集）NO。理由是一次实测：GUI 编辑器会**继承并占住那个管道**，于是
+    `python run_vigil.py | head` 整条管道迟迟不结束 —— 看起来像启动器卡死，
+    其实是编辑器握着写端。无头场景下只打印路径即可，用户自己会去看。
+    """
+    if not sys.stdout.isatty():
+        return
     try:
         if sys.platform == "win32":
             os.startfile(str(p))  # type: ignore[attr-defined]
         elif sys.platform == "darwin":
-            subprocess.run(["open", str(p)], check=False)
+            subprocess.Popen(["open", str(p)], close_fds=True)
         else:
-            subprocess.run(["xdg-open", str(p)], check=False)
+            subprocess.Popen(["xdg-open", str(p)], close_fds=True)
     except Exception as exc:  # noqa: BLE001 - 打开失败不该挡住主流程
         print(f"  （自动打开失败：{exc}）", flush=True)
 
