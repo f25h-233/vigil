@@ -121,6 +121,14 @@ QQ NT 本地加密库 → 密钥提取 → 群号过滤 → 增量解密/索引 
 
 前置：仓库根 `.env` 里有 `VIGIL_DB_KEY` 与 `SILICONFLOW_API_KEY`；`uv` 在 PATH 上；QQ 在跑。
 
+`.env` 从模板复制：`cp .env.example .env`。**两个 key 都不是能从仓库里拿到的**：
+
+- `SILICONFLOW_API_KEY`：去 [SiliconFlow](https://cloud.siliconflow.cn/account/ak) 自助申请。
+- `VIGIL_DB_KEY`：**你自己的 QQ 本地库解密密钥**（16 字节）。只能用
+  `windows_ntqq_get_key.ps1` 从本机 QQ 安装里提取——以调试器方式启动 QQ，
+  命中 `nt_sqlite3_key_v2` 断点后打印。步骤、工具链与风险知情见
+  [`docs/SETUP-ROUTE-C.md`](docs/SETUP-ROUTE-C.md) §五。
+
 ```bash
 uv run vigil daily        # 管线：export → refine → digest（任务计划「VIGIL每日管线」每天 08:00 跑 scripts/vigil-daily.cmd）
 

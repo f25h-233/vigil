@@ -102,7 +102,7 @@ qqcli-rs 的解密路径要求外部 `sqlcipher.exe`（源码里给的下载链�
    —— 必须在**关闭 QQ 之后**做，否则抄到不一致快照（`-wal`/`-shm` 正在写入）
 2. **密钥提取**：跑 `windows_ntqq_get_key.ps1`（不带 `-NoDebugForKey`）
    —— 会以调试器启动 QQ 窗口，需在弹出窗口中登录；命中 `nt_sqlite3_key_v2` 断点后打印 16 字节 key
-3. **解密**：key 填入 `.env` 的 `NTQQ_DB_KEY` → `uv run python 1.decrypt.py` → `nt_msg_plain.db`
+3. **解密**：key 填入 `.env` 的 `VIGIL_DB_KEY`（⚠️ 代码读的就是这个名字；早期文档写的 `NTQQ_DB_KEY` 是旧名，已作废）→ `uv run python 1.decrypt.py` → `nt_msg_plain.db`
 4. **接回 qqcli**：`qq config set-db-path <nt_msg_plain.db>` → `qq index`
 5. **验证**：`qq sessions` / `qq history <群号> --since` / `qq search "关键词"`
 
