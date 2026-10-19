@@ -233,3 +233,31 @@ M1–M7 已完成（M7 于 2026-09-29 收尾）；**第三版 spec（日历 + �
 
 测试数字（截至第三版收尾）：后端 `uv run pytest` = **850 passed**；
 前端 `cd web && npm test` = **26 个测试文件 / 244 passed**。
+
+## 版本号
+
+本项目**不是标准 semver**——第三段不回零，第三段后面还挂一个字母后缀。规则如下，
+唯一计算实现是 [`scripts/version.py`](scripts/version.py)（不要手工推算）：
+
+```
+tag      = v2.{全历史 feat 数}.{全历史 fix+test 数}{后缀}
+后缀字母  = 最近一条 feat 提交之后、【非 feat / fix / test、且非发布提交】的提交数
+            a=1, b=2, … z=26；超过 26 条时进位成 z{超出数}（如第 27 条 → z1）
+            又出现新 feat 时，锚点前移、后缀清空
+包内版本  = 2.{feat}.{fix+test}    ← PEP 440 干净，不带字母（pyproject / package.json 用这个）
+```
+
+**为什么这样定**：中位（feat）↑ = 加了功能，末位（fix+test）↑ = 只修了 bug/测试，
+本来就是 semver 的语义；后缀字母用来给"纯文档 / 杂项"的改动一个**不同的号**，
+免得两次内容不同的发行撞进同一个版本号。
+
+**三条硬约束（不遵守就会自相矛盾）**：
+
+1. **发版后不要改写 master**。计数是"从当前链上数出来的"，一旦 rebase/squash，
+   已发布过的号就会从仓库里数不出来。仓库刚历经过一次删库重建（见下），这条尤其要紧。
+2. **发布提交 `chore(release): vX.Y.Z` 不计入后缀**——否则版本号会追着自己跑。
+3. **无 feat/fix/test 的独立发行靠后缀**；不要为了"凑一个号"去改计数规则。
+
+计算方式：`python scripts/version.py` 打印 tag，`--explain` 打印推导过程。
+包内版本号由这次发行对应的 tag 决定，发版时同步注入
+`pyproject.toml` / `vigil/__init__.py` / `web/package.json` / `web/package-lock.json`。

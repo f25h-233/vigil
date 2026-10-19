@@ -1,6 +1,6 @@
 [project]
 name = "vigil"
-version = "0.1.0"
+version = "2.61.128"
 description = "VIGIL 守夜人 —— QQ 群信息聚合器（路线 C：本地数据库旁路）"
 license = "GPL-3.0-or-later"
 license-files = ["LICENSE"]
