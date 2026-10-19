@@ -8,6 +8,12 @@
 
 VIGIL 替你值夜班。你睡觉的时候它盯着指定的群，天亮时把整理好的一页交给你。
 
+> ## 🚀 想直接用起来？
+> **从零到看见网页，照抄即可** → [`docs/QUICKSTART.md`](docs/QUICKSTART.md)
+>
+> 那份文档假设你什么都不懂，每一步都写了「你应该看到什么」。
+> 唯一的难点是拿到 QQ 数据库密钥（要看调试器，有门槛），文档里也讲清楚了怎么过、过不去怎么办。
+
 ```
     23:47  你在写作业
     00:12  群里发了一条「国家奖学金材料周三截止」
@@ -228,6 +234,8 @@ Copyright (C) 2026  f25h-233
 
 | 文件 | 内容 |
 |---|---|
+| [`docs/QUICKSTART.md`](docs/QUICKSTART.md) | **🚀 从零上手照着抄**：装工具 → 拿密钥 → 装依赖 → 填 .env → 验证 → 配群 → 跑数据 → 起服务。每步附「你应该看到什么」与卡住时回哪一节 |
+| [`docs/SETUP-密钥提取.md`](docs/SETUP-密钥提取.md) | 拿 `VIGIL_DB_KEY` 的完整教程：难度、风险知情、脚本出处、抄错怎么查、走不通的退路 |
 | [`docs/FEASIBILITY.md`](docs/FEASIBILITY.md) | 可行性评估、三条路线对比、本机数据库实测、路线 C 耗时估算与工具链、密钥提取环节补录 |
 | [`docs/REPORT.md`](docs/REPORT.md) | GitHub 方案全景调研（接入层 / 处理层 / 呈现层，star 与更新日期均为 2026-09-13 实抓） |
 | [`docs/SETUP-ROUTE-C.md`](docs/SETUP-ROUTE-C.md) | 路线 C 本机落地记录：工具链落位、环境改动（junction）、密钥提取步骤 |
