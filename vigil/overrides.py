@@ -274,7 +274,18 @@ def attach_readonly(conn: sqlite3.Connection, path: pathlib.Path | None = None) 
             )
             return
     try:
-        conn.execute(f"ATTACH DATABASE 'file:{target.as_posix()}?mode=ro' AS ov")
+        # ⚠️ **必须参数绑定，不许把路径拼进 SQL**（2026-10-19 用户实测的崩溃）：
+        # 路径里只要有一个单引号，拼出来的语句就被提前闭合 —— 仓库放在
+        # `D:\Wang's\vigil` 时，`'file:D:/Wang's/vigil/...'` 会报
+        # `near "s": syntax error`，整个 /api/calendar 5xx。
+        # ⚠️ 绑定的值用 `target.as_uri()`（**不是** `as_posix()`）：as_uri 会给
+        # 带 `file:` 前缀的 URI，并做百分号编码（`'`→`%27`、`空格`→`%20`），
+        # 于是 `?`/`#` 也不会被当成 URI 的分隔符/片段。实测三种形式：
+        #   · f-string + as_posix()（旧）  → 带引号时 syntax error
+        #   · 绑定 f"file:{as_posix()}?mode=ro" → 能开，但路径含 `?`/`#` 会截断
+        #   · 绑定 as_uri() + "?mode=ro"     → ✓ 全对（as_uri 自带 file:，别再补一个，
+        #                                        否则成 `file:file:///...` 打不开）
+        conn.execute("ATTACH DATABASE ? AS ov", (f"{target.as_uri()}?mode=ro",))
     except sqlite3.OperationalError as exc:
         # ── 响亮失败分支：`ensure_schema` 成功（或文件本来就在）但 ATTACH 失败 ──
         # **绝不降级**，哪怕库是刚建出来的空库（`created`）：

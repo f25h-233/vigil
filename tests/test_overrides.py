@@ -295,6 +295,40 @@ def test_deleted_msg_ids_ignores_msgs_of_items_that_are_not_deleted(ov):
     assert overrides.deleted_msg_ids(ov) == frozenset({555})
 
 
+def test_attach_readonly_survives_a_quote_in_the_path(tmp_path):
+    """⭐⭐ 路径里带**单引号**也不许崩（2026-10-19 用户实测回归）。
+
+    用户的仓库放在 `D:\Wang'sigil`。旧实现把路径拼进 SQL：
+        f"ATTACH DATABASE 'file:{target.as_posix()}?mode=ro' AS ov"
+    于是 `'file:D:/Wang's/vigil/...'` 被**提前闭合**，报
+    `sqlite3.OperationalError: near "s": syntax error`，整个 `/api/calendar`
+    5xx。修法是**参数绑定**（路径不下到 SQL 文本里）+ 用 `as_uri()`
+    （百分号编码 `'`→`%27`）。
+
+    ⚠️ 这条测试的**全部价值在于路径里那个引号**。用 `tmp_path` 直接建不带引号
+    的目录是**测不到**的——本文件此前所有用例都这么写，所以这条缺陷在四种
+    平台上都绿（"我这儿没有"当判据的又一例）。
+    """
+    quoted = tmp_path / "Wang's" / "vigil"
+    quoted.mkdir(parents=True)
+    target = quoted / "overrides.db"
+    overrides.ensure_schema(target)
+
+    conn = sqlite3.connect(":memory:", uri=True)
+    try:
+        overrides.attach_readonly(conn, target)  # 旧实现此处抛 syntax error
+        # 真的挂上了才作数：从 ov 读得到表结构（空库，0 行）
+        assert conn.execute("SELECT count(*) FROM ov.item_edits").fetchone() == (0,)
+        # 仍然是只读的（引号不该把"只读"这件事一起弄丢）
+        with pytest.raises(sqlite3.OperationalError, match="readonly"):
+            conn.execute(
+                "INSERT INTO ov.item_edits (item_id, action, actor, created_at)"
+                " VALUES (1, 'delete', 't', 0)"
+            )
+    finally:
+        conn.close()
+
+
 def test_attach_readonly_is_readonly_and_idempotent(tmp_path):
     """读取路径专用（T5 在 `store.py` 的查询层调它）：**只读**，且重复挂不炸。
 
