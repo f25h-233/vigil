@@ -17,4 +17,4 @@ def test_memdb_fixture_works(memdb):
 def test_vigil_package_is_importable():
     import vigil
 
-    assert vigil.__version__ == "2.63.130"
+    assert vigil.__version__ == "2.63.131"
